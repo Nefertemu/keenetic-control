@@ -290,10 +290,36 @@ check("привязка к Wireguard0", ping.bindings["Wireguard0"]?.profile ?? 
 check("перезапуск включён", ping.bindings["Wireguard0"]?.restart ?? false)
 check("у GigabitEthernet1 перезапуска нет", !(ping.bindings["GigabitEthernet1"]?.restart ?? true))
 check("команды профиля собираются обратно",
-      (vpn?.commands() ?? []).joined(separator: " | "),
-      "ping-check profile vpn | ping-check profile vpn host google.com | "
-      + "ping-check profile vpn mode icmp | ping-check profile vpn update-interval 3 | "
+      PingCheckParser.planSave(vpn!, existing: vpn!).commands.joined(separator: " | "),
+      "ping-check profile vpn | ping-check profile vpn mode icmp | "
+      + "ping-check profile vpn host google.com | ping-check profile vpn update-interval 3 | "
       + "ping-check profile vpn max-fails 3 | ping-check profile vpn min-success 3")
+check("mode и update-interval никогда не снимаются — у них нет формы no",
+      !PingCheckParser.planSave(PingCheckProfile(name: "t", host: "a.b"), existing: vpn!)
+          .commands.contains { $0.contains("no mode") || $0.contains("no update-interval") })
+check("очистка порога даёт форму «no»",
+      PingCheckParser.planSave(PingCheckProfile(name: "vpn", host: "google.com", mode: .icmp,
+                                                updateInterval: 3), existing: vpn!)
+          .commands.contains("ping-check profile vpn no max-fails"))
+check("режим TCP требует порт",
+      { do { try PingCheckProfile.validate(
+                 PingCheckProfile(name: "t", host: "a.b", mode: .connect)); return false }
+        catch { return true } }())
+check("порог вне диапазона 1…10 отбивается",
+      { do { try PingCheckProfile.validate(
+                 PingCheckProfile(name: "t", host: "a.b", maxFails: 50)); return false }
+        catch { return true } }())
+check("интервал меньше 3 отбивается",
+      { do { try PingCheckProfile.validate(
+                 PingCheckProfile(name: "t", host: "a.b", updateInterval: 1)); return false }
+        catch { return true } }())
+check("режим URI требует схему",
+      { do { try PingCheckProfile.validate(
+                 PingCheckProfile(name: "t", uri: "example.com", mode: .uri)); return false }
+        catch { return true } }())
+check("режимы ровно те, что в справочнике",
+      PingCheckProfile.Mode.allCases.map(\.rawValue).joined(separator: ","),
+      "icmp,connect,tls,uri")
 check("снятие профиля с интерфейса",
       PingCheckParser.planAssign(interface: "Wireguard0", profile: nil, restart: false,
                                  current: ping.bindings["Wireguard0"]).commands.joined(separator: " | "),

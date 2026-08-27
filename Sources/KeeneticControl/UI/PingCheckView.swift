@@ -33,9 +33,16 @@ struct PingCheckView: View {
             .keys.sorted()
     }
 
+    private func saved(for ident: String) -> PingCheckBinding {
+        session.state?.pingCheckBindings[ident] ?? PingCheckBinding(profile: "", restart: false)
+    }
+
     private var changes: [String: PingCheckBinding] {
-        pending.filter { $0.value != session.state?.pingCheckBindings[$0.key]
-            ?? PingCheckBinding(profile: "", restart: false) }
+        var result: [String: PingCheckBinding] = [:]
+        for (ident, wanted) in pending where wanted != saved(for: ident) {
+            result[ident] = wanted
+        }
+        return result
     }
 
     var body: some View {
@@ -95,8 +102,9 @@ struct PingCheckView: View {
                 Spacer()
                 Button("Добавить профиль") {
                     isNewProfile = true
+                    // Пустые поля роутер заполнит своими значениями по умолчанию.
                     editing = PingCheckProfile(name: "", host: "", mode: .icmp,
-                                               maxFails: 3, minSuccess: 3, updateInterval: 10)
+                                               updateInterval: 10)
                 }
                 .buttonStyle(PrimaryButtonStyle())
             }
@@ -215,9 +223,7 @@ struct PingCheckView: View {
 
     private func interfaceRow(_ item: KeeneticInterface) -> some View {
         let current = binding(for: item.ident)
-        let saved = session.state?.pingCheckBindings[item.ident]
-            ?? PingCheckBinding(profile: "", restart: false)
-        let dirty = current != saved
+        let dirty = current != saved(for: item.ident)
 
         return HStack(spacing: 10) {
             HStack(spacing: 7) {
@@ -318,44 +324,62 @@ struct PingCheckEditor: View {
                        title: isNew ? "Новый профиль Ping-Check" : "Профиль «\(profile.name)»",
                        subtitle: "Роутер периодически проверяет узел и гасит интерфейс, если тот молчит")
 
-            HStack(spacing: 12) {
-                field("Имя профиля") {
-                    TextField("vpn", text: $profile.name)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(!isNew)
-                }
-                field("Узел для проверки") {
-                    TextField("google.com или 1.1.1.1", text: $profile.host)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 12, design: .monospaced))
-                }
+            field("Имя профиля") {
+                TextField("vpn", text: $profile.name)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(!isNew)
             }
 
-            field("Режим") {
+            field("Режим проверки") {
                 Picker("", selection: $profile.mode) {
                     ForEach(PingCheckProfile.Mode.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                Text(profile.mode.explanation)
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
             }
 
-            if profile.mode == .tcp {
-                field("Порт", width: 120) {
-                    TextField("443", value: Binding(get: { profile.port ?? 443 },
-                                                    set: { profile.port = $0 }), format: .number)
-                        .textFieldStyle(.roundedBorder)
+            HStack(alignment: .top, spacing: 12) {
+                if profile.mode.usesURI {
+                    field("Адрес для проверки") {
+                        TextField("https://example.com/", text: $profile.uri)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                    }
+                } else {
+                    field("Узел для проверки") {
+                        TextField("google.com или 1.1.1.1", text: $profile.host)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                    }
+                }
+                if profile.mode.usesPort {
+                    field("Порт", width: 110) {
+                        TextField("443", value: Binding(get: { profile.port ?? 443 },
+                                                        set: { profile.port = $0 }), format: .number)
+                            .textFieldStyle(.roundedBorder)
+                    }
                 }
             }
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 2), spacing: 12) {
                 number("Интервал проверки, с", $profile.updateInterval, placeholder: 10,
-                       hint: "Как часто спрашивать узел.")
-                number("Тайм-аут ответа, с", $profile.timeout, placeholder: 1,
-                       hint: "Сколько ждать ответа. Пусто — как решит роутер.")
-                number("Отказов до отключения", $profile.maxFails, placeholder: 3,
-                       hint: "После стольких неудач интерфейс считается упавшим.")
-                number("Успехов до подъёма", $profile.minSuccess, placeholder: 3,
-                       hint: "Столько ответов подряд — и связь считается вернувшейся.")
+                       hint: "От 3 до 3600.")
+                number("Тайм-аут ответа, с", $profile.timeout, placeholder: 2,
+                       hint: "От 1 до 10. Пусто — роутер возьмёт 2.")
+                number("Отказов до отключения", $profile.maxFails, placeholder: 5,
+                       hint: "От 1 до 10. Пусто — роутер возьмёт 5.")
+                number("Успехов до подъёма", $profile.minSuccess, placeholder: 5,
+                       hint: "От 1 до 10. Пусто — роутер возьмёт 5.")
+            }
+
+            Toggle(isOn: $profile.powerCycle) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Перезапускать питание USB-модема").font(.system(size: 12))
+                    Text("Роутер включает это сам; имеет смысл только для USB-модемов.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
             }
 
             HStack {
