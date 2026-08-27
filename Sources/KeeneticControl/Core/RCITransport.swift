@@ -82,8 +82,10 @@ final class RCITransport: KeeneticTransport {
         guard (200..<300).contains(response.statusCode) else {
             throw TransportError(
                 "Роутер не принял логин или пароль (HTTP \(response.statusCode)).",
-                hint: "Проверь пользователя «\(profile.user)» и пароль администратора "
-                    + "в карточке роутера.",
+                hint: "Веб-панель по адресу \(baseURL.absoluteString) представилась как "
+                    + "«\(realm)» и ждёт пароль пользователя «\(profile.user)». "
+                    + "У веб-панели он может отличаться от пароля для SSH — "
+                    + "проверить можно скриптом Tools/check-rci-password.sh.",
                 isAuthFailure: true)
         }
         _ = body
