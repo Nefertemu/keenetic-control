@@ -113,20 +113,87 @@ final class RCITransport: KeeneticTransport {
     }
 
     func fetchText(_ command: String, timeout: TimeInterval) throws -> String {
-        let path: String
+        let candidates: [String]
         if command.hasPrefix("show startup-config") {
-            path = "ci/startup-config.txt"
+            candidates = ["ci/startup-config.txt", "rci/show/startup-config"]
         } else if isConfigDump(command) {
-            path = "ci/running-config.txt"
+            candidates = ["ci/running-config.txt", "rci/show/running-config"]
         } else {
             return try run(command, timeout: timeout)
         }
 
-        let text = try textGET(path)
-        guard text.count > 200 else {
-            throw TransportError("Роутер вернул подозрительно короткий \(path).")
+        // Прошивки отдают конфигурацию по разным адресам, а на неизвестный путь
+        // веб-панель молча возвращает свой HTML со статусом 200. Поэтому мало
+        // получить ответ — надо убедиться, что это действительно конфигурация.
+        var problems: [String] = []
+
+        for path in candidates {
+            let raw: String
+            do { raw = try textGET(path) }
+            catch {
+                problems.append("\(path): \(error.localizedDescription)")
+                continue
+            }
+
+            let text = CLI.normalizeNewlines(RCITransport.unwrapConfig(raw))
+            if RCITransport.looksLikeConfig(text) {
+                log(.info, "RCI: конфигурация получена из /\(path) (\(Format.bytes(text.utf8.count))).")
+                return text
+            }
+
+            let head = text.prefix(120).replacingOccurrences(of: "\n", with: " ")
+            problems.append("\(path): не похоже на конфигурацию "
+                            + "(\(Format.bytes(text.utf8.count)), начало: «\(head)»)")
         }
-        return text
+
+        let dump = RCITransport.saveDiagnostic(problems)
+        throw TransportError(
+            "Роутер не отдал конфигурацию по известным адресам.",
+            hint: problems.joined(separator: "\n")
+                + (dump == nil ? "" : "\nПодробности: \(dump!.path)"))
+    }
+
+    /// Ответ может прийти как JSON с текстом внутри — достаём его.
+    static func unwrapConfig(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("["),
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        else { return raw }
+
+        var longest = ""
+        func walk(_ value: Any) {
+            switch value {
+            case let text as String:
+                if text.utf8.count > longest.utf8.count { longest = text }
+            case let array as [Any]:
+                array.forEach(walk)
+            case let dictionary as [String: Any]:
+                dictionary.values.forEach(walk)
+            default:
+                break
+            }
+        }
+        walk(object)
+        return longest.isEmpty ? raw : longest
+    }
+
+    /// Конфигурация Keenetic — это строки CLI, а не HTML и не JSON.
+    static func looksLikeConfig(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 200 else { return false }
+        if trimmed.hasPrefix("<") || trimmed.lowercased().hasPrefix("<!doctype") { return false }
+
+        let markers = ["\ninterface ", "\nsystem\n", "\nip ", "\nobject-group ", "\ndns-proxy"]
+        let padded = "\n" + trimmed
+        return markers.contains { padded.contains($0) }
+    }
+
+    private static func saveDiagnostic(_ problems: [String]) -> URL? {
+        let url = AppPaths.logs.appendingPathComponent("rci-config-fetch.txt")
+        let text = "\(Date())\n" + problems.joined(separator: "\n") + "\n"
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+        return url
     }
 
     func close() {
@@ -196,7 +263,8 @@ final class RCITransport: KeeneticTransport {
             guard (200..<300).contains(response.statusCode) else {
                 throw TransportError("GET \(path) → HTTP \(response.statusCode).")
             }
-            return String(data: data, encoding: .utf8) ?? ""
+            // Битый байт не должен превращать весь ответ в пустую строку.
+            return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
         }
     }
 

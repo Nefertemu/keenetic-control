@@ -236,6 +236,26 @@ do {
     check("неожиданный тип ошибки", false)
 }
 
+print("\n== Конфигурация с CRLF (как отдаёт RCI) ==")
+let crlfConfig = sampleConfig.replacingOccurrences(of: "\n", with: "\r\n")
+check("сырой CRLF не разбирается (это и была ошибка)",
+      RouterConfigParser.parseFqdnGroups(crlfConfig).count == 0)
+
+let normalized = CLI.normalizeNewlines(crlfConfig)
+check("после нормализации переводов строк — списки на месте",
+      String(RouterConfigParser.parseFqdnGroups(normalized).count), "2")
+check("маршруты тоже", String(StaticRouteParser.parse(config: normalized).count), "4")
+check("интерфейсы тоже", String(RouterConfigParser.parseConfigInterfaces(normalized).count), "2")
+check("wireguard тоже",
+      WireGuardState.parse(config: normalized, interface: "Wireguard0").peerKeys.count == 1)
+check("чистый LF не портится", CLI.normalizeNewlines(sampleConfig) == sampleConfig)
+check("одиночный CR тоже режется",
+      CLI.normalizeNewlines("a\rb").split(separator: "\n").count == 2)
+check("ответ RCI распознаётся как конфигурация",
+      RCITransport.looksLikeConfig(normalized))
+check("HTML веб-панели отбивается",
+      !RCITransport.looksLikeConfig(String(repeating: "<html><body>nope</body></html>", count: 20)))
+
 if ProcessInfo.processInfo.environment["SELFTEST_NETWORK"] != nil {
     print("\n== Живая загрузка источников ==")
     for spec in SourceCatalog.all {

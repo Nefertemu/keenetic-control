@@ -35,6 +35,33 @@ enum CLI {
     static let ansi = try! NSRegularExpression(
         pattern: "\\x1B(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])")
 
+    /// Прошивка отдаёт конфигурацию с CRLF. В Swift «\r\n» — ОДИН символ,
+    /// поэтому split(separator: "\n") такой текст не разбивает вовсе: парсеры
+    /// получают весь конфиг одной строкой и не находят в нём ничего.
+    /// Приводим переводы строк к «\n» на границе транспорта.
+    /// Работаем на уровне скаляров: строковые API сравнивают по графемам,
+    /// а там «\r\n» — единое целое, и даже contains("\r") вернёт false.
+    static func normalizeNewlines(_ text: String) -> String {
+        guard text.unicodeScalars.contains("\r") else { return text }
+
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(text.unicodeScalars.count)
+        var afterCR = false
+
+        for scalar in text.unicodeScalars {
+            if scalar == "\r" {
+                scalars.append("\n")
+                afterCR = true
+            } else if scalar == "\n" && afterCR {
+                afterCR = false          // «\r\n» уже дало один перевод строки
+            } else {
+                scalars.append(scalar)
+                afterCR = false
+            }
+        }
+        return String(scalars)
+    }
+
     /// Убираем цвета и «забой» — Keenetic любит и то и другое.
     static func stripNoise(_ text: String) -> String {
         var value = ansi.stringByReplacingMatches(
