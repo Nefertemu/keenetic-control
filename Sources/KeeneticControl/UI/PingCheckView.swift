@@ -153,6 +153,7 @@ struct PingCheckView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .help(profile.isBuiltIn ? "Профиль встроен в прошивку" : profile.summary)
             }
 
             Spacer(minLength: 8)

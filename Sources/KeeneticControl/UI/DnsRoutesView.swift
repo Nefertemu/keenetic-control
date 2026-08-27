@@ -208,6 +208,7 @@ struct DnsRoutesView: View {
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
                 .frame(width: 220, alignment: .leading)
+                .help(group.descriptionText)
 
             Text(group.ident)
                 .font(.system(size: 11, design: .monospaced))

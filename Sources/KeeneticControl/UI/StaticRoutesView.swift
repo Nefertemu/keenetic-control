@@ -172,6 +172,7 @@ struct StaticRoutesView: View {
                     .lineLimit(1)
             }
             .frame(width: 210, alignment: .leading)
+            .help(route.rawLine.isEmpty ? route.command : route.rawLine)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(route.via)
@@ -185,6 +186,7 @@ struct StaticRoutesView: View {
                 }
             }
             .frame(width: 170, alignment: .leading)
+            .help(session.state?.label(for: route.via) ?? route.via)
 
             HStack(spacing: 4) {
                 if route.auto { StatusPill(text: "auto", tint: Palette.success) }
@@ -198,6 +200,7 @@ struct StaticRoutesView: View {
                 .foregroundStyle(route.comment.isEmpty ? .tertiary : .secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .help(route.comment)
         }
         .padding(.vertical, 7)
         .contentShape(Rectangle())
@@ -452,6 +455,11 @@ struct ImportPreview: View {
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.tertiary)
                                     .lineLimit(1)
+                            }
+                            if skipped.count > 30 {
+                                Text("… и ещё \(skipped.count - 30)")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.tertiary)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)

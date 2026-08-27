@@ -139,6 +139,7 @@ struct OverviewView: View {
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
+                                    .help(item.statusText)
                             }
                         }
 
@@ -160,6 +161,13 @@ struct OverviewView: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 10)
+                } else if state.candidates.count > visible.count {
+                    Divider()
+                    Text("и ещё \(state.candidates.count - visible.count)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 7)
                 }
             }
             .padding(.horizontal, 12)
@@ -191,23 +199,43 @@ struct OverviewView: View {
                                 Text(group.descriptionText.isEmpty ? group.ident : group.descriptionText)
                                     .font(.system(size: 12, weight: .medium))
                                     .lineLimit(1)
+                                    .help(group.descriptionText.isEmpty ? group.ident : group.descriptionText)
                                 Text(group.ident)
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
-                            Spacer(minLength: 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
                             Text(String(group.count))
                                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                            if let target = group.routedInterfaces.first {
-                                StatusPill(text: target, tint: Palette.success)
-                            } else {
+                            // Список бывает направлен на несколько интерфейсов,
+                            // а карточка узкая: собираем их в один ярлык,
+                            // полные имена с примечаниями — в подсказке.
+                            if group.routedInterfaces.isEmpty {
                                 StatusPill(text: "без маршрута", tint: Palette.warning)
+                            } else {
+                                let targets = group.routedInterfaces
+                                let extra = targets.count - 1
+                                StatusPill(text: extra > 0 ? "\(targets[0]) +\(extra)" : targets[0],
+                                           tint: Palette.success)
+                                    .help(targets.map { state.label(for: $0) }
+                                        .joined(separator: "\n"))
                             }
                         }
                         .padding(.vertical, 7)
 
                         if group.id != visible.last?.id { Divider() }
+                    }
+
+                    if state.groups.count > visible.count {
+                        Divider()
+                        Text("и ещё \(state.groups.count - visible.count) — на вкладке «Маршруты списков»")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 7)
                     }
                 }
                 .padding(.horizontal, 12)
