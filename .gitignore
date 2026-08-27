@@ -1,0 +1,14 @@
+# Сборка
+.build/
+dist/
+*.o
+*.dSYM/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store

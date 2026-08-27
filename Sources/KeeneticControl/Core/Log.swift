@@ -1,0 +1,114 @@
+import Foundation
+import SwiftUI
+
+enum LogLevel: String, Codable {
+    case info, ok, warn, error, cmd
+
+    var symbol: String {
+        switch self {
+        case .info:  return "info.circle"
+        case .ok:    return "checkmark.circle.fill"
+        case .warn:  return "exclamationmark.triangle.fill"
+        case .error: return "xmark.octagon.fill"
+        case .cmd:   return "chevron.right"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .info:  return .secondary
+        case .ok:    return .green
+        case .warn:  return .orange
+        case .error: return .red
+        case .cmd:   return .accentColor
+        }
+    }
+}
+
+struct LogEntry: Identifiable, Equatable {
+    let id = UUID()
+    let date: Date
+    let level: LogLevel
+    let text: String
+
+    var stamp: String { LogEntry.formatter.string(from: date) }
+
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+}
+
+/// Журнал приложения: живёт в памяти для интерфейса и дублируется на диск.
+@MainActor
+final class LogStore: ObservableObject {
+    static let shared = LogStore()
+
+    @Published private(set) var entries: [LogEntry] = []
+
+    private let fileURL: URL
+    private let fileFormatter: DateFormatter
+    private let limit = 4000
+
+    private init() {
+        fileURL = AppPaths.logs.appendingPathComponent("keenetic-control.log")
+        fileFormatter = DateFormatter()
+        fileFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        try? FileManager.default.createDirectory(at: AppPaths.logs, withIntermediateDirectories: true)
+    }
+
+    func append(_ level: LogLevel, _ text: String) {
+        let entry = LogEntry(date: Date(), level: level, text: text)
+        entries.append(entry)
+        if entries.count > limit { entries.removeFirst(entries.count - limit) }
+        write(entry)
+    }
+
+    func clear() { entries.removeAll() }
+
+    var plainText: String {
+        entries.map { "[\($0.stamp)] \($0.level.rawValue.uppercased())  \($0.text)" }
+            .joined(separator: "\n")
+    }
+
+    private func write(_ entry: LogEntry) {
+        let line = "\(fileFormatter.string(from: entry.date))\t\(entry.level.rawValue)\t\(entry.text)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: fileURL)
+        }
+    }
+}
+
+/// Логирование из любого потока.
+func log(_ level: LogLevel, _ text: String) {
+    Task { @MainActor in LogStore.shared.append(level, text) }
+}
+
+enum AppPaths {
+    static let support: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let url = base.appendingPathComponent("KeeneticControl", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+
+    static let cache: URL = subdirectory("cache")
+    static let logs: URL = subdirectory("logs")
+    static let backups: URL = subdirectory("backups")
+    static let wireguard: URL = subdirectory("wireguard")
+
+    static var settingsFile: URL { support.appendingPathComponent("settings.json") }
+    static var routersFile: URL { support.appendingPathComponent("routers.json") }
+
+    private static func subdirectory(_ name: String) -> URL {
+        let url = support.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+}
