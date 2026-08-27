@@ -58,6 +58,22 @@ open "dist/Keenetic Control.app"
 * проверка результата после применения — сверяется, что домены и маршруты реально легли;
 * журнал с фильтрами, дублируется в файл.
 
+## Авторизация веб-панели
+
+Keenetic сменил механизм входа, и на новых прошивках старая схема отвергает
+даже верный пароль. Приложение умеет обе:
+
+* **x-ndw4-interactive** — SCRAM на Argon2id и SHA3-512. Пароль на роутер не
+  уходит: стороны обмениваются доказательствами знания секрета, а подпись
+  сервера проверяется на клиенте, так что подставной роутер не притворится
+  настоящим. Схема выбирается автоматически, когда роутер её объявляет.
+* **x-ndw2-interactive** — прежняя схема (realm + challenge, MD5/SHA-256).
+  Используется как запасная.
+
+В macOS нет ни SHA3, ни Argon2, поэтому в `Sources/KeeneticControl/Crypto`
+лежат свои реализации: Keccak-f[1600] по FIPS 202, BLAKE2b по RFC 7693 и
+Argon2id по RFC 9106. Все сверены с контрольными примерами стандартов.
+
 ## Два способа связи
 
 | | SSH | HTTP RCI |
@@ -103,11 +119,13 @@ open "dist/Keenetic Control.app"
 ## Проверка
 
 ```bash
-swiftc -O Sources/KeeneticControl/Core/*.swift Sources/KeeneticControl/Model/*.swift \
+swiftc -O Sources/KeeneticControl/{Core,Model,Crypto}/*.swift \
        Tools/SelfTest/main.swift -o .build/selftest && .build/selftest
 ```
 
-82 проверки: punycode, нормализация доменов, разбор `running-config`, статические
-маршруты, импорт BAT, WireGuard (разбор `.conf` и порядок команд), планировщик,
-детектор ошибок CLI, обработка обрыва SSH. С `SELFTEST_NETWORK=1` дополнительно
-скачиваются все восемь источников.
+Проверяются: punycode, нормализация доменов, разбор `running-config` (в том
+числе с CRLF, как отдаёт RCI), статические маршруты, импорт BAT, WireGuard
+(разбор `.conf` и порядок команд), планировщик, детектор ошибок CLI, обработка
+обрыва SSH и криптография схемы x-ndw4 — SHA3-512, HMAC-SHA3-512, BLAKE2b и
+Argon2id сверяются с контрольными примерами FIPS 202, RFC 4231, RFC 7693 и
+RFC 9106. С `SELFTEST_NETWORK=1` дополнительно скачиваются все восемь источников.

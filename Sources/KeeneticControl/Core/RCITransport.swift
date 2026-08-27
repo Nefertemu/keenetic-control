@@ -51,8 +51,9 @@ final class RCITransport: KeeneticTransport {
         let (_, probe) = try perform(request(path: "auth", method: "GET"))
         adoptRedirect(from: probe)
 
-        let offered = (probe.value(forHTTPHeaderField: "WWW-Authenticate") ?? "").lowercased()
-        advertisesModernAuth = offered.contains("ndw4")
+        let offered = probe.value(forHTTPHeaderField: "WWW-Authenticate") ?? ""
+        advertisesModernAuth = offered.lowercased().contains("ndw4")
+        let modernEndpoint = RCITransport.endpoint(in: offered) ?? "auth"
 
         if probe.statusCode == 200 {
             authorized = true
@@ -76,6 +77,26 @@ final class RCITransport: KeeneticTransport {
                                  isAuthFailure: true)
         }
 
+        // Новые прошивки принимают только x-ndw4; старая схема у них отвечает,
+        // но отвергает даже верный пароль. Пробуем сначала её.
+        if advertisesModernAuth {
+            do {
+                try runModernAuth(login: profile.user, password: password, endpoint: modernEndpoint)
+                authorized = true
+                log(.ok, "RCI: вход по схеме x-ndw4 (\(realm)).")
+                return
+            } catch let failure as NDW4.Failure where failure.serverUntrusted {
+                throw TransportError(
+                    "Роутер не подтвердил, что знает пароль.",
+                    hint: "Подпись сервера в схеме x-ndw4 не сошлась: либо пароль неверный, "
+                        + "либо по этому адресу отвечает не твой роутер.",
+                    isAuthFailure: true)
+            } catch {
+                log(.warn, "RCI: x-ndw4 не прошла (\(error.localizedDescription)), "
+                    + "пробую старую схему.")
+            }
+        }
+
         let md5 = hex(Insecure.MD5.hash(data: Data("\(profile.user):\(realm):\(password)".utf8)))
         let sha = hex(SHA256.hash(data: Data((challenge + md5).utf8)))
 
@@ -86,15 +107,6 @@ final class RCITransport: KeeneticTransport {
 
         let (body, response) = try perform(login)
         guard (200..<300).contains(response.statusCode) else {
-            if advertisesModernAuth {
-                throw TransportError(
-                    "Роутер требует новую схему авторизации веб-панели (x-ndw4).",
-                    hint: "Прошивка этого Keenetic («\(realm)») перешла на новый механизм "
-                        + "входа и старую схему больше не принимает — даже с верным паролем. "
-                        + "Приложение её пока не умеет.\n"
-                        + "Для этого роутера выбери транспорт SSH — там всё работает.",
-                    isAuthFailure: true)
-            }
             throw TransportError(
                 "Роутер не принял логин или пароль (HTTP \(response.statusCode)).",
                 hint: "Веб-панель по адресу \(baseURL.absoluteString) представилась как "
@@ -105,6 +117,34 @@ final class RCITransport: KeeneticTransport {
         }
         _ = body
         authorized = true
+    }
+
+    /// Один шаг схемы x-ndw4: JSON туда, статус и заголовок x-ndm-data обратно.
+    private func runModernAuth(login: String, password: String, endpoint: String) throws {
+        try NDW4.authenticate(login: login, password: password) { payload in
+            var step = self.request(path: endpoint, method: "POST")
+            step.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            step.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+            let (_, response) = try self.perform(step)
+
+            var parsed: [String: Any]?
+            if let encoded = response.value(forHTTPHeaderField: "X-NDM-Data"),
+               let raw = Data(base64Encoded: encoded),
+               let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
+                parsed = object
+            }
+            return NDW4.Reply(status: response.statusCode, data: parsed)
+        }
+    }
+
+    /// endpoint="/auth" из заголовка WWW-Authenticate.
+    static func endpoint(in header: String) -> String? {
+        guard let range = header.range(of: "endpoint=\"") else { return nil }
+        let tail = header[range.upperBound...]
+        guard let end = tail.firstIndex(of: "\"") else { return nil }
+        let value = String(tail[tail.startIndex..<end])
+        return value.hasPrefix("/") ? String(value.dropFirst()) : value
     }
 
     private func hex<H: Sequence>(_ digest: H) -> String where H.Element == UInt8 {

@@ -256,6 +256,35 @@ check("ответ RCI распознаётся как конфигурация",
 check("HTML веб-панели отбивается",
       !RCITransport.looksLikeConfig(String(repeating: "<html><body>nope</body></html>", count: 20)))
 
+print("\n== Криптография схемы x-ndw4 ==")
+check("SHA3-512 пустой строки (FIPS 202)", SHA3.hash512("").hexString,
+  "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26")
+check("SHA3-512(abc)", SHA3.hash512("abc").hexString,
+  "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0")
+check("HMAC-SHA3-512 (RFC 4231 #1)",
+  SHA3.hmac512(key: [UInt8](repeating: 0x0b, count: 20), message: "Hi There").hexString,
+  "eb3fbd4b2eaab8f5c504bd3a41465aacec15770a7cabac531e482f860b5ec7ba47ccb2c6f2afce8f88d22b6dc61380f23a668fd3888bb80537c0a0b86407689e")
+check("HMAC-SHA3-512, ключ длиннее блока",
+  SHA3.hmac512(key: [UInt8](repeating: 0xaa, count: 131),
+               message: "Test Using Larger Than Block-Size Key - Hash Key First").hexString,
+  "00f751a9e50695b090ed6911a4b65524951cdc15a73a5d58bb55215ea2cd839ac79d2b44a39bafab27e83fde9e11f6340b11d991b1b91bf2eee7fc872426c3a4")
+check("BLAKE2b-512(abc) (RFC 7693)", Blake2b.hash(Array("abc".utf8), length: 64).hexString,
+  "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923")
+check("BLAKE2b-512, ровно один блок", Blake2b.hash([UInt8](repeating: 0, count: 128), length: 64).hexString,
+  "865939e120e6805438478841afb739ae4250cf372653078a065cdcfffca4caf798e6d462b65d658fc165782640eded70963449ae1500fb0f24981d7727e22c41")
+do {
+    let tag = try Argon2.hash(
+        password: [UInt8](repeating: 0x01, count: 32), salt: [UInt8](repeating: 0x02, count: 16),
+        secret: [UInt8](repeating: 0x03, count: 8), associated: [UInt8](repeating: 0x04, count: 12),
+        parameters: .init(iterations: 3, memoryKiB: 32, parallelism: 4, tagLength: 32))
+    check("Argon2id, контрольный пример RFC 9106", tag.hexString,
+          "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
+} catch { failures += 1; checks += 1; print("  FAIL Argon2id: \(error)") }
+check("разбор endpoint из WWW-Authenticate",
+  RCITransport.endpoint(in: "x-ndw4-interactive endpoint=\"/auth\" data=\"e30=\"") ?? "nil", "auth")
+check("endpoint отсутствует — не выдумываем",
+  RCITransport.endpoint(in: "x-ndw2-interactive realm=\"X\"") == nil)
+
 if ProcessInfo.processInfo.environment["SELFTEST_NETWORK"] != nil {
     print("\n== Живая загрузка источников ==")
     for spec in SourceCatalog.all {
