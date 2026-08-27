@@ -9,10 +9,20 @@ final class SSHTransport: KeeneticTransport {
     private let profile: RouterProfile
     private let password: String?
 
+    /// Дескриптор живёт под замком: `abort()` закрывает его из другого потока,
+    /// чтобы разбудить зависший poll() и не держать очередь операций.
+    private let lock = NSLock()
     private var master: Int32 = -1
     private var child: pid_t = -1
     private var pendingBytes = Data()
     private var buffer = ""
+
+    private var descriptor: Int32 {
+        lock.lock(); defer { lock.unlock() }
+        return master
+    }
+
+    private var isOpen: Bool { descriptor >= 0 }
 
     private static let prompt = try! NSRegularExpression(pattern: "\\([^)\\r\\n]+\\)>[ \\t]*")
     private static let more = try! NSRegularExpression(
@@ -126,7 +136,7 @@ final class SSHTransport: KeeneticTransport {
             "ssh",
             "-tt",
             "-p", String(profile.port),
-            "-o", "ConnectTimeout=12",
+            "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "StrictHostKeyChecking=accept-new",
@@ -166,27 +176,29 @@ final class SSHTransport: KeeneticTransport {
             _exit(127)
         }
 
+        lock.lock()
         master = masterFD
+        lock.unlock()
         child = pid
         buffer = ""
         pendingBytes = Data()
 
         // Неблокирующее чтение — таймауты держим сами через poll().
-        let flags = fcntl(master, F_GETFL, 0)
-        _ = fcntl(master, F_SETFL, flags | O_NONBLOCK)
+        let flags = fcntl(masterFD, F_GETFL, 0)
+        _ = fcntl(masterFD, F_SETFL, flags | O_NONBLOCK)
     }
 
     // MARK: - Команды
 
     func run(_ command: String, timeout: TimeInterval) throws -> String {
-        guard master >= 0 else { throw TransportError("SSH-сессия не подключена.") }
+        guard isOpen else { throw TransportError("SSH-сессия не подключена.") }
         send(command + "\n")
         let output = try waitForPrompt(timeout: timeout)
         return CLI.stripEcho(output, commands: [command])
     }
 
     func runBatch(_ commands: [String], timeout: TimeInterval) throws -> String {
-        guard master >= 0 else { throw TransportError("SSH-сессия не подключена.") }
+        guard isOpen else { throw TransportError("SSH-сессия не подключена.") }
         guard !commands.isEmpty else { return "" }
 
         // Пишем пачку крупными кусками, но не переполняя буфер терминала.
@@ -213,28 +225,47 @@ final class SSHTransport: KeeneticTransport {
     }
 
     func close() {
-        guard master >= 0 else { return }
+        guard isOpen else { reap(force: false); return }
         send("exit\n")
 
-        // Даём ssh секунду на аккуратный выход.
-        let deadline = Date().addingTimeInterval(1.0)
-        while Date() < deadline {
-            var status: Int32 = 0
-            if waitpid(child, &status, WNOHANG) == child { child = -1; break }
-            usleep(30_000)
-        }
-
-        if child > 0 {
-            kill(child, SIGTERM)
-            var status: Int32 = 0
-            waitpid(child, &status, 0)
-            child = -1
-        }
-
-        Darwin.close(master)
+        // Закрытый pty сам пошлёт ssh SIGHUP — ждать «вежливого» выхода нечего.
+        lock.lock()
+        let fd = master
         master = -1
+        lock.unlock()
+        if fd >= 0 { Darwin.close(fd) }
+
+        reap(force: false)
         buffer = ""
         pendingBytes = Data()
+    }
+
+    /// Аварийный обрыв из другого потока: операция висит дольше отведённого.
+    /// Закрытие дескриптора разбудит poll(), и операция честно свалится с ошибкой.
+    func abort() {
+        lock.lock()
+        let fd = master
+        master = -1
+        lock.unlock()
+        if fd >= 0 { Darwin.close(fd) }
+        if child > 0 { kill(child, SIGKILL) }
+    }
+
+    /// Подбираем процесс, но никогда не ждём его вечно.
+    private func reap(force: Bool) {
+        guard child > 0 else { return }
+        var status: Int32 = 0
+
+        if force { kill(child, SIGKILL) }
+
+        let deadline = Date().addingTimeInterval(force ? 2.0 : 1.0)
+        while Date() < deadline {
+            if waitpid(child, &status, WNOHANG) == child { child = -1; return }
+            usleep(20_000)
+        }
+
+        if !force { reap(force: true); return }
+        child = -1     // не дождались — пусть подберёт система, очередь важнее
     }
 
     // MARK: - Движок ожидания
@@ -259,7 +290,6 @@ final class SSHTransport: KeeneticTransport {
                 send(" ")   // постраничный вывод — просим следующую страницу
 
             case .eof:
-                master = -1
                 throw TransportError("SSH-соединение закрыто роутером.")
 
             case .timeout:
@@ -316,9 +346,12 @@ final class SSHTransport: KeeneticTransport {
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { return .timedOut }
 
-            var descriptor = pollfd(fd: master, events: Int16(POLLIN), revents: 0)
+            let fd = descriptor
+            guard fd >= 0 else { return .eof }   // сессию оборвали снаружи
+
+            var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let slice = Int32(min(remaining * 1000, 500).rounded(.up))
-            let ready = poll(&descriptor, 1, slice)
+            let ready = poll(&poller, 1, slice)
 
             if ready < 0 {
                 if errno == EINTR { continue }
@@ -327,7 +360,7 @@ final class SSHTransport: KeeneticTransport {
             if ready == 0 { continue }   // ещё не время сдаваться
 
             var raw = [UInt8](repeating: 0, count: 65536)
-            let count = raw.withUnsafeMutableBytes { Darwin.read(master, $0.baseAddress, $0.count) }
+            let count = raw.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
 
             if count > 0 {
                 pendingBytes.append(contentsOf: raw[0..<count])
@@ -367,12 +400,13 @@ final class SSHTransport: KeeneticTransport {
     }
 
     private func send(_ text: String) {
-        guard master >= 0 else { return }
+        let fd = descriptor
+        guard fd >= 0 else { return }
         let data = Array(text.utf8)
         var offset = 0
         while offset < data.count {
             let written = data[offset...].withUnsafeBufferPointer {
-                Darwin.write(master, $0.baseAddress, $0.count)
+                Darwin.write(fd, $0.baseAddress, $0.count)
             }
             if written > 0 {
                 offset += written

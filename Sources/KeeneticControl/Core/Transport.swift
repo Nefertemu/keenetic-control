@@ -19,6 +19,8 @@ protocol KeeneticTransport: AnyObject {
     /// Длинные текстовые выгрузки (running-config и подобное).
     func fetchText(_ command: String, timeout: TimeInterval) throws -> String
     func close()
+    /// Оборвать всё немедленно из другого потока — сторож операций.
+    func abort()
 }
 
 extension KeeneticTransport {

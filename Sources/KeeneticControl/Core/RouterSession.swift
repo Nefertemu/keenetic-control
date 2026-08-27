@@ -77,6 +77,9 @@ final class RouterSession: ObservableObject {
 
     private var transport: KeeneticTransport?
     private let queue = DispatchQueue(label: "pro.netcraze.KeeneticControl.session", qos: .userInitiated)
+    /// Одна попытка подключения на сессию: две параллельные плодят лишние
+    /// SSH-процессы, и роутер начинает их отбивать.
+    private var connectTask: Task<KeeneticTransport, Error>?
 
     init(router: RouterProfile) {
         self.router = router
@@ -96,27 +99,102 @@ final class RouterSession: ObservableObject {
     }
 
     func connect() async throws {
-        if status.isOnline { return }
-        status = .connecting
-        activity = "Подключаюсь к \(router.host)…"
-        defer { activity = nil }
+        if status.isOnline, transport != nil { return }
 
+        // Попытка уже идёт — дожидаемся её, а не поднимаем вторую сессию.
+        if let running = connectTask {
+            _ = try await running.value
+            return
+        }
+
+        status = .connecting
         let profile = router
         let password = router.resolvedPassword
 
+        let task = Task { try await self.openTransport(profile: profile, password: password) }
+        connectTask = task
+        defer { connectTask = nil; activity = nil }
+
         do {
-            let transport: KeeneticTransport = try await background {
-                let created: KeeneticTransport = profile.transport == .ssh
-                    ? SSHTransport(profile: profile, password: password)
-                    : try RCITransport(profile: profile, password: password)
-                try created.connect()
-                return created
-            }
-            self.transport = transport
+            let opened = try await task.value
+            transport = opened
             status = .online(profile.transport)
         } catch {
+            transport = nil
             status = .failed(describe(error))
             log(.error, "Подключение к \(profile.name): \(describe(error))")
+            throw error
+        }
+    }
+
+    /// Связь с роутером бывает капризной — одна осечка не повод сдаваться.
+    private func openTransport(profile: RouterProfile, password: String?) async throws -> KeeneticTransport {
+        let attempts = 3
+        var lastError: Error = TransportError("Не удалось подключиться.")
+
+        for attempt in 1...attempts {
+            activity = attempt == 1
+                ? "Подключаюсь к \(profile.host)…"
+                : "Попытка \(attempt) из \(attempts): \(profile.host)…"
+
+            let created: KeeneticTransport = profile.transport == .ssh
+                ? SSHTransport(profile: profile, password: password)
+                : try RCITransport(profile: profile, password: password)
+
+            let started = Date()
+            do {
+                try await watch(created, budget: 70) { try created.connect() }
+                let elapsed = Date().timeIntervalSince(started)
+                log(.ok, "Подключение к \(profile.name) за \(String(format: "%.1f", elapsed)) с"
+                    + (attempt > 1 ? " (попытка \(attempt))" : ""))
+                return created
+            } catch {
+                created.abort()
+                lastError = error
+                let elapsed = Date().timeIntervalSince(started)
+                log(.warn, "Попытка \(attempt)/\(attempts) не удалась за "
+                    + "\(String(format: "%.1f", elapsed)) с: \(describe(error))")
+
+                // Пароль не подошёл — повторять бессмысленно.
+                if let transportError = error as? TransportError,
+                   transportError.message.contains("логин") || transportError.message.contains("пароль") {
+                    throw error
+                }
+                if attempt < attempts {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                }
+            }
+        }
+
+        throw lastError
+    }
+
+    /// Сторож: если операция залипла дольше отведённого, рвём транспорт.
+    /// Иначе последовательная очередь встанет намертво и интерфейс замрёт
+    /// на «Подключаюсь…» без единой записи в журнале.
+    private func watch<T>(_ transport: KeeneticTransport, budget: TimeInterval,
+                          _ body: @escaping () throws -> T) async throws -> T {
+        let watchdog = Task {
+            try await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
+            transport.abort()
+            log(.warn, "Операция превысила \(Int(budget)) с — соединение оборвано.")
+        }
+        defer { watchdog.cancel() }
+        return try await background(body)
+    }
+
+    /// То же самое для текущего транспорта.
+    private func guarded<T>(budget: TimeInterval,
+                            _ body: @escaping (KeeneticTransport) throws -> T) async throws -> T {
+        let active = try await session()
+        do {
+            return try await watch(active, budget: budget) { try body(active) }
+        } catch {
+            // Транспорт мёртв — следующая операция поднимет новый.
+            if transport === active {
+                transport = nil
+                status = .failed(describe(error))
+            }
             throw error
         }
     }
@@ -142,12 +220,11 @@ final class RouterSession: ObservableObject {
 
     @discardableResult
     func refresh() async throws -> RouterState {
-        let transport = try await session()
         activity = "Читаю конфигурацию роутера…"
         defer { activity = nil }
 
-        let fresh: RouterState = try await background {
-            let configText = try transport.fetchText("show running-config", timeout: 360)
+        let fresh: RouterState = try await guarded(budget: 200) { transport in
+            let configText = try transport.fetchText("show running-config", timeout: 180)
 
             var statusInterfaces: [String: KeeneticInterface] = [:]
             if let rci = transport as? RCITransport {
@@ -197,8 +274,8 @@ final class RouterSession: ObservableObject {
             configText = current.configText
         } else {
             activity = "Читаю конфигурацию перед изменением…"
-            configText = try await background {
-                try transport.fetchText("show running-config", timeout: 360)
+            configText = try await watch(transport, budget: 200) {
+                try transport.fetchText("show running-config", timeout: 180)
             }
             activity = nil
         }
@@ -226,7 +303,9 @@ final class RouterSession: ObservableObject {
 
         if saveConfig {
             activity = "Сохраняю конфигурацию роутера…"
-            let output = try await background { try transport.run("system configuration save", timeout: 300) }
+            let output = try await watch(transport, budget: 200) {
+                try transport.run("system configuration save", timeout: 180)
+            }
             activity = nil
             if CLI.failed(output) {
                 log(.error, "Не удалось сохранить конфигурацию: \(output)")
@@ -272,7 +351,7 @@ final class RouterSession: ObservableObject {
             }
 
             let batch = chunk
-            let output = try await background { () -> String in
+            let output = try await watch(transport, budget: 150) { () -> String in
                 batch.count == 1
                     ? try transport.run(batch[0], timeout: 120)
                     : try transport.runBatch(batch, timeout: 120)
@@ -282,7 +361,9 @@ final class RouterSession: ObservableObject {
                 if batch.count > 1 {
                     log(.warn, "Ошибка внутри пачки — повторяю команды по одной…")
                     for command in batch {
-                        let single = try await background { try transport.run(command, timeout: 120) }
+                        let single = try await watch(transport, budget: 150) {
+                            try transport.run(command, timeout: 120)
+                        }
                         if CLI.failed(single) {
                             throw TransportError("Роутер отверг команду: \(command)", hint: single)
                         }
@@ -299,7 +380,9 @@ final class RouterSession: ObservableObject {
     }
 
     private func verify(plan: Plan, transport: KeeneticTransport, limit: Int) async throws -> [String] {
-        let configText = try await background { try transport.fetchText("show running-config", timeout: 360) }
+        let configText = try await watch(transport, budget: 200) {
+            try transport.fetchText("show running-config", timeout: 180)
+        }
         let groups = RouterConfigParser.parseFqdnGroups(configText)
         var problems: [String] = []
 
@@ -358,7 +441,9 @@ final class RouterSession: ObservableObject {
         var outputs: [String] = []
         for (index, command) in commands.enumerated() {
             log(.cmd, command)
-            let output = try await background { try transport.run(command, timeout: 120) }
+            let output = try await watch(transport, budget: 150) {
+                try transport.run(command, timeout: 120)
+            }
             if CLI.failed(output) {
                 throw TransportError("Роутер отверг команду: \(command)", hint: output)
             }
@@ -367,7 +452,9 @@ final class RouterSession: ObservableObject {
         }
 
         if saveConfig {
-            let output = try await background { try transport.run("system configuration save", timeout: 300) }
+            let output = try await watch(transport, budget: 200) {
+                try transport.run("system configuration save", timeout: 180)
+            }
             if CLI.failed(output) {
                 throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
             }
@@ -380,12 +467,16 @@ final class RouterSession: ObservableObject {
 
     func readConfigText() async throws -> String {
         let transport = try await session()
-        return try await background { try transport.fetchText("show running-config", timeout: 360) }
+        return try await watch(transport, budget: 200) {
+            try transport.fetchText("show running-config", timeout: 180)
+        }
     }
 
     func readStartupConfig() async throws -> String {
         let transport = try await session()
-        return try await background { try transport.fetchText("show startup-config", timeout: 360) }
+        return try await watch(transport, budget: 200) {
+            try transport.fetchText("show startup-config", timeout: 180)
+        }
     }
 
     // MARK: - Загрузка списков доменов

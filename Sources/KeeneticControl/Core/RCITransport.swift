@@ -125,6 +125,8 @@ final class RCITransport: KeeneticTransport {
         authorized = false
     }
 
+    func abort() { close() }
+
     private func isConfigDump(_ command: String) -> Bool {
         command.hasPrefix("show running-config") || command.hasPrefix("show startup-config")
     }
