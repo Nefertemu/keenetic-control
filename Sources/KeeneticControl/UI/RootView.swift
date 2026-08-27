@@ -6,6 +6,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case fqdn
     case dnsRoutes
     case staticRoutes
+    case compare
     case backups
     case journal
     case routers
@@ -19,6 +20,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .fqdn:          return "Списки FQDN"
         case .dnsRoutes:     return "Маршруты списков"
         case .staticRoutes:  return "Статические маршруты"
+        case .compare:       return "Сравнение роутеров"
         case .backups:       return "Резервные копии"
         case .journal:       return "Журнал"
         case .routers:       return "Роутеры и настройки"
@@ -32,6 +34,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .fqdn:          return "list.bullet.rectangle"
         case .dnsRoutes:     return "arrow.triangle.branch"
         case .staticRoutes:  return "point.topleft.down.to.point.bottomright.curvepath"
+        case .compare:       return "arrow.left.arrow.right"
         case .backups:       return "clock.arrow.circlepath"
         case .journal:       return "text.alignleft"
         case .routers:       return "gearshape"
@@ -42,7 +45,8 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview:                          return "Роутер"
         case .wireguard:                         return "Туннели"
-        case .fqdn, .dnsRoutes, .staticRoutes:   return "Маршрутизация"
+        case .fqdn, .dnsRoutes, .staticRoutes, .compare:
+                                                 return "Маршрутизация"
         case .backups, .journal, .routers:       return "Служебное"
         }
     }
@@ -234,6 +238,7 @@ struct RootView: View {
                 case .fqdn:          FqdnView(alert: $alert)
                 case .dnsRoutes:     DnsRoutesView(alert: $alert)
                 case .staticRoutes:  StaticRoutesView(alert: $alert)
+                case .compare:       CompareView(alert: $alert, section: $section)
                 case .backups:       BackupsView(alert: $alert)
                 case .journal:       JournalView()
                 case .routers:       RoutersView(alert: $alert)

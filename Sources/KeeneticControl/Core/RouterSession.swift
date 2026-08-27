@@ -127,6 +127,18 @@ final class RouterSession: ObservableObject {
         slots[id]?.status.isOnline ?? false
     }
 
+    /// Прочитанное состояние любого роутера из пула — для сравнения между собой.
+    func readState(for id: UUID) -> RouterState? {
+        id == router.id ? state : slots[id]?.state
+    }
+
+    /// Роутеры, конфигурацию которых уже прочитали.
+    func routersWithState() -> Set<UUID> {
+        var result = Set(slots.filter { $0.value.state != nil }.map(\.key))
+        if state != nil { result.insert(router.id) }
+        return result
+    }
+
     // MARK: - Подключение
 
     /// Переключение НЕ разрывает связь: соединение остаётся в своём слоте,

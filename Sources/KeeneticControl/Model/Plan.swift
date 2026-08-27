@@ -272,6 +272,96 @@ enum Planner {
         return plan
     }
 
+    // MARK: - Перенос списков между роутерами
+
+    /// Дополняет списки текущего роутера тем, чего не хватает по сравнению
+    /// с эталонным. Списки сопоставляются по описанию — именно оно, а не
+    /// идентификатор, одинаково на разных роутерах. Операция только
+    /// добавляющая: лишнее на текущем роутере не трогается, только отмечается.
+    static func planSync(reference: [String: FqdnGroup],
+                         current: [String: FqdnGroup],
+                         chunkSize: Int,
+                         reservedIDs: inout Set<String>) -> Plan {
+        var plan = Plan(title: "Перенос недостающих доменов")
+        reservedIDs.formUnion(current.keys)
+
+        // Группируем по описанию: одна «часть» источника может быть разбита
+        // на несколько списков с одинаковым описанием.
+        func byDescription(_ groups: [String: FqdnGroup]) -> [String: [FqdnGroup]] {
+            var result: [String: [FqdnGroup]] = [:]
+            for group in groups.values where !group.descriptionText.isEmpty {
+                result[group.descriptionText, default: []].append(group)
+            }
+            for key in result.keys { result[key]?.sort { $0.ident < $1.ident } }
+            return result
+        }
+
+        let referenceByName = byDescription(reference)
+        let currentByName = byDescription(current)
+
+        var plannedCounts: [String: Int] = [:]
+        for group in current.values { plannedCounts[group.ident] = group.includes.count }
+
+        var createdLists = 0
+
+        for name in referenceByName.keys.sorted() {
+            let source = referenceByName[name] ?? []
+            let sourceDomains = source.reduce(into: [String]()) { result, group in
+                result.append(contentsOf: group.includes.sorted())
+            }
+
+            var targets = currentByName[name] ?? []
+            let present = targets.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
+            // Домен, лежащий в любом списке роутера, повторно не добавляем.
+            let anywhere = current.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
+
+            let missing = sourceDomains.filter { !present.contains($0) && !anywhere.contains($0) }
+            guard !missing.isEmpty else { continue }
+
+            for domain in missing {
+                var target = targets.first { (plannedCounts[$0.ident] ?? 0) < chunkSize }
+
+                if target == nil {
+                    let ident = allocateGroupIDs(existing: &reservedIDs, count: 1)[0]
+                    var created = FqdnGroup(ident: ident)
+                    created.descriptionText = name
+                    targets.append(created)
+                    plan.createdGroups.append(created)
+                    plannedCounts[ident] = 0
+                    createdLists += 1
+                    plan.commands.append("object-group fqdn \(ident)")
+                    plan.commands.append("object-group fqdn \(ident) description \(CLI.quote(name))")
+                    target = created
+                }
+
+                guard let chosen = target else { continue }
+                plan.addDomain(chosen.ident, domain,
+                               command: "object-group fqdn \(chosen.ident) include \(domain)")
+                plannedCounts[chosen.ident, default: 0] += 1
+            }
+        }
+
+        // То, чего нет на эталонном роутере, — просто сообщаем.
+        let referenceDomains = reference.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
+        let currentDomains = current.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
+        let extra = currentDomains.subtracting(referenceDomains)
+        if !extra.isEmpty {
+            plan.notes.append("На этом роутере есть \(Format.domains(extra.count)), которых нет "
+                              + "у эталонного. Они не трогаются.")
+        }
+
+        let missingNames = Set(referenceByName.keys).subtracting(currentByName.keys)
+        if !missingNames.isEmpty {
+            plan.notes.append("Списков не было вовсе: " + missingNames.sorted().joined(separator: ", "))
+        }
+        if createdLists > 0 {
+            plan.notes.append("Создаётся новых частей: \(createdLists). "
+                              + "Маршруты им не назначаются — это отдельная вкладка.")
+        }
+
+        return plan
+    }
+
     /// Сначала все удаления, потом создание списков и добавления.
     static func merge(title: String, plans: [Plan]) -> Plan {
         var merged = Plan(title: title)
