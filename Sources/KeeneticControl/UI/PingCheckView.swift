@@ -7,8 +7,15 @@ struct PingCheckView: View {
     @ObservedObject private var store = Store.shared
     @Binding var alert: AlertPayload?
 
-    @State private var editing: PingCheckProfile?
-    @State private var isNewProfile = false
+    /// Профиль и признак новизны — одним значением: раздельные состояния
+    /// расходились, и диалог открывался с заблокированным именем.
+    private struct Editing: Identifiable {
+        let id = UUID()
+        var profile: PingCheckProfile
+        var isNew: Bool
+    }
+
+    @State private var editing: Editing?
     @State private var confirmDelete: PingCheckProfile?
     @State private var pending: [String: PingCheckBinding] = [:]
     @State private var plan: Plan?
@@ -61,8 +68,8 @@ struct PingCheckView: View {
             }
             .padding(20)
         }
-        .sheet(item: $editing) { profile in
-            PingCheckEditor(profile: profile, isNew: isNewProfile) { edited in
+        .sheet(item: $editing) { item in
+            PingCheckEditor(profile: item.profile, isNew: item.isNew) { edited in
                 editing = nil
                 buildSavePlan(edited)
             } onCancel: { editing = nil }
@@ -101,10 +108,10 @@ struct PingCheckView: View {
                            subtitle: "Роутер проверяет связь и гасит интерфейс, если узел не отвечает")
                 Spacer()
                 Button("Добавить профиль") {
-                    isNewProfile = true
                     // Пустые поля роутер заполнит своими значениями по умолчанию.
-                    editing = PingCheckProfile(name: "", host: "", mode: .icmp,
-                                               updateInterval: 10)
+                    editing = Editing(profile: PingCheckProfile(name: "", host: "", mode: .icmp,
+                                                                updateInterval: 10),
+                                      isNew: true)
                 }
                 .buttonStyle(PrimaryButtonStyle())
             }
@@ -159,8 +166,7 @@ struct PingCheckView: View {
             }
 
             Button("Изменить") {
-                isNewProfile = false
-                editing = profile
+                editing = Editing(profile: profile, isNew: false)
             }
             .buttonStyle(SubtleButtonStyle())
             .disabled(profile.isBuiltIn)
