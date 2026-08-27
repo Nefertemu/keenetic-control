@@ -351,4 +351,9 @@ enum WireGuardVault {
     static func clearBaseline(router: RouterProfile, interface: String) {
         Keychain.delete(account: account(router: router, interface: interface))
     }
+
+    /// Все возможные имена rollback-баз роутера — для полной уборки.
+    static func baselineAccounts(router: RouterProfile) -> [String] {
+        (0...15).map { account(router: router, interface: "Wireguard\($0)") }
+    }
 }

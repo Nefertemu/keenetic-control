@@ -68,7 +68,7 @@ struct OverviewView: View {
     private func failure(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             CardHeader(icon: "exclamationmark.triangle.fill", title: "Не удалось подключиться",
-                       subtitle: session.router.subtitle, tint: Palette.danger)
+                       subtitle: session.router.endpoint, tint: Palette.danger)
             Text(message)
                 .font(.system(size: 12, design: .monospaced))
                 .textSelection(.enabled)
@@ -91,7 +91,7 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 CardHeader(icon: "wifi.router.fill", title: session.router.name,
-                           subtitle: "Прочитано \(Format.age(state.readAt)) · \(session.router.subtitle)")
+                           subtitle: "Прочитано \(Format.age(state.readAt)) · \(session.router.endpoint)")
                 Spacer()
                 StatusPill(text: session.status.title, tint: session.status.tint, icon: "bolt.fill")
             }
@@ -116,8 +116,9 @@ struct OverviewView: View {
             CardHeader(icon: "network", title: "Интерфейсы",
                        subtitle: "Сначала те, на которые есть смысл вешать маршруты")
 
+            let visible = Array(state.candidates.prefix(9))
             VStack(spacing: 0) {
-                ForEach(Array(state.candidates.prefix(9))) { item in
+                ForEach(visible) { item in
                     HStack(spacing: 10) {
                         Circle()
                             .fill(item.isUp ? Palette.success : Color.secondary.opacity(0.4))
@@ -143,7 +144,7 @@ struct OverviewView: View {
                     }
                     .padding(.vertical, 7)
 
-                    if item.id != state.candidates.prefix(9).last?.id { Divider() }
+                    if item.id != visible.last?.id { Divider() }
                 }
 
                 if state.candidates.isEmpty {

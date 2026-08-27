@@ -9,9 +9,13 @@ image.lockFocus()
 guard let context = NSGraphicsContext.current?.cgContext else { exit(1) }
 
 // --- Фон: squircle с диагональным градиентом.
-let inset: CGFloat = size * 0.055
-let rect = CGRect(x: inset, y: inset, width: size - inset * 2, height: size - inset * 2)
-let shape = CGPath(roundedRect: rect, cornerWidth: size * 0.225, cornerHeight: size * 0.225, transform: nil)
+// macOS ждёт вокруг иконки заметные поля: без них док обрезает рисунок.
+// Квадрат занимает ~80% холста, скругление — ~22% его стороны.
+let inset: CGFloat = size * 0.10
+let side = size - inset * 2
+let corner = side * 0.2237
+let rect = CGRect(x: inset, y: inset, width: side, height: side)
+let shape = CGPath(roundedRect: rect, cornerWidth: corner, cornerHeight: corner, transform: nil)
 
 context.saveGState()
 context.addPath(shape)
@@ -39,13 +43,13 @@ context.drawRadialGradient(glow,
                            options: [])
 context.restoreGState()
 
-let center = CGPoint(x: size / 2, y: size * 0.505)
+let center = CGPoint(x: size / 2, y: size * 0.495)
 let white = NSColor.white
 let accent = NSColor(srgbRed: 1.00, green: 0.74, blue: 0.24, alpha: 1)
 
 // --- Корпус роутера.
-let bodyWidth = size * 0.46
-let bodyHeight = size * 0.135
+let bodyWidth = size * 0.40
+let bodyHeight = size * 0.118
 let body = CGRect(x: center.x - bodyWidth / 2, y: center.y - bodyHeight * 1.55,
                   width: bodyWidth, height: bodyHeight)
 context.setFillColor(white.cgColor)
@@ -64,12 +68,12 @@ for index in 0..<3 {
 
 // --- Волны сигнала над корпусом.
 let waveBase = CGPoint(x: center.x, y: body.maxY + size * 0.012)
-let lineWidth = size * 0.052
+let lineWidth = size * 0.046
 context.setLineCap(.round)
 context.setLineWidth(lineWidth)
 
 for index in 0..<3 {
-    let radius = size * (0.105 + CGFloat(index) * 0.082)
+    let radius = size * (0.092 + CGFloat(index) * 0.072)
     let alpha = 1.0 - Double(index) * 0.24
     context.setStrokeColor(white.withAlphaComponent(alpha).cgColor)
     context.addArc(center: waveBase, radius: radius,
@@ -83,7 +87,7 @@ context.fillEllipse(in: CGRect(x: waveBase.x - size * 0.033, y: waveBase.y - siz
                                width: size * 0.066, height: size * 0.066))
 
 // --- Ветвление маршрута под корпусом.
-context.setLineWidth(size * 0.036)
+context.setLineWidth(size * 0.032)
 context.setStrokeColor(white.withAlphaComponent(0.92).cgColor)
 let stemTop = body.minY
 let junction = stemTop - size * 0.065
@@ -91,8 +95,8 @@ context.move(to: CGPoint(x: center.x, y: stemTop))
 context.addLine(to: CGPoint(x: center.x, y: junction))
 context.strokePath()
 
-let arm = size * 0.135
-let drop = size * 0.062
+let arm = size * 0.118
+let drop = size * 0.054
 for direction in [-1.0, 1.0] {
     context.move(to: CGPoint(x: center.x, y: junction))
     context.addLine(to: CGPoint(x: center.x + arm * direction, y: junction))

@@ -59,7 +59,7 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 218, ideal: 232, max: 280)
+                .navigationSplitViewColumnWidth(min: 230, ideal: 252, max: 320)
         } detail: {
             detail
         }
@@ -108,46 +108,59 @@ struct RootView: View {
         return seen
     }
 
+    /// Карточка роутера. Раньше вся карточка была одним Menu — borderlessButton
+    /// схлопывал её до размера первой строки, адрес пропадал, а клик попадал
+    /// мимо. Теперь карточка обычная, а выбор роутера — на отдельной кнопке.
     private var routerCard: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Menu {
-                ForEach(store.routers) { router in
-                    Button {
-                        store.selectedRouterID = router.id
-                        Task { await session.switchTo(router) }
-                    } label: {
-                        Label(router.name, systemImage: router.id == session.router.id
-                              ? "checkmark.circle.fill" : "wifi.router")
-                    }
-                }
-                Divider()
-                Button("Управление роутерами…") { section = .routers }
-            } label: {
-                HStack(spacing: 9) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(session.status.tint.opacity(0.16))
+                        .frame(width: 32, height: 32)
                     Image(systemName: "wifi.router.fill")
-                        .font(.system(size: 15))
-                        .foregroundStyle(Palette.accent)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(session.router.name)
-                            .font(.system(size: 13, weight: .semibold))
-                            .lineLimit(1)
-                        Text(session.router.subtitle)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(session.status.tint)
+                }
+
+                Text(session.router.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+
+                Spacer(minLength: 2)
+
+                Menu {
+                    ForEach(store.routers) { router in
+                        Button {
+                            store.selectedRouterID = router.id
+                            Task { await session.switchTo(router) }
+                        } label: {
+                            Label(router.name, systemImage: router.id == session.router.id
+                                  ? "checkmark.circle.fill" : "wifi.router")
+                        }
                     }
-                    Spacer(minLength: 4)
+                    Divider()
+                    Button("Управление роутерами…") { section = .routers }
+                } label: {
                     Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Сменить роутер")
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .inset(cornerRadius: 10)
+
+            // Адрес занимает всю ширину карточки: рядом с иконкой ему тесно,
+            // и он резался посередине.
+            Text(session.router.endpoint)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(session.router.endpoint)
 
             HStack(spacing: 8) {
                 StatusPill(text: session.status.title,
@@ -160,7 +173,7 @@ struct RootView: View {
                     Task { await toggleConnection() }
                 } label: {
                     Image(systemName: session.status.isOnline ? "eject.circle" : "bolt.circle")
-                        .font(.system(size: 15))
+                        .font(.system(size: 16))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(session.status.isOnline ? Color.secondary : Palette.accent)
@@ -168,6 +181,9 @@ struct RootView: View {
                 .disabled(session.status.isBusy)
             }
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .inset(cornerRadius: 11)
     }
 
     private var footer: some View {

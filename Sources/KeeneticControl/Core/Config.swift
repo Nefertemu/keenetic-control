@@ -85,9 +85,10 @@ struct RouterProfile: Identifiable, Codable, Hashable {
     }
 
     /// Куда реально уходит подключение — это и показываем пользователю.
+    /// Порт 22 у SSH подразумевается и только занимает место.
     var endpoint: String {
         switch transport {
-        case .ssh:  return "\(host):\(port)"
+        case .ssh:  return port == 22 ? host : "\(host):\(port)"
         case .http: return effectiveWebURL
         }
     }
@@ -204,6 +205,11 @@ final class Store: ObservableObject {
 
     func remove(_ router: RouterProfile) {
         router.password = nil
+        // Вместе с роутером убираем и его rollback-базы WireGuard,
+        // иначе они остаются в связке ключей навсегда.
+        for name in WireGuardVault.baselineAccounts(router: router) {
+            Keychain.delete(account: name)
+        }
         routers.removeAll { $0.id == router.id }
         if selectedRouterID == router.id { selectedRouterID = routers.first?.id }
     }

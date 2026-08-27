@@ -75,13 +75,24 @@ final class LogStore: ObservableObject {
     private func write(_ entry: LogEntry) {
         let line = "\(fileFormatter.string(from: entry.date))\t\(entry.level.rawValue)\t\(entry.text)\n"
         guard let data = line.data(using: .utf8) else { return }
+
         if let handle = try? FileHandle(forWritingTo: fileURL) {
             defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
+            let size = (try? handle.seekToEnd()) ?? 0
             try? handle.write(contentsOf: data)
+            if size > Self.maxFileSize { rotate() }
         } else {
             try? data.write(to: fileURL)
         }
+    }
+
+    /// Без ротации файл журнала растёт бесконечно.
+    private static let maxFileSize: UInt64 = 4 * 1024 * 1024
+
+    private func rotate() {
+        let archive = fileURL.deletingPathExtension().appendingPathExtension("1.log")
+        try? FileManager.default.removeItem(at: archive)
+        try? FileManager.default.moveItem(at: fileURL, to: archive)
     }
 }
 

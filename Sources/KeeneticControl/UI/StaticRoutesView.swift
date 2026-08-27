@@ -89,7 +89,7 @@ struct StaticRoutesView: View {
                 Button("Импорт из BAT/TXT…") { importFile() }
                     .buttonStyle(SubtleButtonStyle())
 
-                Menu("Экспорт") {
+                Menu(selection.isEmpty ? "Экспорт" : "Экспорт выбранных") {
                     Button("В BAT для Windows…") { export(bat: true) }
                     Button("В команды Keenetic…") { export(bat: false) }
                 }
@@ -150,7 +150,6 @@ struct StaticRoutesView: View {
             }
         }
         .card(padding: 0)
-        .padding(.bottom, 0)
     }
 
     private func row(_ route: StaticRoute) -> some View {
@@ -251,7 +250,10 @@ struct StaticRoutesView: View {
     }
 
     private func export(bat: Bool) {
-        let all = session.state?.staticRoutes ?? []
+        // Если что-то выделено — выгружаем выделенное, иначе всё.
+        let everything = session.state?.staticRoutes ?? []
+        let chosen = everything.filter { selection.contains($0.id) }
+        let all = chosen.isEmpty ? everything : chosen
         guard !all.isEmpty else { return }
 
         let panel = NSSavePanel()
