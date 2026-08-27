@@ -49,8 +49,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 }
 
 struct RootView: View {
-    @StateObject private var session = RouterSession(
-        router: Store.shared.selectedRouter ?? RouterProfile())
+    @ObservedObject var session: RouterSession
     @ObservedObject private var store = Store.shared
 
     @State private var section: AppSection = .overview
@@ -71,6 +70,7 @@ struct RootView: View {
                   dismissButton: .default(Text("Понятно")))
         }
         .task {
+            AppDelegate.session = session
             if let router = store.selectedRouter { await session.switchTo(router) }
         }
     }
@@ -135,8 +135,13 @@ struct RootView: View {
                             store.selectedRouterID = router.id
                             Task { await session.switchTo(router) }
                         } label: {
-                            Label(router.name, systemImage: router.id == session.router.id
-                                  ? "checkmark.circle.fill" : "wifi.router")
+                            // Связь при переключении не рвётся — показываем,
+                            // к кому уже подключены.
+                            Text(router.id == session.router.id
+                                 ? "● \(router.name)"
+                                 : (session.isConnected(router.id)
+                                    ? "\(router.name) — на связи"
+                                    : router.name))
                         }
                     }
                     Divider()

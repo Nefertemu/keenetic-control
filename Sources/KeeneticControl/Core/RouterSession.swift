@@ -67,68 +67,179 @@ struct ApplyOutcome {
     var elapsed: TimeInterval = 0
 }
 
+/// Живое соединение с одним роутером. Переключение между роутерами их не
+/// рвёт: у каждого своё состояние, своя очередь операций и своя попытка
+/// подключения, так что долгое чтение одного не блокирует другой.
+@MainActor
+final class RouterSlot {
+    var transport: KeeneticTransport?
+    var state: RouterState?
+    var status: ConnectionStatus = .offline
+    var connectTask: Task<KeeneticTransport, Error>?
+    /// По чему судим, что профиль поменялся и соединение пора выбросить.
+    var connectionKey: String
+    let queue: DispatchQueue
+
+    init(profile: RouterProfile) {
+        connectionKey = profile.connectionKey
+        queue = DispatchQueue(
+            label: "pro.netcraze.KeeneticControl.session.\(profile.id.uuidString)",
+            qos: .userInitiated)
+    }
+}
+
 @MainActor
 final class RouterSession: ObservableObject {
-    @Published private(set) var status: ConnectionStatus = .offline
-    @Published private(set) var state: RouterState?
+    // Свойства описывают АКТИВНЫЙ роутер и зеркалятся в его слот,
+    // чтобы состояние пережило переключение.
+    @Published private(set) var status: ConnectionStatus = .offline {
+        didSet { slots[router.id]?.status = status }
+    }
+    @Published private(set) var state: RouterState? {
+        didSet { slots[router.id]?.state = state }
+    }
     @Published private(set) var progress: ProgressInfo?
     @Published private(set) var activity: String?
     @Published var router: RouterProfile
 
-    private var transport: KeeneticTransport?
-    private let queue = DispatchQueue(label: "pro.netcraze.KeeneticControl.session", qos: .userInitiated)
-    /// Одна попытка подключения на сессию: две параллельные плодят лишние
-    /// SSH-процессы, и роутер начинает их отбивать.
-    private var connectTask: Task<KeeneticTransport, Error>?
+    private var transport: KeeneticTransport? {
+        didSet { slots[router.id]?.transport = transport }
+    }
+    private var slots: [UUID: RouterSlot] = [:]
+
+    private var activeSlot: RouterSlot { slot(for: router) }
+    private var queue: DispatchQueue { activeSlot.queue }
 
     init(router: RouterProfile) {
         self.router = router
+        slots[router.id] = RouterSlot(profile: router)
+    }
+
+    private func slot(for profile: RouterProfile) -> RouterSlot {
+        if let existing = slots[profile.id] { return existing }
+        let created = RouterSlot(profile: profile)
+        slots[profile.id] = created
+        return created
+    }
+
+    /// Какие роутеры сейчас на связи — для отметок в списке выбора.
+    func isConnected(_ id: UUID) -> Bool {
+        slots[id]?.status.isOnline ?? false
     }
 
     // MARK: - Подключение
 
-    func switchTo(_ router: RouterProfile) async {
-        guard router.id != self.router.id else {
-            self.router = router
+    /// Переключение НЕ разрывает связь: соединение остаётся в своём слоте,
+    /// и возврат к роутеру происходит мгновенно, без повторного чтения.
+    func switchTo(_ profile: RouterProfile) async {
+        if profile.id == router.id {
+            router = profile
+            dropIfProfileChanged(profile)
             return
         }
-        await disconnect()
-        self.router = router
-        state = nil
+
+        // Текущее состояние уже лежит в своём слоте благодаря didSet.
+        router = profile
+        let target = slot(for: profile)
+        dropIfProfileChanged(profile)
+
+        transport = target.transport
+        state = target.state
+        status = target.status
+        progress = nil
+        activity = nil
+    }
+
+    /// Сменили адрес, порт или транспорт — старое соединение уже не про этот роутер.
+    private func dropIfProfileChanged(_ profile: RouterProfile) {
+        let target = slot(for: profile)
+        guard target.connectionKey != profile.connectionKey else { return }
+        target.connectionKey = profile.connectionKey
+
+        let stale = target.transport
+        target.transport = nil
+        target.state = nil
+        target.status = .offline
+        target.connectTask?.cancel()
+        target.connectTask = nil
+
+        if profile.id == router.id {
+            transport = nil
+            state = nil
+            status = .offline
+        }
+        // abort() безопасен из любого потока и не блокирует: закрывает
+        // дескриптор и добивает процесс, ждать его на очереди слота незачем.
+        stale?.abort()
+    }
+
+    /// Закрыть все живые соединения — при выходе из приложения.
+    func disconnectAll() {
+        for slot in slots.values {
+            slot.connectTask?.cancel()
+            slot.transport?.abort()
+            slot.transport = nil
+            slot.status = .offline
+        }
+        transport = nil
         status = .offline
+    }
+
+    /// Результат операции мог прийти уже после переключения роутера —
+    /// тогда он принадлежит слоту владельца, а не активным свойствам.
+    private func store(transport newValue: KeeneticTransport?,
+                       status newStatus: ConnectionStatus, owner: UUID) {
+        if owner == router.id {
+            transport = newValue
+            status = newStatus
+        } else if let slot = slots[owner] {
+            slot.transport = newValue
+            slot.status = newStatus
+        }
+    }
+
+    private func store(state newValue: RouterState, owner: UUID) {
+        if owner == router.id { state = newValue } else { slots[owner]?.state = newValue }
+    }
+
+    private func clearActivity(owner: UUID) {
+        if owner == router.id { activity = nil }
     }
 
     func connect() async throws {
         if status.isOnline, transport != nil { return }
 
+        let slot = activeSlot
+
         // Попытка уже идёт — дожидаемся её, а не поднимаем вторую сессию.
-        if let running = connectTask {
+        if let running = slot.connectTask {
             _ = try await running.value
             return
         }
 
         status = .connecting
         let profile = router
-        let password = router.resolvedPassword
+        let owner = profile.id
 
-        let task = Task { try await self.openTransport(profile: profile, password: password) }
-        connectTask = task
-        defer { connectTask = nil; activity = nil }
+        let task = Task { try await self.openTransport(profile: profile) }
+        slot.connectTask = task
+        defer { slot.connectTask = nil; clearActivity(owner: owner) }
 
         do {
             let opened = try await task.value
-            transport = opened
-            status = .online(profile.transport)
+            store(transport: opened, status: .online(profile.transport), owner: owner)
         } catch {
-            transport = nil
-            status = .failed(describe(error))
+            store(transport: nil, status: .failed(describe(error)), owner: owner)
             log(.error, "Подключение к \(profile.name): \(describe(error))")
             throw error
         }
     }
 
     /// Связь с роутером бывает капризной — одна осечка не повод сдаваться.
-    private func openTransport(profile: RouterProfile, password: String?) async throws -> KeeneticTransport {
+    private func openTransport(profile: RouterProfile) async throws -> KeeneticTransport {
+        // Связка ключей может показать системный запрос доступа и держать
+        // вызов сколько угодно — на главном потоке это заморозило бы окно.
+        let password = await Task.detached { profile.resolvedPassword }.value
         let attempts = 3
         var lastError: Error = TransportError("Не удалось подключиться.")
 
@@ -183,14 +294,15 @@ final class RouterSession: ObservableObject {
     /// То же самое для текущего транспорта.
     private func guarded<T>(budget: TimeInterval,
                             _ body: @escaping (KeeneticTransport) throws -> T) async throws -> T {
+        let owner = router.id
         let active = try await session()
         do {
             return try await watch(active, budget: budget) { try body(active) }
         } catch {
             // Транспорт мёртв — следующая операция поднимет новый.
-            if transport === active {
-                transport = nil
-                status = .failed(describe(error))
+            let slot = slots[owner]
+            if transport === active || slot?.transport === active {
+                store(transport: nil, status: .failed(describe(error)), owner: owner)
             }
             throw error
         }
@@ -202,6 +314,7 @@ final class RouterSession: ObservableObject {
             return
         }
         self.transport = nil
+        state = nil
         status = .offline
         await background { transport.close() }
     }
@@ -217,8 +330,9 @@ final class RouterSession: ObservableObject {
 
     @discardableResult
     func refresh() async throws -> RouterState {
+        let owner = router.id
         activity = "Читаю конфигурацию роутера…"
-        defer { activity = nil }
+        defer { clearActivity(owner: owner) }
 
         let fresh: RouterState = try await guarded(budget: 200) { transport in
             let configText = try transport.fetchText("show running-config", timeout: 180)
@@ -246,7 +360,7 @@ final class RouterSession: ObservableObject {
                 readAt: Date())
         }
 
-        state = fresh
+        store(state: fresh, owner: owner)
         log(.ok, "Прочитано: \(Format.lists(fresh.groups.count)), "
             + "\(Format.domains(fresh.totalDomains)), "
             + "\(Format.routes(fresh.staticRoutes.count)).")
@@ -377,6 +491,7 @@ final class RouterSession: ObservableObject {
     }
 
     private func verify(plan: Plan, transport: KeeneticTransport, limit: Int) async throws -> [String] {
+        let owner = router.id
         let configText = try await watch(transport, budget: 200) {
             try transport.fetchText("show running-config", timeout: 180)
         }
@@ -413,14 +528,15 @@ final class RouterSession: ObservableObject {
         }
 
         // Обновляем состояние из уже прочитанной конфигурации — лишний раз не ходим.
-        state = RouterState(
+        let previous = owner == router.id ? state : slots[owner]?.state
+        store(state: RouterState(
             configText: configText,
             groups: groups,
-            interfaces: state?.interfaces ?? [:],
-            candidates: state?.candidates ?? [],
+            interfaces: previous?.interfaces ?? [:],
+            candidates: previous?.candidates ?? [],
             staticRoutes: StaticRouteParser.parse(config: configText),
             wireguardInterfaces: WireGuardState.interfaceNames(config: configText),
-            readAt: Date())
+            readAt: Date()), owner: owner)
 
         return problems
     }

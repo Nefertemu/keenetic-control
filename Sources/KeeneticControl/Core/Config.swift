@@ -93,6 +93,12 @@ struct RouterProfile: Identifiable, Codable, Hashable {
         }
     }
 
+    /// По чему судим, что профиль изменился настолько, что старое
+    /// соединение к нему уже не относится.
+    var connectionKey: String {
+        "\(transport.rawValue)|\(host)|\(port)|\(user)|\(webURL)"
+    }
+
     /// Локальная панель живёт по http, KeenDNS и любой внешний адрес — по https.
     static func looksLocal(_ host: String) -> Bool {
         if host.hasSuffix(".local") || host == "localhost" { return true }

@@ -286,7 +286,15 @@ struct WireGuardView: View {
 
     private func refreshBaseline() {
         guard !interfaceIdent.isEmpty else { hasBaseline = false; return }
-        hasBaseline = WireGuardVault.hasBaseline(router: session.router, interface: interfaceIdent)
+        let router = session.router
+        let interface = interfaceIdent
+        Task {
+            let found = await Task.detached {
+                WireGuardVault.hasBaseline(router: router, interface: interface)
+            }.value
+            guard interface == interfaceIdent else { return }
+            hasBaseline = found
+        }
     }
 
     private func pickFile() {

@@ -74,7 +74,13 @@ struct RoutersView: View {
     }
 
     private func refreshPasswordFlags() {
-        havePassword = Set(store.routers.filter { $0.password?.isEmpty == false }.map(\.id))
+        let known = store.routers
+        Task {
+            let ids = await Task.detached {
+                Set(known.filter { $0.password?.isEmpty == false }.map(\.id))
+            }.value
+            havePassword = ids
+        }
     }
 
     private func routerRow(_ router: RouterProfile) -> some View {
