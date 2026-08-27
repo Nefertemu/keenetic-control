@@ -71,13 +71,15 @@ final class SSHTransport: KeeneticTransport {
                     guard passwordAttempts <= 3 else {
                         close()
                         throw TransportError("Роутер не принял пароль.",
-                                             hint: "Проверь пароль администратора в карточке роутера.")
+                                             hint: "Проверь пароль администратора в карточке роутера.",
+                                             isAuthFailure: true)
                     }
                     guard let password, !password.isEmpty else {
                         close()
                         throw TransportError(
                             "Роутер \(profile.host) просит пароль, а он не задан.",
-                            hint: "Открой «Роутеры», выбери этот роутер и впиши пароль — он ляжет в связку ключей.")
+                            hint: "Открой «Роутеры», выбери этот роутер и впиши пароль — он ляжет в связку ключей.",
+                            isAuthFailure: true)
                     }
                     send(password + "\n")
 
@@ -85,7 +87,8 @@ final class SSHTransport: KeeneticTransport {
                     close()
                     throw TransportError(
                         "SSH отклонил авторизацию.",
-                        hint: "Проверь логин «\(profile.user)» и пароль.")
+                        hint: "Проверь логин «\(profile.user)» и пароль.",
+                        isAuthFailure: true)
 
                 case 4:
                     // Причина ("Connection refused") лежит в самом совпавшем куске.

@@ -3,9 +3,13 @@ import Foundation
 struct TransportError: LocalizedError {
     let message: String
     var hint: String?
-    init(_ message: String, hint: String? = nil) {
+    /// Роутер не принял логин или пароль — повторять бессмысленно.
+    var isAuthFailure: Bool
+
+    init(_ message: String, hint: String? = nil, isAuthFailure: Bool = false) {
         self.message = message
         self.hint = hint
+        self.isAuthFailure = isAuthFailure
     }
     var errorDescription: String? { message }
 }

@@ -59,7 +59,8 @@ struct CardModifier: ViewModifier {
                     .fill(Palette.surface))
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Palette.stroke, lineWidth: 1))
+                    .strokeBorder(Palette.stroke, lineWidth: 1)
+                    .allowsHitTesting(false))
             .shadow(color: .black.opacity(0.05), radius: 8, y: 2)
     }
 }
@@ -71,7 +72,8 @@ extension View {
     func inset(cornerRadius: CGFloat = 10) -> some View {
         background(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(Palette.inset))
             .overlay(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(Palette.stroke, lineWidth: 1))
+                .strokeBorder(Palette.stroke, lineWidth: 1)
+                .allowsHitTesting(false))
     }
 }
 

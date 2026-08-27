@@ -9,7 +9,9 @@ final class RCITransport: KeeneticTransport {
     private let profile: RouterProfile
     private let password: String?
     private let session: URLSession
-    private let baseURL: URL
+    /// Роутер может увести с http на https. Дальше работаем по конечному
+    /// адресу: иначе POST после 302 потеряет тело и авторизация не пройдёт.
+    private var baseURL: URL
     private var authorized = false
 
     init(profile: RouterProfile, password: String?) throws {
@@ -22,8 +24,11 @@ final class RCITransport: KeeneticTransport {
         self.baseURL = url
 
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpCookieStorage = HTTPCookieStorage()
+        // Хранилище cookie у ephemeral уже своё и изолированное. Свой экземпляр
+        // HTTPCookieStorage() cookie не удерживает — роутер тогда видит запрос
+        // вне сессии, в которой выдал челлендж, и отвечает 400.
         configuration.httpShouldSetCookies = true
+        configuration.httpCookieAcceptPolicy = .always
         configuration.timeoutIntervalForRequest = 45
         configuration.timeoutIntervalForResource = 600
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -41,6 +46,7 @@ final class RCITransport: KeeneticTransport {
 
     private func authenticate() throws {
         let (_, probe) = try perform(request(path: "auth", method: "GET"))
+        adoptRedirect(from: probe)
 
         if probe.statusCode == 200 {
             authorized = true
@@ -60,7 +66,8 @@ final class RCITransport: KeeneticTransport {
         }
         guard let password, !password.isEmpty else {
             throw TransportError("Для \(profile.host) не задан пароль.",
-                                 hint: "Открой «Роутеры» и впиши пароль администратора.")
+                                 hint: "Открой «Роутеры» и впиши пароль администратора.",
+                                 isAuthFailure: true)
         }
 
         let md5 = hex(Insecure.MD5.hash(data: Data("\(profile.user):\(realm):\(password)".utf8)))
@@ -74,8 +81,10 @@ final class RCITransport: KeeneticTransport {
         let (body, response) = try perform(login)
         guard (200..<300).contains(response.statusCode) else {
             throw TransportError(
-                "Авторизация не прошла: HTTP \(response.statusCode).",
-                hint: "Проверь логин «\(profile.user)» и пароль администратора.")
+                "Роутер не принял логин или пароль (HTTP \(response.statusCode)).",
+                hint: "Проверь пользователя «\(profile.user)» и пароль администратора "
+                    + "в карточке роутера.",
+                isAuthFailure: true)
         }
         _ = body
         authorized = true
@@ -189,6 +198,20 @@ final class RCITransport: KeeneticTransport {
             }
             return String(data: data, encoding: .utf8) ?? ""
         }
+    }
+
+    /// Запоминаем адрес, на который роутер увёл нас редиректом.
+    private func adoptRedirect(from response: HTTPURLResponse) {
+        guard let final = response.url,
+              var components = URLComponents(url: final, resolvingAgainstBaseURL: false)
+        else { return }
+        components.path = "/"
+        components.query = nil
+        components.fragment = nil
+        guard let pinned = components.url, pinned.absoluteString != baseURL.absoluteString
+        else { return }
+        log(.info, "RCI: роутер увёл на \(pinned.absoluteString) — работаю оттуда.")
+        baseURL = pinned
     }
 
     private func request(path: String, method: String) -> URLRequest {

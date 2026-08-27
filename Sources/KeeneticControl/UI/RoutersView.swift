@@ -8,6 +8,9 @@ struct RoutersView: View {
 
     @State private var editing: RouterProfile?
     @State private var confirmDelete: RouterProfile?
+    /// Связку ключей дёргаем по разу на роутер, а не на каждую перерисовку:
+    /// каждое обращение — потенциальный системный запрос доступа.
+    @State private var havePassword: Set<UUID> = []
 
     var body: some View {
         ScrollView {
@@ -66,12 +69,18 @@ struct RoutersView: View {
             .inset()
         }
         .card()
+        .onAppear(perform: refreshPasswordFlags)
+        .onChange(of: store.routers) { _, _ in refreshPasswordFlags() }
+    }
+
+    private func refreshPasswordFlags() {
+        havePassword = Set(store.routers.filter { $0.password?.isEmpty == false }.map(\.id))
     }
 
     private func routerRow(_ router: RouterProfile) -> some View {
         let isCurrent = router.id == session.router.id
         let fromEnvironment = router.environmentPassword != nil
-        let hasPassword = fromEnvironment || router.password?.isEmpty == false
+        let hasPassword = fromEnvironment || havePassword.contains(router.id)
 
         return HStack(spacing: 11) {
             Image(systemName: isCurrent ? "wifi.router.fill" : "wifi.router")

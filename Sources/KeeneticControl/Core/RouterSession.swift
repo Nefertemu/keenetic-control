@@ -134,8 +134,8 @@ final class RouterSession: ObservableObject {
 
         for attempt in 1...attempts {
             activity = attempt == 1
-                ? "Подключаюсь к \(profile.host)…"
-                : "Попытка \(attempt) из \(attempts): \(profile.host)…"
+                ? "Подключаюсь к \(profile.endpoint)…"
+                : "Попытка \(attempt) из \(attempts): \(profile.endpoint)…"
 
             let created: KeeneticTransport = profile.transport == .ssh
                 ? SSHTransport(profile: profile, password: password)
@@ -155,11 +155,8 @@ final class RouterSession: ObservableObject {
                 log(.warn, "Попытка \(attempt)/\(attempts) не удалась за "
                     + "\(String(format: "%.1f", elapsed)) с: \(describe(error))")
 
-                // Пароль не подошёл — повторять бессмысленно.
-                if let transportError = error as? TransportError,
-                   transportError.message.contains("логин") || transportError.message.contains("пароль") {
-                    throw error
-                }
+                // Пароль не подошёл — повторять бессмысленно и вредно.
+                if (error as? TransportError)?.isAuthFailure == true { throw error }
                 if attempt < attempts {
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
                 }

@@ -84,10 +84,33 @@ struct RouterProfile: Identifiable, Codable, Hashable {
         }
     }
 
+    /// Куда реально уходит подключение — это и показываем пользователю.
+    var endpoint: String {
+        switch transport {
+        case .ssh:  return "\(host):\(port)"
+        case .http: return effectiveWebURL
+        }
+    }
+
+    /// Локальная панель живёт по http, KeenDNS и любой внешний адрес — по https.
+    static func looksLocal(_ host: String) -> Bool {
+        if host.hasSuffix(".local") || host == "localhost" { return true }
+        guard let value = IPTools.parseIPv4(host) else { return false }
+        let first = (value >> 24) & 0xFF
+        let second = (value >> 16) & 0xFF
+        return first == 10 || first == 127
+            || (first == 192 && second == 168)
+            || (first == 172 && (16...31).contains(second))
+    }
+
     /// Приводим адрес к виду «http://host:port/» — без /auth, /rci и прочих путей.
     private func normalizeWebURL(_ value: String) -> String {
         var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !text.contains("://") { text = "http://" + text }
+        if !text.contains("://") {
+            let bareHost = String(text.split(separator: "/").first ?? "")
+                .split(separator: ":").first.map(String.init) ?? text
+            text = (RouterProfile.looksLocal(bareHost) ? "http://" : "https://") + text
+        }
         guard var components = URLComponents(string: text) else { return value }
         components.path = "/"
         components.query = nil
@@ -109,6 +132,8 @@ struct AppSettings: Codable {
     var keepBackups: Int = 20
     var removeStaleByDefault: Bool = true
     var saveConfigAfterApply: Bool = true
+    /// Последний выбранный роутер — чтобы запуск не сбрасывал его на первый.
+    var lastRouterID: String = ""
 
     static let `default` = AppSettings()
 }
@@ -123,7 +148,12 @@ final class Store: ObservableObject {
     @Published var settings: AppSettings {
         didSet { persistSettings() }
     }
-    @Published var selectedRouterID: UUID?
+    @Published var selectedRouterID: UUID? {
+        didSet {
+            guard !loading, let id = selectedRouterID else { return }
+            settings.lastRouterID = id.uuidString
+        }
+    }
 
     var selectedRouter: RouterProfile? {
         guard let id = selectedRouterID else { return routers.first }
@@ -150,7 +180,8 @@ final class Store: ObservableObject {
             settings = .default
         }
 
-        selectedRouterID = routers.first?.id
+        let remembered = UUID(uuidString: settings.lastRouterID)
+        selectedRouterID = routers.contains { $0.id == remembered } ? remembered : routers.first?.id
         loading = false
         persistRouters()
     }
