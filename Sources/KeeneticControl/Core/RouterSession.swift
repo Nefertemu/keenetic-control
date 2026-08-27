@@ -36,9 +36,24 @@ struct RouterState {
     var candidates: [KeeneticInterface] = []
     var staticRoutes: [StaticRoute] = []
     var wireguardInterfaces: [String] = []
+    var pingCheckProfiles: [PingCheckProfile] = []
+    var pingCheckBindings: [String: PingCheckBinding] = [:]
     var readAt: Date = Date()
 
     var sortedGroups: [FqdnGroup] { RouterConfigParser.sortedGroups(groups) }
+
+    /// Примечание интерфейса из конфигурации роутера — то же, что видно
+    /// в веб-панели рядом с именем.
+    func note(for ident: String) -> String? {
+        let note = interfaces[ident]?.descriptionText ?? ""
+        return note.isEmpty ? nil : note
+    }
+
+    /// «Wireguard0 · Dataforest» — имя вместе с примечанием.
+    func label(for ident: String) -> String {
+        guard let note = note(for: ident) else { return ident }
+        return "\(ident) · \(note)"
+    }
     var totalDomains: Int { groups.values.reduce(0) { $0 + $1.includes.count } }
     var routedGroups: Int { groups.values.filter { !$0.routeLines.isEmpty }.count }
 }
@@ -362,6 +377,7 @@ final class RouterSession: ObservableObject {
                 config: RouterConfigParser.parseConfigInterfaces(configText),
                 status: statusInterfaces)
 
+            let pingCheck = PingCheckParser.parse(config: configText)
             return RouterState(
                 configText: configText,
                 groups: RouterConfigParser.parseFqdnGroups(configText),
@@ -369,6 +385,8 @@ final class RouterSession: ObservableObject {
                 candidates: RouterConfigParser.likelyRouteInterfaces(interfaces),
                 staticRoutes: StaticRouteParser.parse(config: configText),
                 wireguardInterfaces: WireGuardState.interfaceNames(config: configText),
+                pingCheckProfiles: pingCheck.profiles,
+                pingCheckBindings: pingCheck.bindings,
                 readAt: Date())
         }
 
@@ -541,6 +559,7 @@ final class RouterSession: ObservableObject {
 
         // Обновляем состояние из уже прочитанной конфигурации — лишний раз не ходим.
         let previous = owner == router.id ? state : slots[owner]?.state
+        let pingCheck = PingCheckParser.parse(config: configText)
         store(state: RouterState(
             configText: configText,
             groups: groups,
@@ -548,6 +567,8 @@ final class RouterSession: ObservableObject {
             candidates: previous?.candidates ?? [],
             staticRoutes: StaticRouteParser.parse(config: configText),
             wireguardInterfaces: WireGuardState.interfaceNames(config: configText),
+            pingCheckProfiles: pingCheck.profiles,
+            pingCheckBindings: pingCheck.bindings,
             readAt: Date()), owner: owner)
 
         return problems

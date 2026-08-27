@@ -89,7 +89,7 @@ struct DnsRoutesView: View {
                     Picker("", selection: $interfaceIdent) {
                         Text("— выбери —").tag("")
                         ForEach(session.state?.candidates ?? []) { item in
-                            Text(item.isUp ? "\(item.ident) ✓" : item.ident).tag(item.ident)
+                            Text(item.displayName + (item.isUp ? " ✓" : "")).tag(item.ident)
                         }
                     }
                     .labelsHidden()
@@ -224,8 +224,9 @@ struct DnsRoutesView: View {
                     StatusPill(text: "нет маршрута", tint: Palette.warning)
                 } else {
                     ForEach(group.routedInterfaces, id: \.self) { target in
-                        StatusPill(text: target,
+                        StatusPill(text: session.state?.label(for: target) ?? target,
                                    tint: target == interfaceIdent ? Palette.success : Palette.accent)
+                            .help(target)
                     }
                 }
                 Spacer(minLength: 0)

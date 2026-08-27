@@ -3,6 +3,7 @@ import SwiftUI
 enum AppSection: String, CaseIterable, Identifiable {
     case overview
     case wireguard
+    case pingCheck
     case fqdn
     case dnsRoutes
     case staticRoutes
@@ -17,6 +18,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview:      return "Обзор"
         case .wireguard:     return "WireGuard"
+        case .pingCheck:     return "Ping-Check"
         case .fqdn:          return "Списки FQDN"
         case .dnsRoutes:     return "Маршруты списков"
         case .staticRoutes:  return "Статические маршруты"
@@ -31,6 +33,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview:      return "square.grid.2x2"
         case .wireguard:     return "shield.lefthalf.filled"
+        case .pingCheck:     return "waveform.path.ecg"
         case .fqdn:          return "list.bullet.rectangle"
         case .dnsRoutes:     return "arrow.triangle.branch"
         case .staticRoutes:  return "point.topleft.down.to.point.bottomright.curvepath"
@@ -44,7 +47,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var group: String {
         switch self {
         case .overview:                          return "Роутер"
-        case .wireguard:                         return "Туннели"
+        case .wireguard, .pingCheck:             return "Туннели"
         case .fqdn, .dnsRoutes, .staticRoutes, .compare:
                                                  return "Маршрутизация"
         case .backups, .journal, .routers:       return "Служебное"
@@ -235,6 +238,7 @@ struct RootView: View {
                 switch section {
                 case .overview:      OverviewView(alert: $alert, section: $section)
                 case .wireguard:     WireGuardView(alert: $alert)
+                case .pingCheck:     PingCheckView(alert: $alert)
                 case .fqdn:          FqdnView(alert: $alert)
                 case .dnsRoutes:     DnsRoutesView(alert: $alert)
                 case .staticRoutes:  StaticRoutesView(alert: $alert)

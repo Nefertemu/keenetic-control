@@ -125,7 +125,15 @@ struct OverviewView: View {
                             .frame(width: 7, height: 7)
 
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(item.ident).font(.system(size: 12, weight: .medium))
+                            HStack(spacing: 5) {
+                                Text(item.ident).font(.system(size: 12, weight: .medium))
+                                if !item.descriptionText.isEmpty {
+                                    Text(item.descriptionText)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Palette.accent)
+                                        .lineLimit(1)
+                                }
+                            }
                             if !item.statusText.isEmpty {
                                 Text(item.statusText)
                                     .font(.system(size: 10))

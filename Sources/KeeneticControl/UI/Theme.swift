@@ -123,7 +123,9 @@ struct StatusPill: View {
             } else {
                 Circle().fill(tint).frame(width: 6, height: 6)
             }
-            Text(text).font(.system(size: 11, weight: .medium))
+            Text(text)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(1)
         }
         .foregroundStyle(filled ? Color.white : tint)
         .padding(.horizontal, 9)

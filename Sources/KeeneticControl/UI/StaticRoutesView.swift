@@ -173,10 +173,18 @@ struct StaticRoutesView: View {
             }
             .frame(width: 210, alignment: .leading)
 
-            Text(route.via)
-                .font(.system(size: 12, design: .monospaced))
-                .lineLimit(1)
-                .frame(width: 170, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(route.via)
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(1)
+                if let note = session.state?.note(for: route.via) {
+                    Text(note)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Palette.accent)
+                        .lineLimit(1)
+                }
+            }
+            .frame(width: 170, alignment: .leading)
 
             HStack(spacing: 4) {
                 if route.auto { StatusPill(text: "auto", tint: Palette.success) }
@@ -330,7 +338,7 @@ struct RouteEditor: View {
                         .font(.system(size: 12, design: .monospaced))
                     Menu {
                         ForEach(interfaces) { item in
-                            Button(item.ident) { via = item.ident }
+                            Button(item.displayName) { via = item.ident }
                         }
                     } label: {
                         Image(systemName: "list.bullet")

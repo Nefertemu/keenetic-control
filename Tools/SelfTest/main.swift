@@ -256,6 +256,55 @@ check("ответ RCI распознаётся как конфигурация",
 check("HTML веб-панели отбивается",
       !RCITransport.looksLikeConfig(String(repeating: "<html><body>nope</body></html>", count: 20)))
 
+print("\n== Ping-Check ==")
+// Фрагмент настоящей конфигурации роутера.
+let pingConfig = """
+ping-check profile vpn\r
+    host google.com\r
+    update-interval 3\r
+    mode icmp\r
+    min-success 3\r
+    max-fails 3\r
+!\r
+interface GigabitEthernet1\r
+    description dom.ru\r
+    ping-check profile default\r
+!\r
+interface Wireguard0\r
+    description Dataforest\r
+    ping-check profile vpn\r
+    ping-check restart\r
+!\r
+"""
+let ping = PingCheckParser.parse(config: CLI.normalizeNewlines(pingConfig))
+check("профилей найдено", String(ping.profiles.count), "2")
+let vpn = ping.profiles.first { $0.name == "vpn" }
+check("узел проверки", vpn?.host ?? "nil", "google.com")
+check("интервал", String(vpn?.updateInterval ?? -1), "3")
+check("порог отказа", String(vpn?.maxFails ?? -1), "3")
+check("порог подъёма", String(vpn?.minSuccess ?? -1), "3")
+check("режим", vpn?.mode.rawValue ?? "nil", "icmp")
+check("default распознан как встроенный",
+      ping.profiles.first { $0.name == "default" }?.isBuiltIn ?? false)
+check("привязка к Wireguard0", ping.bindings["Wireguard0"]?.profile ?? "nil", "vpn")
+check("перезапуск включён", ping.bindings["Wireguard0"]?.restart ?? false)
+check("у GigabitEthernet1 перезапуска нет", !(ping.bindings["GigabitEthernet1"]?.restart ?? true))
+check("команды профиля собираются обратно",
+      (vpn?.commands() ?? []).joined(separator: " | "),
+      "ping-check profile vpn | ping-check profile vpn host google.com | "
+      + "ping-check profile vpn mode icmp | ping-check profile vpn update-interval 3 | "
+      + "ping-check profile vpn max-fails 3 | ping-check profile vpn min-success 3")
+check("снятие профиля с интерфейса",
+      PingCheckParser.planAssign(interface: "Wireguard0", profile: nil, restart: false,
+                                 current: ping.bindings["Wireguard0"]).commands.joined(separator: " | "),
+      "interface Wireguard0 no ping-check profile | interface Wireguard0 no ping-check restart")
+check("удаление снимает профиль с интерфейсов первым",
+      PingCheckParser.planDelete(vpn!, usedBy: ["Wireguard0"]).commands.first ?? "nil",
+      "interface Wireguard0 no ping-check profile")
+check("без изменений план пустой",
+      PingCheckParser.planAssign(interface: "Wireguard0", profile: "vpn", restart: true,
+                                 current: ping.bindings["Wireguard0"]).isEmpty)
+
 print("\n== Криптография схемы x-ndw4 ==")
 check("SHA3-512 пустой строки (FIPS 202)", SHA3.hash512("").hexString,
   "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26")
