@@ -13,6 +13,9 @@ final class RCITransport: KeeneticTransport {
     /// адресу: иначе POST после 302 потеряет тело и авторизация не пройдёт.
     private var baseURL: URL
     private var authorized = false
+    /// Новые прошивки объявляют схему x-ndw4 и перестают принимать старую,
+    /// даже когда пароль верный. Отличаем это от настоящей ошибки пароля.
+    private var advertisesModernAuth = false
 
     init(profile: RouterProfile, password: String?) throws {
         self.profile = profile
@@ -48,6 +51,9 @@ final class RCITransport: KeeneticTransport {
         let (_, probe) = try perform(request(path: "auth", method: "GET"))
         adoptRedirect(from: probe)
 
+        let offered = (probe.value(forHTTPHeaderField: "WWW-Authenticate") ?? "").lowercased()
+        advertisesModernAuth = offered.contains("ndw4")
+
         if probe.statusCode == 200 {
             authorized = true
             return
@@ -80,6 +86,15 @@ final class RCITransport: KeeneticTransport {
 
         let (body, response) = try perform(login)
         guard (200..<300).contains(response.statusCode) else {
+            if advertisesModernAuth {
+                throw TransportError(
+                    "Роутер требует новую схему авторизации веб-панели (x-ndw4).",
+                    hint: "Прошивка этого Keenetic («\(realm)») перешла на новый механизм "
+                        + "входа и старую схему больше не принимает — даже с верным паролем. "
+                        + "Приложение её пока не умеет.\n"
+                        + "Для этого роутера выбери транспорт SSH — там всё работает.",
+                    isAuthFailure: true)
+            }
             throw TransportError(
                 "Роутер не принял логин или пароль (HTTP \(response.statusCode)).",
                 hint: "Веб-панель по адресу \(baseURL.absoluteString) представилась как "

@@ -18,6 +18,11 @@ BASE="${BASE%/}"
 JAR="$(mktemp)"
 trap 'rm -f "$JAR"' EXIT
 
+# Пароль спрашиваем ДО запроса челленджа: сессионная cookie роутера живёт
+# около 20 секунд, и пока пользователь печатает, она успевает протухнуть.
+printf 'пароль для «%s» (ввод скрыт): ' "$USER_NAME"
+stty -echo; IFS= read -r PASS; stty echo; printf '\n'
+
 HEADERS="$(curl -sS -m 15 -L -c "$JAR" -D - -o /dev/null "$BASE/auth" 2>&1)" || {
     echo "Роутер не ответил: $HEADERS"; exit 1
 }
@@ -30,6 +35,15 @@ echo "адрес:        $BASE"
 echo "ответ /auth:  HTTP $CODE"
 echo "realm:        ${REALM:-<нет>}"
 
+SCHEMES=$(printf '%s' "$HEADERS" | grep -i '^WWW-Authenticate:' | sed 's/[^:]*: *//' | awk '{print $1}' | paste -sd' ' -)
+echo "схемы входа:  ${SCHEMES:-<нет>}"
+if printf '%s' "$SCHEMES" | grep -qi 'ndw4'; then
+    echo
+    echo "ВНИМАНИЕ: роутер объявляет новую схему x-ndw4. Такие прошивки"
+    echo "отвергают старую схему даже с верным паролем — ниже почти наверняка"
+    echo "будет 401, и это не значит, что пароль неправильный."
+fi
+
 if [ "$CODE" = "200" ]; then
     echo "Роутер уже пускает без пароля — сессия открыта."
     exit 0
@@ -38,9 +52,6 @@ if [ -z "$REALM" ] || [ -z "$CHAL" ]; then
     echo "Это не веб-панель Keenetic: нет X-NDM-Realm/X-NDM-Challenge."
     exit 1
 fi
-
-printf 'пароль для «%s» (ввод скрыт): ' "$USER_NAME"
-stty -echo; IFS= read -r PASS; stty echo; printf '\n'
 
 MD5=$(printf '%s' "$USER_NAME:$REALM:$PASS" | md5 -q)
 SHA=$(printf '%s' "$CHAL$MD5" | shasum -a 256 | cut -d' ' -f1)
@@ -60,8 +71,14 @@ case "$RESULT" in
         echo "конфигурация:  HTTP $CFG"
         ;;
     401) echo
-         echo "ПАРОЛЬ НЕ ПОДОШЁЛ. Веб-панель ждёт другой пароль, чем SSH,"
-         echo "либо пользователь не «$USER_NAME»."
+         if printf '%s' "$SCHEMES" | grep -qi 'ndw4'; then
+             echo "Старая схема входа отвергнута. Судя по объявленной x-ndw4,"
+             echo "дело не в пароле: прошивка больше не принимает старый механизм."
+             echo "Для этого роутера используй транспорт SSH."
+         else
+             echo "ПАРОЛЬ НЕ ПОДОШЁЛ. Веб-панель ждёт другой пароль, чем SSH,"
+             echo "либо пользователь не «$USER_NAME»."
+         fi
          ;;
     400) echo
          echo "Запрос пришёл вне сессии — проблема с cookie, а не с паролем."
