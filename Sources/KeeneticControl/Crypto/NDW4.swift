@@ -56,6 +56,16 @@ enum NDW4 {
             throw Failure("Фаза 1: соль не разбирается.")
         }
 
+        // Параметры приходят от роутера: на абсурдных значениях мы бы
+        // выделили гигабайты памяти или считали ключ часами.
+        guard (1...16).contains(iterations), (8...(1 << 20)).contains(memoryCost) else {
+            throw Failure("Фаза 1: роутер прислал неправдоподобные параметры "
+                          + "(проходов \(iterations), памяти \(memoryCost) КиБ).")
+        }
+        guard saltBytes.count >= 8, saltBytes.count <= 64 else {
+            throw Failure("Фаза 1: длина соли \(saltBytes.count) байт выглядит неправильной.")
+        }
+
         // --- Вывод ключей из пароля.
         let salted = try Argon2.hash(
             password: Array(password.utf8),

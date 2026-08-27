@@ -303,6 +303,8 @@ enum Planner {
         for group in current.values { plannedCounts[group.ident] = group.includes.count }
 
         var createdLists = 0
+        // Домен, лежащий в любом списке роутера, повторно не добавляем.
+        let anywhere = current.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
 
         for name in referenceByName.keys.sorted() {
             let source = referenceByName[name] ?? []
@@ -311,11 +313,7 @@ enum Planner {
             }
 
             var targets = currentByName[name] ?? []
-            let present = targets.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-            // Домен, лежащий в любом списке роутера, повторно не добавляем.
-            let anywhere = current.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-
-            let missing = sourceDomains.filter { !present.contains($0) && !anywhere.contains($0) }
+            let missing = sourceDomains.filter { !anywhere.contains($0) }
             guard !missing.isEmpty else { continue }
 
             for domain in missing {

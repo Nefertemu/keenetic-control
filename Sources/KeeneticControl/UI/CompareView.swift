@@ -229,27 +229,26 @@ struct CompareView: View {
     }
 }
 
-/// Разница между двумя прочитанными роутерами.
+/// Разница между двумя прочитанными роутерами. Считается один раз при
+/// создании: тут тысячи доменов, и пересчёт на каждое обращение из body
+/// заметно тормозил бы отрисовку.
 private struct Comparison {
     let reference: RouterProfile
     let theirs: RouterState
     let ours: RouterState
+    let missingHere: [String]
+    let extraHere: [String]
+    let shared: Int
 
-    var missingHere: [String] {
+    init(reference: RouterProfile, theirs: RouterState, ours: RouterState) {
+        self.reference = reference
+        self.theirs = theirs
+        self.ours = ours
+
         let mine = ours.groups.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
         let other = theirs.groups.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-        return other.subtracting(mine).sorted()
-    }
-
-    var extraHere: [String] {
-        let mine = ours.groups.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-        let other = theirs.groups.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-        return mine.subtracting(other).sorted()
-    }
-
-    var shared: Int {
-        let mine = ours.groups.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-        let other = theirs.groups.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
-        return mine.intersection(other).count
+        missingHere = other.subtracting(mine).sorted()
+        extraHere = mine.subtracting(other).sorted()
+        shared = mine.intersection(other).count
     }
 }

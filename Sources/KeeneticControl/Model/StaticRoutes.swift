@@ -148,8 +148,9 @@ enum StaticRouteParser {
             route.destination = "default"
         } else if head.lowercased() == "host", !tokens.isEmpty {
             route.destination = tokens.removeFirst()
-        } else if family == .ipv4, let mask = tokens.first, IPTools.ipv4MaskToPrefix(mask) != nil {
-            let prefix = IPTools.ipv4MaskToPrefix(tokens.removeFirst())!
+        } else if family == .ipv4, let mask = tokens.first,
+                  let prefix = IPTools.ipv4MaskToPrefix(mask) {
+            tokens.removeFirst()
             route.destination = prefix == 32 ? head : "\(head)/\(prefix)"
         } else {
             route.destination = head
