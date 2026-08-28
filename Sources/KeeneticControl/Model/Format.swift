@@ -10,8 +10,14 @@ enum Format {
     }
 
     /// «12 с назад», «3 мин назад» — для времени последнего рукопожатия.
+    /// Точность до секунды нужна только в первую минуту: дальше она лишь
+    /// удлиняет строку, и та переносится на две.
     static func ago(seconds: Int) -> String {
-        seconds < 5 ? "только что" : "\(duration(TimeInterval(seconds))) назад"
+        if seconds < 5 { return "только что" }
+        if seconds < 60 { return "\(seconds) с назад" }
+        if seconds < 3600 { return "\(seconds / 60) мин назад" }
+        if seconds < 86_400 { return "\(seconds / 3600) ч назад" }
+        return "\(seconds / 86_400) дн назад"
     }
 
     static func duration(_ seconds: TimeInterval) -> String {

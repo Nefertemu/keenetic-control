@@ -78,6 +78,10 @@ if [ -z "$IDENTITY" ]; then
         | awk 'NR==1 && /\)/ {print $2}')"
 fi
 
+# Расширенные атрибуты (метки Finder, карантин) переезжают вместе с
+# файлами и ломают подпись: codesign отказывается работать с «detritus».
+xattr -cr "$BUNDLE" 2>/dev/null || true
+
 echo "==> Подпись"
 if [ -n "$IDENTITY" ]; then
     NAME="$(security find-identity -v -p codesigning 2>/dev/null \

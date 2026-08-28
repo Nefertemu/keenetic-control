@@ -149,6 +149,47 @@ final class RCITransport: KeeneticTransport {
         }
     }
 
+    /// `show interface` без аргумента `details` не содержит ни состояния
+    /// проверки связи, ни прочих подробностей — веб-панель роутера просит их
+    /// явно: `showInterfaceApi.read({details: "yes"})`. Форму запроса
+    /// прошивки понимают по-разному, поэтому пробуем обе и запоминаем ту,
+    /// что сработала.
+    static func interfaceStatusJSON(_ transport: RCITransport) -> Any? {
+        let attempts: [(String, () throws -> Any?)] = [
+            ("GET с параметром", {
+                try transport.json(method: "GET", path: "rci/show/interface?details=yes")
+            }),
+            ("POST с телом", {
+                try transport.json(method: "POST", path: "rci/show/interface",
+                                   body: ["details": "yes"])
+            }),
+            ("без подробностей", {
+                try transport.json(method: "GET", path: "rci/show/interface")
+            }),
+        ]
+
+        var fallback: Any?
+        for (name, attempt) in attempts {
+            guard let result = try? attempt() else { continue }
+            if hasDetails(result) {
+                log(.info, "RCI: состояние интерфейсов с подробностями (\(name)).")
+                return result
+            }
+            if fallback == nil { fallback = result }
+        }
+        if fallback != nil {
+            log(.warn, "RCI: роутер отдал состояние интерфейсов без секции details — "
+                + "проверка связи показана не будет.")
+        }
+        return fallback
+    }
+
+    /// Хоть у одного интерфейса есть подробности — значит форма запроса верная.
+    private static func hasDetails(_ value: Any?) -> Bool {
+        guard let map = value as? [String: Any] else { return false }
+        return map.values.contains { ($0 as? [String: Any])?["details"] != nil }
+    }
+
     /// Роутеры, которые объявляют x-ndw4, но спотыкаются на первой фазе.
     /// Живёт до перезапуска приложения — прошивку могут и обновить.
     private static let modernAuthLock = NSLock()

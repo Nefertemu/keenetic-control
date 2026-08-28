@@ -144,10 +144,9 @@ struct LiveStateLine: View {
 
     private var checkTint: Color {
         switch check {
-        case .passing:       return Palette.success
-        case .failing:       return Palette.danger
-        case .notReady:      return Palette.warning
-        case .notConfigured: return .secondary
+        case .passing:                    return Palette.success
+        case .failing:                    return Palette.danger
+        case .unknown, .notConfigured:    return .secondary
         }
     }
 
@@ -158,20 +157,23 @@ struct LiveStateLine: View {
     }
 
     var body: some View {
-        let shows = check != .notConfigured || handshakeText != nil
-        if shows {
+        // Про проверку говорим, только когда роутер действительно ответил.
+        // «Не знаю» — это не состояние туннеля, и выдавать его за состояние
+        // нельзя: человек читает это как поломку.
+        if check.isKnown || handshakeText != nil {
             HStack(spacing: 6) {
-                if check != .notConfigured {
+                if check.isKnown {
                     HStack(spacing: 4) {
-                        Image(systemName: check == .passing ? "checkmark.circle.fill"
-                              : (check == .failing ? "xmark.circle.fill" : "clock"))
+                        Image(systemName: check == .passing
+                              ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .font(.system(size: 9))
                         Text(check.title).font(.system(size: 10, weight: .medium))
                     }
                     .foregroundStyle(checkTint)
+                    .help(check.explanation)
                 }
                 if let handshakeText {
-                    if check != .notConfigured {
+                    if check.isKnown {
                         Text("·").font(.system(size: 10)).foregroundStyle(.tertiary)
                     }
                     Text(handshakeText)

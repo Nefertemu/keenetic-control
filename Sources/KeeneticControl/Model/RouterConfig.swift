@@ -34,17 +34,32 @@ struct WireGuardPeerState: Hashable {
 enum PingCheckLiveState: Hashable {
     /// Профиль на интерфейс не назначен.
     case notConfigured
-    /// Профиль есть, но роутер ещё не сообщил результат.
-    case notReady
+    /// Профиль есть, но роутер про проверку ничего не сказал. Это НЕ значит,
+    /// что проверка падает, — мы просто не знаем. Показывать такое как
+    /// состояние роутера нельзя, поэтому в сводке оно молчит.
+    case unknown
     case passing
     case failing
+
+    /// Есть ли что показать человеку.
+    var isKnown: Bool { self == .passing || self == .failing }
 
     var title: String {
         switch self {
         case .notConfigured: return "проверки нет"
-        case .notReady:      return "проверка не готова"
+        case .unknown:       return "роутер не сообщил"
         case .passing:       return "связь есть"
         case .failing:       return "связи нет"
+        }
+    }
+
+    /// Почему пусто — объяснение для подсказки.
+    var explanation: String {
+        switch self {
+        case .notConfigured: return "Профиль Ping-Check на этот интерфейс не назначен."
+        case .unknown:       return "Профиль назначен, но роутер не прислал результат проверки."
+        case .passing:       return "Роутер проверяет связь, и она проходит."
+        case .failing:       return "Роутер проверяет связь, и она не проходит."
         }
     }
 }
@@ -100,7 +115,7 @@ struct KeeneticInterface: Identifiable, Hashable {
     /// интерфейс, а конфигурация — поэтому спрашиваем отдельно.
     func pingCheck(configured: Bool) -> PingCheckLiveState {
         guard configured else { return .notConfigured }
-        guard let status = pingCheckStatus else { return .notReady }
+        guard let status = pingCheckStatus, !status.isEmpty else { return .unknown }
         return status == "running" ? .passing : .failing
     }
 
@@ -356,12 +371,10 @@ enum RouterConfigParser {
                 let lowered = key.lowercased()
 
                 // Вложенные объекты: проверка связи и пиры WireGuard.
+                // Панель читает ping-check из details, но полагаться на точное
+                // место не будем — ищем ключ на любой глубине.
                 if lowered == "details", let details = raw as? [String: Any] {
-                    if let check = details["ping-check"] as? [String: Any] {
-                        item.pingCheckStatus = (check["status"] as? String) ?? ""
-                    } else if details["ping-check"] != nil {
-                        item.pingCheckStatus = ""
-                    }
+                    item.pingCheckStatus = findPingCheckStatus(details)
                     continue
                 }
                 if lowered == "wireguard", let wireguard = raw as? [String: Any] {
@@ -381,6 +394,25 @@ enum RouterConfigParser {
             result[ident] = item
         }
         return result
+    }
+
+    /// Состояние проверки связи внутри произвольно вложенного объекта.
+    /// Возвращает nil, если роутер про неё ничего не сказал, — и это НЕ
+    /// то же самое, что «проверка не проходит».
+    static func findPingCheckStatus(_ value: Any?, depth: Int = 0) -> String? {
+        guard depth < 4, let map = value as? [String: Any] else { return nil }
+
+        if let check = map["ping-check"] {
+            if let nested = check as? [String: Any] {
+                return (nested["status"] as? String) ?? ""
+            }
+            if let text = check as? String { return text }
+            return ""
+        }
+        for nested in map.values {
+            if let found = findPingCheckStatus(nested, depth: depth + 1) { return found }
+        }
+        return nil
     }
 
     /// `wireguard.peer` бывает и массивом, и одиночным объектом.

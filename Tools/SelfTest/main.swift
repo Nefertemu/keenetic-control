@@ -168,8 +168,32 @@ check("падающая проверка",
       liveIfaces["Wireguard1"]?.pingCheck(configured: true) == .failing)
 check("без профиля состояние не выдумываем",
       liveIfaces["Wireguard0"]?.pingCheck(configured: false) == .notConfigured)
-check("роутер молчит — не готово",
-      liveIfaces["Wireguard2"]?.pingCheck(configured: true) == .notReady)
+check("роутер молчит — состояние неизвестно, а не «падает»",
+      liveIfaces["Wireguard2"]?.pingCheck(configured: true) == .unknown)
+check("неизвестное не показывается как состояние роутера",
+      !(liveIfaces["Wireguard2"]?.pingCheck(configured: true).isKnown ?? true))
+check("а известное показывается",
+      liveIfaces["Wireguard0"]?.pingCheck(configured: true).isKnown ?? false)
+
+// Роутер прислал details, но без ping-check — тоже «не знаем».
+let noCheck = RouterConfigParser.parseInterfaceStatus(json: [
+    "Wireguard9": ["id": "Wireguard9", "details": ["dsl": ["status": "up"]]],
+])
+check("details без ping-check — не выдумываем",
+      noCheck["Wireguard9"]?.pingCheck(configured: true) == .unknown)
+
+// Ключ лежит глубже, чем ожидалось, — всё равно находим.
+let nested = RouterConfigParser.parseInterfaceStatus(json: [
+    "Wireguard8": ["id": "Wireguard8",
+                   "details": ["ip": ["ping-check": ["status": "running"]]]],
+])
+check("ping-check найден на глубине",
+      nested["Wireguard8"]?.pingCheck(configured: true) == .passing)
+
+check("пустой статус — это не «падает»",
+      RouterConfigParser.findPingCheckStatus(["ping-check": [:] as [String: Any]]) == "")
+check("нет ключа — nil, а не пустая строка",
+      RouterConfigParser.findPingCheckStatus(["details": ["x": 1]]) == nil)
 
 let peer = liveIfaces["Wireguard0"]?.peers.first
 check("пир разобран", String(liveIfaces["Wireguard0"]?.peers.count ?? 0), "1")
@@ -198,7 +222,10 @@ check("самое свежее рукопожатие из нескольких"
 
 check("«только что» для свежих секунд", Format.ago(seconds: 3), "только что")
 check("секунды", Format.ago(seconds: 12), "12 с назад")
-check("минуты", Format.ago(seconds: 185), "3 мин 05 с назад")
+check("минуты без лишних секунд", Format.ago(seconds: 185), "3 мин назад")
+check("часы", Format.ago(seconds: 7300), "2 ч назад")
+check("сутки", Format.ago(seconds: 200_000), "2 дн назад")
+check("граница минуты", Format.ago(seconds: 59), "59 с назад")
 
 print("\n== Имена файлов резервных копий ==")
 check("владелец снимка",

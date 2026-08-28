@@ -480,7 +480,7 @@ final class RouterSession: ObservableObject {
             var statusInterfaces: [String: KeeneticInterface] = [:]
             if let rci = transport as? RCITransport {
                 statusInterfaces = RouterConfigParser.parseInterfaceStatus(
-                    json: try? rci.json(method: "GET", path: "rci/show/interface"))
+                    json: RCITransport.interfaceStatusJSON(rci))
             } else {
                 let text = try transport.run("show interface", timeout: 120)
                 statusInterfaces = RouterConfigParser.parseInterfaceStatus(text)

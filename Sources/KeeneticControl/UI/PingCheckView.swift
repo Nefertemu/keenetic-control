@@ -279,10 +279,16 @@ struct PingCheckView: View {
 
             // Что роутер думает о проверке прямо сейчас — назначения мало,
             // важно знать, проходит она или падает.
-            LiveStateLine(check: session.state?.pingCheck(for: item.ident) ?? .notConfigured,
-                          handshake: item.freshestHandshake,
-                          online: item.isUp && !item.peers.isEmpty)
-                .frame(width: 150, alignment: .leading)
+            let check = session.state?.pingCheck(for: item.ident) ?? .notConfigured
+            Group {
+                if check.isKnown {
+                    LiveStateLine(check: check, handshake: nil, online: false)
+                } else {
+                    Text("—").font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 150, alignment: .leading)
+            .help(check.explanation)
 
             if dirty { StatusPill(text: "изменено", tint: Palette.warning) }
             Spacer(minLength: 0)
