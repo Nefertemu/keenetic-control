@@ -9,6 +9,10 @@ func check(_ name: String, _ actual: String, _ expected: String) {
     else { failures += 1; print("  FAIL \(name)\n       ждали: \(expected)\n       вышло: \(actual)") }
 }
 
+func check(_ name: String, _ actual: [String], _ expected: [String]) {
+    check(name, actual.joined(separator: " | "), expected.joined(separator: " | "))
+}
+
 func check(_ name: String, _ condition: Bool) {
     checks += 1
     if condition { print("  ok   \(name)") }
@@ -123,6 +127,78 @@ check("неизвестный интерфейс не теряется",
 check("подсказка — по строке на интерфейс",
       naming.targetTooltip(["Wireguard0", "ISP"]), "Dataforest · Wireguard0\nISP")
 check("пустой список даёт пустую строку", naming.targetSummary([]), "")
+
+print("\n== Живое состояние интерфейса (форма из кода веб-панели) ==")
+// Панель роутера читает details["ping-check"]["status"] и wireguard.peer[].
+// Проверяем, что мы разбираем ровно эту форму.
+let liveJSON: [String: Any] = [
+    "Wireguard0": [
+        "id": "Wireguard0",
+        "description": "Dataforest",
+        "type": "Wireguard",
+        "state": "up",
+        "connected": "yes",
+        "details": ["ping-check": ["status": "running"]],
+        "wireguard": ["peer": [[
+            "public-key": "abc=",
+            "remote-endpoint-address": "1.2.3.4:51820",
+            "online": true,
+            "rxbytes": 1024,
+            "txbytes": 2048,
+            "last-handshake": 12,
+        ]]],
+    ],
+    "Wireguard1": [
+        "id": "Wireguard1",
+        "state": "up",
+        "details": ["ping-check": ["status": "stopped"]],
+        "wireguard": ["peer": [
+            "public-key": "one=",
+            "online": false,
+            "last-handshake": 2_147_483_647,
+        ]],
+    ],
+    "Wireguard2": ["id": "Wireguard2", "state": "up"],
+]
+let liveIfaces = RouterConfigParser.parseInterfaceStatus(json: liveJSON)
+check("проверка связи прочитана", liveIfaces["Wireguard0"]?.pingCheckStatus ?? "nil", "running")
+check("проходящая проверка",
+      liveIfaces["Wireguard0"]?.pingCheck(configured: true) == .passing)
+check("падающая проверка",
+      liveIfaces["Wireguard1"]?.pingCheck(configured: true) == .failing)
+check("без профиля состояние не выдумываем",
+      liveIfaces["Wireguard0"]?.pingCheck(configured: false) == .notConfigured)
+check("роутер молчит — не готово",
+      liveIfaces["Wireguard2"]?.pingCheck(configured: true) == .notReady)
+
+let peer = liveIfaces["Wireguard0"]?.peers.first
+check("пир разобран", String(liveIfaces["Wireguard0"]?.peers.count ?? 0), "1")
+check("ключ пира", peer?.publicKey ?? "nil", "abc=")
+check("точка входа", peer?.endpoint ?? "nil", "1.2.3.4:51820")
+check("принято байт", String(peer?.received ?? -1), "1024")
+check("отдано байт", String(peer?.sent ?? -1), "2048")
+check("возраст рукопожатия", String(peer?.handshakeAge ?? -1), "12")
+check("свежее рукопожатие", peer?.isFresh ?? false)
+
+let stale = liveIfaces["Wireguard1"]?.peers.first
+check("одиночный пир без массива разобран", stale != nil)
+check("сторож 2147483647 — рукопожатия не было", stale?.handshakeAge == nil)
+check("офлайновый пир не считается свежим", !(stale?.isFresh ?? true))
+
+var aged = WireGuardPeerState(online: true, handshakeAge: 181)
+check("тишина дольше трёх минут — не свежий", !aged.isFresh)
+aged.handshakeAge = 180
+check("ровно три минуты — ещё свежий", aged.isFresh)
+
+check("самое свежее рукопожатие из нескольких",
+      String(KeeneticInterface(ident: "W", peers: [
+        WireGuardPeerState(online: true, handshakeAge: 90),
+        WireGuardPeerState(online: true, handshakeAge: 12),
+      ]).freshestHandshake ?? -1), "12")
+
+check("«только что» для свежих секунд", Format.ago(seconds: 3), "только что")
+check("секунды", Format.ago(seconds: 12), "12 с назад")
+check("минуты", Format.ago(seconds: 185), "3 мин 05 с назад")
 
 print("\n== Имена файлов резервных копий ==")
 check("владелец снимка",
@@ -424,6 +500,146 @@ do {
     check("Argon2id, контрольный пример RFC 9106", tag.hexString,
           "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
 } catch { failures += 1; checks += 1; print("  FAIL Argon2id: \(error)") }
+print("\n== Настройки переживают обновление приложения ==")
+// Файл настроек от прошлой версии не знает новых полей. Синтезированный
+// декодер на этом спотыкается, а Store в таком случае берёт значения по
+// умолчанию — то есть молча стирает всё, что человек настроил.
+let oldSettings = #"{"chunkSize":123,"keepBackups":7,"lastRouterID":"ABC"}"#.data(using: .utf8)!
+if let restored = try? JSONDecoder().decode(AppSettings.self, from: oldSettings) {
+    check("старое значение сохранилось", String(restored.chunkSize), "123")
+    check("и второе тоже", String(restored.keepBackups), "7")
+    check("выбранный роутер не потерян", restored.lastRouterID, "ABC")
+    check("новое поле взяло значение по умолчанию", !restored.autoUpdateEnabled)
+    check("и число тоже", String(restored.autoUpdateHours), "24")
+    check("и список", restored.autoUpdateSources.isEmpty)
+} else {
+    check("файл настроек прошлой версии читается", false)
+}
+check("пустой объект не ломает чтение",
+      (try? JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))) != nil)
+check("полный цикл записи и чтения",
+      { var s = AppSettings(); s.autoUpdateEnabled = true; s.chunkSize = 55
+        guard let data = try? JSONEncoder().encode(s),
+              let back = try? JSONDecoder().decode(AppSettings.self, from: data)
+        else { return false }
+        return back.autoUpdateEnabled && back.chunkSize == 55 }())
+
+print("\n== Возврат по резервной копии ==")
+let snapshotConfig = """
+interface Wireguard0
+    description Dataforest
+!
+object-group fqdn domain-list0
+    description "мой список"
+    include one.example
+    include two.example
+!
+object-group fqdn domain-list1
+    description "второй"
+    include three.example
+!
+dns-proxy route object-group domain-list0 Wireguard0 auto
+ip route 10.50.0.0 255.255.0.0 Wireguard0 auto
+!
+"""
+let currentConfig = """
+interface Wireguard0
+    description Dataforest
+!
+object-group fqdn domain-list0
+    description "мой список"
+    include one.example
+    include added.example
+!
+object-group fqdn domain-list2
+    description "новый"
+    include fresh.example
+!
+dns-proxy route object-group domain-list0 Wireguard0
+ip route 172.16.0.0 255.240.0.0 Wireguard0 auto
+!
+"""
+let diff = Restore.compare(backup: snapshotConfig, current: currentConfig)
+check("расхождения найдены", !diff.isEmpty)
+check("пропавший домен замечен", diff.missingDomains["domain-list0"] == ["two.example"])
+check("лишний домен замечен", diff.extraDomains["domain-list0"] == ["added.example"])
+check("исчезнувший список", diff.missingGroups.map(\.ident), ["domain-list1"])
+check("появившийся список", diff.extraGroups.map(\.ident), ["domain-list2"])
+check("маршрут списка изменился — старый вернуть",
+      diff.missingRouteLines, ["dns-proxy route object-group domain-list0 Wireguard0 auto"])
+check("а новый снять",
+      diff.extraRouteLines, ["dns-proxy route object-group domain-list0 Wireguard0"])
+check("статический маршрут вернуть", diff.missingRoutes.map(\.destination), ["10.50.0.0/16"])
+check("статический маршрут снять", diff.extraRoutes.map(\.destination), ["172.16.0.0/12"])
+
+let restorePlan = Restore.plan(diff, chunkSize: 300, title: "Возврат")
+let restoreText = restorePlan.commands.joined(separator: "\n")
+check("лишний домен удаляется",
+      restoreText.contains("no object-group fqdn domain-list0 include added.example"))
+check("пропавший домен возвращается",
+      restoreText.contains("object-group fqdn domain-list0 include two.example"))
+check("появившийся список удаляется целиком",
+      restoreText.contains("no object-group fqdn domain-list2"))
+check("исчезнувший список создаётся заново",
+      restoreText.contains("object-group fqdn domain-list1 description \"второй\""))
+check("и наполняется", restoreText.contains("object-group fqdn domain-list1 include three.example"))
+check("статический маршрут возвращается",
+      restoreText.contains("ip route 10.50.0.0 255.255.0.0 Wireguard0 auto"))
+check("лишний статический снимается",
+      restoreText.contains("no ip route 172.16.0.0 255.240.0.0 Wireguard0 auto"))
+
+// Порядок: список должен появиться раньше, чем на него вешают маршрут.
+let createIndex = restorePlan.commands.firstIndex { $0 == "object-group fqdn domain-list1" } ?? .max
+let routeIndex = restorePlan.commands.firstIndex {
+    $0.hasPrefix("dns-proxy route object-group domain-list0")
+} ?? -1
+check("маршруты идут после создания списков", createIndex < routeIndex)
+let dropIndex = restorePlan.commands.firstIndex { $0.hasPrefix("no dns-proxy route") } ?? .max
+check("лишний маршрут снимается первым делом", dropIndex == 0)
+
+check("одинаковые конфигурации — расхождений нет",
+      Restore.compare(backup: snapshotConfig, current: snapshotConfig).isEmpty)
+check("CRLF из RCI не мешает сверке",
+      Restore.compare(backup: snapshotConfig.replacingOccurrences(of: "\n", with: "\r\n"),
+                      current: snapshotConfig).isEmpty)
+
+print("\n== Свои источники ==")
+check("адреса из многострочного поля",
+      CustomSource.addresses(from: " https://a/x \n\n https://b/y ,https://c/z ").joined(separator: "|"),
+      "https://a/x|https://b/y|https://c/z")
+check("подпись по хосту", CustomSource.subtitle(for: ["https://example.com/list.txt"]), "example.com")
+check("подпись по имени файла", CustomSource.subtitle(for: ["/tmp/my.txt"]), "my.txt")
+check("зеркала посчитаны",
+      CustomSource.subtitle(for: ["https://a/x", "https://b/x"]), "a · зеркал: 1")
+
+func sourceError(_ source: CustomSource) -> String? {
+    do { try CustomSource.validate(source, existing: []); return nil }
+    catch { return (error as? TransportError)?.message ?? error.localizedDescription }
+}
+check("без названия не сохраняется", sourceError(CustomSource()) != nil)
+check("без префикса не сохраняется",
+      sourceError(CustomSource(title: "Мой", urls: ["https://a/x"])) != nil)
+check("без адреса не сохраняется",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my")) != nil)
+check("нормальный источник принимается",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my list",
+                               urls: ["https://a/x"])) == nil)
+check("несуществующий файл отбивается",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my",
+                               urls: ["/нет/такого/файла.txt"])) != nil)
+check("чужая схема отбивается",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my",
+                               urls: ["ftp://a/x"])) != nil)
+check("префикс встроенного источника занят",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "kinopub",
+                               urls: ["https://a/x"])) != nil)
+
+let mine = CustomSource(title: "Мой", descriptionPrefix: "my list", urls: ["https://a/x"])
+check("ключ своего источника отличим", mine.spec.key.hasPrefix("custom-"))
+check("свой кэш отдельным файлом", mine.spec.cacheName.hasPrefix("custom-"))
+check("путь к файлу не переписывается под github",
+      SourceSpec.rawGitHub("/tmp/github.com/x.txt"), "/tmp/github.com/x.txt")
+
 print("\n== Защита от лишних неудачных входов ==")
 // Роутер объявляет x-ndw4, но на первой фазе не присылает соль. Пароль тут
 // ни при чём: вторая попытка только потратит лимит роутера.

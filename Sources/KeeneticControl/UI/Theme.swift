@@ -135,6 +135,55 @@ struct StatusPill: View {
     }
 }
 
+/// Живое состояние туннеля одной строкой: проверка связи и свежесть
+/// рукопожатия. Пусто, если роутеру нечего сказать.
+struct LiveStateLine: View {
+    var check: PingCheckLiveState
+    var handshake: Int?
+    var online: Bool
+
+    private var checkTint: Color {
+        switch check {
+        case .passing:       return Palette.success
+        case .failing:       return Palette.danger
+        case .notReady:      return Palette.warning
+        case .notConfigured: return .secondary
+        }
+    }
+
+    private var handshakeText: String? {
+        guard online else { return nil }
+        guard let handshake else { return "рукопожатия не было" }
+        return "рукопожатие \(Format.ago(seconds: handshake))"
+    }
+
+    var body: some View {
+        let shows = check != .notConfigured || handshakeText != nil
+        if shows {
+            HStack(spacing: 6) {
+                if check != .notConfigured {
+                    HStack(spacing: 4) {
+                        Image(systemName: check == .passing ? "checkmark.circle.fill"
+                              : (check == .failing ? "xmark.circle.fill" : "clock"))
+                            .font(.system(size: 9))
+                        Text(check.title).font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundStyle(checkTint)
+                }
+                if let handshakeText {
+                    if check != .notConfigured {
+                        Text("·").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    }
+                    Text(handshakeText)
+                        .font(.system(size: 10))
+                        // Тишина дольше трёх минут — туннель уже не живой.
+                        .foregroundStyle((handshake ?? .max) <= 180 ? .secondary : Palette.warning)
+                }
+            }
+        }
+    }
+}
+
 struct MetricTile: View {
     var value: String
     var label: String

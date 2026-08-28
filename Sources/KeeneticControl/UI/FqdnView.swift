@@ -12,6 +12,7 @@ struct FqdnView: View {
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
     @State private var working = false
+    @State private var editingSource: CustomSource?
 
     private let columns = [GridItem(.adaptive(minimum: 290), spacing: 12)]
 
@@ -24,6 +25,20 @@ struct FqdnView: View {
                 options
             }
             .padding(20)
+        }
+        .sheet(item: $editingSource) { source in
+            SourceEditor(source: source, existing: store.customSources) { saved in
+                editingSource = nil
+                if store.customSources.contains(where: { $0.id == saved.id }) {
+                    store.updateSource(saved)
+                } else {
+                    store.addSource(saved)
+                }
+            } onDelete: {
+                editingSource = nil
+                store.removeSource(source)
+                selected.remove(source.spec.key)
+            } onCancel: { editingSource = nil }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, applyTitle: "Загрузить на роутер") { dryRun in
@@ -71,16 +86,18 @@ struct FqdnView: View {
                 CardHeader(icon: "square.stack.3d.up", title: "Источники",
                            subtitle: "Отметь то, что хочешь залить — можно несколько сразу")
                 Spacer()
-                Button(selected.count == SourceCatalog.all.count ? "Снять все" : "Выбрать все") {
-                    selected = selected.count == SourceCatalog.all.count
+                Button("Свой источник…") { editingSource = CustomSource() }
+                    .buttonStyle(SubtleButtonStyle())
+                Button(selected.count == store.allSources.count ? "Снять все" : "Выбрать все") {
+                    selected = selected.count == store.allSources.count
                         ? []
-                        : Set(SourceCatalog.all.map(\.key))
+                        : Set(store.allSources.map(\.key))
                 }
                 .buttonStyle(SubtleButtonStyle())
             }
 
             LazyVGrid(columns: columns, spacing: 12) {
-                ForEach(SourceCatalog.all) { spec in
+                ForEach(store.allSources) { spec in
                     sourceCard(spec)
                 }
             }
@@ -111,6 +128,15 @@ struct FqdnView: View {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 16))
                     .foregroundStyle(isSelected ? Palette.accent : Color.secondary.opacity(0.4))
+            }
+
+            if let mine = custom(spec) {
+                HStack(spacing: 6) {
+                    StatusPill(text: "свой", tint: Palette.accent)
+                    Button("Изменить") { editingSource = mine }
+                        .buttonStyle(.link)
+                        .font(.system(size: 10))
+                }
             }
 
             if let data {
@@ -144,6 +170,20 @@ struct FqdnView: View {
         .onTapGesture {
             if isSelected { selected.remove(spec.key) } else { selected.insert(spec.key) }
         }
+        .contextMenu {
+            if let mine = custom(spec) {
+                Button("Изменить источник…") { editingSource = mine }
+                Button("Удалить источник", role: .destructive) {
+                    store.removeSource(mine)
+                    selected.remove(spec.key)
+                }
+            }
+        }
+    }
+
+    /// Свой ли это источник — по нему доступны правка и удаление.
+    private func custom(_ spec: SourceSpec) -> CustomSource? {
+        store.customSources.first { $0.spec.key == spec.key }
     }
 
     // MARK: - Параметры и запуск
@@ -218,7 +258,7 @@ struct FqdnView: View {
             var reserved = Set(state.groups.keys)
             var fetched: [String: SourceData] = loaded
 
-            for spec in SourceCatalog.all where selected.contains(spec.key) {
+            for spec in store.allSources where selected.contains(spec.key) {
                 let data = try await session.loadSource(spec, forceRefresh: forceRefresh)
                 fetched[spec.key] = data
                 log(.info, "\(spec.title): \(data.entries.count) записей, \(data.freshness).")
@@ -272,4 +312,128 @@ struct OutcomeBox: Identifiable {
     let id = UUID()
     let outcome: ApplyOutcome
     init(_ outcome: ApplyOutcome) { self.outcome = outcome }
+}
+
+// MARK: - Свой источник
+
+struct SourceEditor: View {
+    @State var source: CustomSource
+    let existing: [CustomSource]
+    var onSave: (CustomSource) -> Void
+    var onDelete: () -> Void
+    var onCancel: () -> Void
+
+    @State private var urlText = ""
+    @State private var subnetText = ""
+    @State private var error: String?
+    @State private var loaded = false
+
+    private var isNew: Bool { !existing.contains { $0.id == source.id } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            CardHeader(icon: "link", title: isNew ? "Новый источник" : source.title,
+                       subtitle: "Список доменов по адресу или из файла на диске")
+
+            field("Название") {
+                TextField("Мой список", text: $source.title).textFieldStyle(.roundedBorder)
+            }
+
+            field("Префикс описания на роутере") {
+                TextField("my list", text: $source.descriptionPrefix)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                Text("Части списка получат описания «\(prefixPreview) 1», «\(prefixPreview) 2» — "
+                     + "по ним приложение потом узнаёт свои списки и пополняет именно их.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            field("Адреса списка") {
+                TextEditor(text: $urlText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 62)
+                    .padding(4)
+                    .inset()
+                Text("По одному в строке. Можно http://, https:// или путь к файлу "
+                     + "от корня. Несколько строк — это зеркала ОДНОГО списка: "
+                     + "пробуются по очереди до первого удачного.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            field("Адреса подсетей (необязательно)") {
+                TextEditor(text: $subnetText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 44)
+                    .padding(4)
+                    .inset()
+            }
+
+            field("Минимум записей", width: 150) {
+                TextField("1", value: $source.minDomains, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                Text("Меньше — загрузка считается неудачной.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+
+            if let error {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Button("Отмена", action: onCancel)
+                    .buttonStyle(SubtleButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+                if !isNew {
+                    Button("Удалить", action: onDelete)
+                        .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
+                }
+                Spacer()
+                Button(isNew ? "Добавить" : "Сохранить") { submit() }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 560)
+        .background(Palette.surface)
+        .onAppear {
+            guard !loaded else { return }
+            urlText = source.urls.joined(separator: "\n")
+            subnetText = source.subnetURLs.joined(separator: "\n")
+            loaded = true
+        }
+    }
+
+    private var prefixPreview: String {
+        let value = source.descriptionPrefix.trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? "my list" : value
+    }
+
+    private func submit() {
+        var cleaned = source
+        cleaned.title = cleaned.title.trimmingCharacters(in: .whitespaces)
+        cleaned.descriptionPrefix = cleaned.descriptionPrefix.trimmingCharacters(in: .whitespaces)
+        cleaned.urls = CustomSource.addresses(from: urlText)
+        cleaned.subnetURLs = CustomSource.addresses(from: subnetText)
+        do {
+            try CustomSource.validate(cleaned, existing: existing)
+            onSave(cleaned)
+        } catch {
+            self.error = (error as? TransportError)?.message ?? error.localizedDescription
+        }
+    }
+
+    private func field<Content: View>(_ title: String, width: CGFloat? = nil,
+                                      @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            content()
+        }
+        .frame(width: width, alignment: .leading)
+    }
 }

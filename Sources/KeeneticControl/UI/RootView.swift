@@ -59,8 +59,11 @@ struct RootView: View {
     @ObservedObject var session: RouterSession
     @ObservedObject private var store = Store.shared
 
+    @ObservedObject private var updater = AutoUpdater.shared
     @State private var section: AppSection = .overview
     @State private var alert: AlertPayload?
+    @State private var plan: Plan?
+    @State private var outcome: ApplyOutcome?
 
     var body: some View {
         NavigationSplitView {
@@ -76,8 +79,18 @@ struct RootView: View {
                   message: Text(payload.message),
                   dismissButton: .default(Text("Понятно")))
         }
+        .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
+            PlanSheet(plan: box.plan, applyTitle: "Загрузить на роутер") { dryRun in
+                plan = nil
+                Task { await apply(box.plan, dryRun: dryRun) }
+            } onCancel: { plan = nil }
+        }
+        .sheet(item: Binding(get: { outcome.map(OutcomeBox.init) }, set: { outcome = $0?.outcome })) { box in
+            OutcomeSheet(title: "Обновление списков", outcome: box.outcome) { outcome = nil }
+        }
         .task {
             AppDelegate.session = session
+            AutoUpdater.shared.attach(session: session)
             if let router = store.selectedRouter { await session.switchTo(router) }
         }
     }
@@ -237,7 +250,7 @@ struct RootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             Palette.canvas.ignoresSafeArea()
 
             Group {
@@ -255,6 +268,8 @@ struct RootView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            if let found = updater.finding { updateBanner(found) }
         }
         .navigationTitle(section.title)
         .toolbar {
@@ -271,7 +286,66 @@ struct RootView: View {
         }
     }
 
+    /// Фоновая сверка что-то нашла. Полоса поверх содержимого, а не
+    /// уведомление в никуда: план уже собран, его можно посмотреть сразу.
+    private func updateBanner(_ found: AutoUpdater.Finding) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Palette.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Источники разошлись с «\(found.routerName)»")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(found.plan.summary.joined(separator: " · "))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+
+            if found.routerID == session.router.id {
+                Button("Посмотреть план") { plan = found.plan }
+                    .buttonStyle(PrimaryButtonStyle(tint: Palette.warning))
+            } else {
+                Text("проверялся другой роутер")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+
+            Button {
+                updater.dismissFinding()
+            } label: {
+                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Скрыть до следующей проверки")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous)
+            .fill(Palette.surface))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
+            .strokeBorder(Palette.warning.opacity(0.5), lineWidth: 1)
+            .allowsHitTesting(false))
+        .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
+        .padding(.horizontal, 20)
+        .padding(.top, 12)
+    }
+
     // MARK: - Действия
+
+    private func apply(_ plan: Plan, dryRun: Bool) async {
+        do {
+            let result = try await session.apply(plan: plan, dryRun: dryRun,
+                                                 saveConfig: store.settings.saveConfigAfterApply)
+            if result.applied {
+                outcome = result
+                updater.dismissFinding()
+            }
+        } catch {
+            alert = AlertPayload(title: "Не удалось применить", message: session.describe(error))
+        }
+    }
 
     private func toggleConnection() async {
         if session.status.isOnline {

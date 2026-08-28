@@ -18,6 +18,10 @@ struct WireGuardView: View {
 
     private var interfaces: [String] { session.state?.wireguardInterfaces ?? [] }
 
+    private var peers: [WireGuardPeerState] {
+        session.state?.interfaces[interfaceIdent]?.peers ?? []
+    }
+
     private var liveState: WireGuardState? {
         guard let text = session.state?.configText, !interfaceIdent.isEmpty else { return nil }
         return WireGuardState.parse(config: text, interface: interfaceIdent)
@@ -118,12 +122,16 @@ struct WireGuardView: View {
                         KeyValueRow(key: "Адрес интерфейса",
                                     value: live.addresses.joined(separator: ", "), monospaced: true)
                     }
-                    ForEach(live.peerKeys, id: \.self) { key in
-                        KeyValueRow(key: "PublicKey пира", value: key, monospaced: true)
+                    if peers.isEmpty {
+                        ForEach(live.peerKeys, id: \.self) { key in
+                            KeyValueRow(key: "PublicKey пира", value: key, monospaced: true)
+                        }
                     }
                 }
                 .padding(12)
                 .inset()
+
+                if !peers.isEmpty { peerTable }
             }
 
             HStack(spacing: 8) {
@@ -140,6 +148,76 @@ struct WireGuardView: View {
             }
         }
         .card()
+    }
+
+    /// Пиры с живой статистикой: рукопожатие и трафик отличают рабочий
+    /// туннель от повисшего, чего «включён» сам по себе не говорит.
+    private var peerTable: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Text("Пир").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Точка входа").frame(width: 180, alignment: .leading)
+                Text("Рукопожатие").frame(width: 150, alignment: .leading)
+                Text("Принято").frame(width: 90, alignment: .trailing)
+                Text("Отдано").frame(width: 90, alignment: .trailing)
+            }
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            ForEach(peers, id: \.publicKey) { peer in
+                HStack(spacing: 10) {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(peer.isFresh ? Palette.success
+                                  : (peer.online ? Palette.warning : Color.secondary.opacity(0.4)))
+                            .frame(width: 6, height: 6)
+                        Text(peer.publicKey.isEmpty ? "—" : peer.publicKey)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(peer.publicKey)
+
+                    Text(peer.endpoint.isEmpty ? "—" : peer.endpoint)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(peer.endpoint.isEmpty ? .tertiary : .secondary)
+                        .lineLimit(1)
+                        .frame(width: 180, alignment: .leading)
+                        .help(peer.endpoint)
+
+                    Group {
+                        if !peer.online {
+                            Text("не подключён").foregroundStyle(.tertiary)
+                        } else if let age = peer.handshakeAge {
+                            Text(Format.ago(seconds: age))
+                                .foregroundStyle(peer.isFresh ? Palette.success : Palette.warning)
+                        } else {
+                            Text("не было").foregroundStyle(Palette.danger)
+                        }
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 150, alignment: .leading)
+
+                    Text(Format.bytes(peer.received))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 90, alignment: .trailing)
+                    Text(Format.bytes(peer.sent))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 90, alignment: .trailing)
+                }
+                .padding(.vertical, 7)
+
+                if peer.publicKey != peers.last?.publicKey { Divider() }
+            }
+        }
+        .padding(.horizontal, 12)
+        .inset()
     }
 
     // MARK: - Файл конфигурации

@@ -116,6 +116,7 @@ enum AppPaths {
 
     static var settingsFile: URL { support.appendingPathComponent("settings.json") }
     static var routersFile: URL { support.appendingPathComponent("routers.json") }
+    static var sourcesFile: URL { support.appendingPathComponent("sources.json") }
 
     private static func subdirectory(_ name: String) -> URL {
         let url = support.appendingPathComponent(name, isDirectory: true)

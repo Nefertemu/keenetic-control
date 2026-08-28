@@ -218,6 +218,7 @@ struct PingCheckView: View {
                     Text("Интерфейс").frame(width: 250, alignment: .leading)
                     Text("Профиль").frame(width: 190, alignment: .leading)
                     Text("Перезапуск").frame(width: 110, alignment: .leading)
+                    Text("Сейчас").frame(width: 150, alignment: .leading)
                     Spacer()
                 }
                 .font(.system(size: 10, weight: .semibold))
@@ -275,6 +276,13 @@ struct PingCheckView: View {
                 .toggleStyle(.checkbox)
                 .disabled(current.profile.isEmpty)
                 .frame(width: 110, alignment: .leading)
+
+            // Что роутер думает о проверке прямо сейчас — назначения мало,
+            // важно знать, проходит она или падает.
+            LiveStateLine(check: session.state?.pingCheck(for: item.ident) ?? .notConfigured,
+                          handshake: item.freshestHandshake,
+                          online: item.isUp && !item.peers.isEmpty)
+                .frame(width: 150, alignment: .leading)
 
             if dirty { StatusPill(text: "изменено", tint: Palette.warning) }
             Spacer(minLength: 0)

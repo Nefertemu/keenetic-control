@@ -38,6 +38,7 @@ struct SourceSpec: Identifiable, Hashable {
 
     /// github.com/…/blob/… — это HTML-страница. Переводим в raw.
     static func rawGitHub(_ url: String) -> String {
+        guard !url.hasPrefix("/"), !url.hasPrefix("file:") else { return url }
         guard url.contains("github.com/") else { return url }
         if url.contains("/raw/refs/heads/") { return url }
         guard url.contains("/blob/") else { return url }
@@ -257,6 +258,18 @@ enum SourceLoader {
 
     /// Синхронная загрузка: вызывается только с фоновой очереди.
     static func fetch(_ urlString: String) throws -> String {
+        // Свой источник может быть файлом на диске — читаем его напрямую,
+        // а не через сеть.
+        if urlString.hasPrefix("/") || urlString.hasPrefix("file:") {
+            let path = urlString.hasPrefix("file:")
+                ? (URL(string: urlString)?.path ?? urlString)
+                : urlString
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+                throw TransportError("Не читается файл: \(path)")
+            }
+            return text
+        }
+
         guard let url = URL(string: urlString) else {
             throw TransportError("Некорректный адрес: \(urlString)")
         }

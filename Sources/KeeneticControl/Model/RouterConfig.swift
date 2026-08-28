@@ -1,5 +1,54 @@
 import Foundation
 
+/// Живое состояние пира WireGuard из `show interface`.
+///
+/// Имена полей и их смысл взяты из кода веб-панели самого роутера:
+/// она читает `wireguard.peer[]` и берёт оттуда `public-key`,
+/// `last-handshake`, `rxbytes`, `txbytes`, `endpoint` и `online`.
+/// `last-handshake` — это СКОЛЬКО СЕКУНД НАЗАД было рукопожатие
+/// (панель прогоняет его через тот же форматтер длительности, что и
+/// время работы), а значение `2147483647` означает «не было ни разу».
+struct WireGuardPeerState: Hashable {
+    /// Сторож «рукопожатия не было» — ровно так его трактует панель.
+    static let never = 2_147_483_647
+
+    var publicKey: String = ""
+    var endpoint: String = ""
+    var online: Bool = false
+    var received: Int = 0
+    var sent: Int = 0
+    /// Секунд назад. nil — рукопожатия не было.
+    var handshakeAge: Int?
+
+    var isFresh: Bool {
+        guard online, let age = handshakeAge else { return false }
+        // WireGuard шлёт keepalive обычно раз в 25 с; три минуты тишины —
+        // это уже не «живой» туннель.
+        return age <= 180
+    }
+}
+
+/// Что роутер думает о проверке связи на интерфейсе прямо сейчас.
+/// Разбор повторяет логику веб-панели: она смотрит в `details`,
+/// и «running» считает единственным успешным состоянием.
+enum PingCheckLiveState: Hashable {
+    /// Профиль на интерфейс не назначен.
+    case notConfigured
+    /// Профиль есть, но роутер ещё не сообщил результат.
+    case notReady
+    case passing
+    case failing
+
+    var title: String {
+        switch self {
+        case .notConfigured: return "проверки нет"
+        case .notReady:      return "проверка не готова"
+        case .passing:       return "связь есть"
+        case .failing:       return "связи нет"
+        }
+    }
+}
+
 struct KeeneticInterface: Identifiable, Hashable {
     var ident: String
     var descriptionText: String = ""
@@ -11,6 +60,10 @@ struct KeeneticInterface: Identifiable, Hashable {
     var defaultGW: String = ""
     var securityLevel: String = ""
     var aliases: Set<String> = []
+    /// Значение details["ping-check"]["status"], если роутер его прислал.
+    var pingCheckStatus: String?
+    /// Пиры WireGuard с их живой статистикой.
+    var peers: [WireGuardPeerState] = []
 
     var id: String { ident }
 
@@ -41,6 +94,19 @@ struct KeeneticInterface: Identifiable, Hashable {
         if defaultGW == "yes" { parts.append("шлюз по умолчанию") }
         if isGlobal == "yes" { parts.append("выход в интернет") }
         return parts.joined(separator: ", ")
+    }
+
+    /// Состояние проверки связи. Назначен ли профиль, знает не сам
+    /// интерфейс, а конфигурация — поэтому спрашиваем отдельно.
+    func pingCheck(configured: Bool) -> PingCheckLiveState {
+        guard configured else { return .notConfigured }
+        guard let status = pingCheckStatus else { return .notReady }
+        return status == "running" ? .passing : .failing
+    }
+
+    /// Самое свежее рукопожатие среди пиров — по нему судят о туннеле.
+    var freshestHandshake: Int? {
+        peers.compactMap(\.handshakeAge).min()
     }
 
     var isVPN: Bool {
@@ -287,6 +353,22 @@ enum RouterConfigParser {
             item.aliases.insert(name)
 
             for (key, raw) in payload {
+                let lowered = key.lowercased()
+
+                // Вложенные объекты: проверка связи и пиры WireGuard.
+                if lowered == "details", let details = raw as? [String: Any] {
+                    if let check = details["ping-check"] as? [String: Any] {
+                        item.pingCheckStatus = (check["status"] as? String) ?? ""
+                    } else if details["ping-check"] != nil {
+                        item.pingCheckStatus = ""
+                    }
+                    continue
+                }
+                if lowered == "wireguard", let wireguard = raw as? [String: Any] {
+                    item.peers = parsePeers(wireguard["peer"])
+                    continue
+                }
+
                 let text: String
                 switch raw {
                 case let value as String: text = value
@@ -294,11 +376,38 @@ enum RouterConfigParser {
                 case let value as NSNumber: text = value.stringValue
                 default: continue
                 }
-                apply(key: key.lowercased(), value: text, to: &item)
+                apply(key: lowered, value: text, to: &item)
             }
             result[ident] = item
         }
         return result
+    }
+
+    /// `wireguard.peer` бывает и массивом, и одиночным объектом.
+    static func parsePeers(_ raw: Any?) -> [WireGuardPeerState] {
+        let items: [[String: Any]]
+        switch raw {
+        case let array as [[String: Any]]: items = array
+        case let single as [String: Any]:  items = [single]
+        default: return []
+        }
+
+        return items.map { entry in
+            var peer = WireGuardPeerState()
+            peer.publicKey = (entry["public-key"] as? String) ?? ""
+            peer.endpoint = (entry["remote-endpoint-address"] as? String)
+                ?? (entry["endpoint"] as? String) ?? ""
+            peer.online = (entry["online"] as? Bool)
+                ?? ((entry["online"] as? NSNumber)?.boolValue ?? false)
+            peer.received = (entry["rxbytes"] as? NSNumber)?.intValue ?? 0
+            peer.sent = (entry["txbytes"] as? NSNumber)?.intValue ?? 0
+
+            if let age = (entry["last-handshake"] as? NSNumber)?.intValue,
+               age < WireGuardPeerState.never {
+                peer.handshakeAge = age
+            }
+            return peer
+        }
     }
 
     private static func apply(key: String, value: String, to item: inout KeeneticInterface) {
@@ -329,6 +438,8 @@ enum RouterConfigParser {
             if !incoming.isGlobal.isEmpty { item.isGlobal = incoming.isGlobal }
             if !incoming.defaultGW.isEmpty { item.defaultGW = incoming.defaultGW }
             if !incoming.securityLevel.isEmpty { item.securityLevel = incoming.securityLevel }
+            if incoming.pingCheckStatus != nil { item.pingCheckStatus = incoming.pingCheckStatus }
+            if !incoming.peers.isEmpty { item.peers = incoming.peers }
             item.aliases.formUnion(incoming.aliases)
             merged[ident] = item
         }

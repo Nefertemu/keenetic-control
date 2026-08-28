@@ -68,9 +68,29 @@ PLIST
 
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 
+# Ад-хок подпись даёт требование вида cdhash — оно меняется с каждой
+# сборкой, и связка ключей каждый раз заново спрашивает доступ к паролям.
+# Подпись сертификатом даёт требование по идентификатору бандла, оно
+# переживает пересборку, и разрешение выдаётся один раз навсегда.
+IDENTITY="${KC_SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+    IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk 'NR==1 && /\)/ {print $2}')"
+fi
+
 echo "==> Подпись"
-codesign --force --deep --sign - "$BUNDLE"
+if [ -n "$IDENTITY" ]; then
+    NAME="$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -m1 "$IDENTITY" | sed 's/.*"\(.*\)"/\1/')"
+    echo "    сертификат: ${NAME:-$IDENTITY}"
+    codesign --force --deep --sign "$IDENTITY" "$BUNDLE"
+else
+    echo "    сертификата подписи нет — подписываю ад-хок"
+    echo "    связка ключей будет заново спрашивать доступ после каждой сборки"
+    codesign --force --deep --sign - "$BUNDLE"
+fi
 codesign --verify --verbose=1 "$BUNDLE" 2>&1 | sed 's/^/    /'
+codesign -d -r- "$BUNDLE" 2>&1 | grep -i "^designated" | sed 's/^/    /'
 
 echo
 echo "Готово: $BUNDLE"

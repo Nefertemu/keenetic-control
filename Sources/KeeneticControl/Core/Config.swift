@@ -141,8 +141,45 @@ struct AppSettings: Codable {
     var saveConfigAfterApply: Bool = true
     /// Последний выбранный роутер — чтобы запуск не сбрасывал его на первый.
     var lastRouterID: String = ""
+    /// Фоновая сверка источников с роутером.
+    var autoUpdateEnabled: Bool = false
+    var autoUpdateHours: Int = 24
+    /// Пусто — сверять все источники.
+    var autoUpdateSources: [String] = []
+    var autoUpdateNotify: Bool = true
+    var lastAutoUpdate: Date?
 
     static let `default` = AppSettings()
+
+    init() {}
+
+    /// Читаем каждое поле по отдельности и по отсутствию берём значение по
+    /// умолчанию. Синтезированный декодер спотыкается на любом новом поле,
+    /// и тогда файл настроек считается битым — а это молча сбрасывало бы
+    /// ВСЕ настройки при первом запуске новой версии.
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = AppSettings()
+        func value<T: Decodable>(_ key: CodingKeys, _ default: T) -> T {
+            ((try? box.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? `default`
+        }
+
+        chunkSize = value(.chunkSize, fallback.chunkSize)
+        maxDomainsPerList = value(.maxDomainsPerList, fallback.maxDomainsPerList)
+        batchSize = value(.batchSize, fallback.batchSize)
+        cacheTTLMinutes = value(.cacheTTLMinutes, fallback.cacheTTLMinutes)
+        defaultAuto = value(.defaultAuto, fallback.defaultAuto)
+        defaultReject = value(.defaultReject, fallback.defaultReject)
+        keepBackups = value(.keepBackups, fallback.keepBackups)
+        removeStaleByDefault = value(.removeStaleByDefault, fallback.removeStaleByDefault)
+        saveConfigAfterApply = value(.saveConfigAfterApply, fallback.saveConfigAfterApply)
+        lastRouterID = value(.lastRouterID, fallback.lastRouterID)
+        autoUpdateEnabled = value(.autoUpdateEnabled, fallback.autoUpdateEnabled)
+        autoUpdateHours = value(.autoUpdateHours, fallback.autoUpdateHours)
+        autoUpdateSources = value(.autoUpdateSources, fallback.autoUpdateSources)
+        autoUpdateNotify = value(.autoUpdateNotify, fallback.autoUpdateNotify)
+        lastAutoUpdate = try? box.decodeIfPresent(Date.self, forKey: .lastAutoUpdate)
+    }
 }
 
 @MainActor
@@ -155,12 +192,21 @@ final class Store: ObservableObject {
     @Published var settings: AppSettings {
         didSet { persistSettings() }
     }
+    /// Личные источники доменов — рядом со встроенным каталогом.
+    @Published var customSources: [CustomSource] = [] {
+        didSet { persistSources() }
+    }
     @Published var selectedRouterID: UUID? {
         didSet {
             guard !loading, let id = selectedRouterID else { return }
             settings.lastRouterID = id.uuidString
         }
     }
+
+    /// Встроенные источники плюс свои — в этом порядке.
+    var allSources: [SourceSpec] { SourceCatalog.all + customSources.map(\.spec) }
+
+    func source(for key: String) -> SourceSpec? { allSources.first { $0.key == key } }
 
     var selectedRouter: RouterProfile? {
         guard let id = selectedRouterID else { return routers.first }
@@ -185,6 +231,11 @@ final class Store: ObservableObject {
             settings = saved
         } else {
             settings = .default
+        }
+
+        if let data = try? Data(contentsOf: AppPaths.sourcesFile),
+           let saved = try? decoder.decode([CustomSource].self, from: data) {
+            customSources = saved
         }
 
         let remembered = UUID(uuidString: settings.lastRouterID)
@@ -228,6 +279,27 @@ final class Store: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try? encoder.encode(routers).write(to: AppPaths.routersFile, options: .atomic)
+    }
+
+    func addSource(_ source: CustomSource) { customSources.append(source) }
+
+    func updateSource(_ source: CustomSource) {
+        guard let index = customSources.firstIndex(where: { $0.id == source.id }) else { return }
+        customSources[index] = source
+    }
+
+    func removeSource(_ source: CustomSource) {
+        // Кэш личного источника больше никому не нужен.
+        try? FileManager.default.removeItem(at: source.spec.cacheFile)
+        try? FileManager.default.removeItem(at: source.spec.subnetCacheFile)
+        customSources.removeAll { $0.id == source.id }
+    }
+
+    private func persistSources() {
+        guard !loading else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? encoder.encode(customSources).write(to: AppPaths.sourcesFile, options: .atomic)
     }
 
     private func persistSettings() {

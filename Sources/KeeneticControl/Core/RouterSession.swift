@@ -55,6 +55,16 @@ struct RouterState {
         return "\(note) · \(ident)"
     }
 
+    /// Назначен ли интерфейсу профиль проверки связи.
+    func hasPingCheck(_ ident: String) -> Bool {
+        !(pingCheckBindings[ident]?.profile ?? "").isEmpty
+    }
+
+    /// Что роутер думает о проверке связи на этом интерфейсе сейчас.
+    func pingCheck(for ident: String) -> PingCheckLiveState {
+        interfaces[ident]?.pingCheck(configured: hasPingCheck(ident)) ?? .notConfigured
+    }
+
     /// Как назвать интерфейс одним словом там, где места мало.
     func shortLabel(for ident: String) -> String { note(for: ident) ?? ident }
 

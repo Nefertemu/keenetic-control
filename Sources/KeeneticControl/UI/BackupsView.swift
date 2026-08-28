@@ -20,6 +20,10 @@ struct BackupsView: View {
     @State private var preview = ""
     @State private var loadingPreview = false
     @State private var onlyThisRouter = true
+    @State private var difference: Restore.Difference?
+    @State private var comparing = false
+    @State private var plan: Plan?
+    @State private var outcome: ApplyOutcome?
 
     private var selected: Snapshot? {
         guard let selection else { return nil }
@@ -40,6 +44,23 @@ struct BackupsView: View {
         }
         .padding(20)
         .onAppear(perform: reload)
+        .sheet(item: Binding(get: { difference.map(DiffBox.init) },
+                             set: { difference = $0?.value })) { box in
+            RestorePreview(difference: box.value, snapshot: selected?.url.lastPathComponent ?? "") {
+                difference = nil
+                plan = Restore.plan(box.value, chunkSize: Store.shared.settings.chunkSize,
+                                    title: "Возврат к копии")
+            } onCancel: { difference = nil }
+        }
+        .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
+            PlanSheet(plan: box.plan, applyTitle: "Вернуть как было") { dryRun in
+                plan = nil
+                Task { await apply(box.plan, dryRun: dryRun) }
+            } onCancel: { plan = nil }
+        }
+        .sheet(item: Binding(get: { outcome.map(OutcomeBox.init) }, set: { outcome = $0?.outcome })) { box in
+            OutcomeSheet(title: "Возврат к резервной копии", outcome: box.outcome) { outcome = nil }
+        }
         .onChange(of: session.router.id) { _, _ in
             // Снимки лежат вперемешку, и выделенный принадлежал прошлому
             // роутеру — под фильтром «только этот» он просто исчезал бы.
@@ -149,6 +170,20 @@ struct BackupsView: View {
                            subtitle: selected.map { "running-config · \($0.host) · \($0.url.lastPathComponent)" }
                              ?? "Выбери файл слева")
                 Spacer()
+                if selected != nil {
+                    Button {
+                        Task { await compare() }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if comparing { ProgressView().controlSize(.small) }
+                            Text(comparing ? "Сверяю…" : "Сверить с роутером")
+                        }
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(comparing || session.progress != nil)
+                    .help("Показать, чем текущая конфигурация отличается от снимка, "
+                          + "и собрать план возврата")
+                }
                 if !preview.isEmpty {
                     Button("Копировать") {
                         NSPasteboard.general.clearContents()
@@ -214,6 +249,41 @@ struct BackupsView: View {
         }
     }
 
+    /// Сверка снимка с тем, что на роутере сейчас.
+    private func compare() async {
+        guard let url = selection else { return }
+        comparing = true
+        defer { comparing = false }
+        do {
+            let backup = try await Task.detached {
+                try String(contentsOf: url, encoding: .utf8)
+            }.value
+            let current = try await session.readConfigText()
+            let found = Restore.compare(backup: backup, current: current)
+            if found.isEmpty {
+                alert = AlertPayload(
+                    title: "Расхождений нет",
+                    message: "Списки FQDN, их маршруты и статические маршруты "
+                           + "совпадают со снимком.",
+                    isError: false)
+                return
+            }
+            difference = found
+        } catch {
+            alert = AlertPayload(title: "Не удалось сверить", message: session.describe(error))
+        }
+    }
+
+    private func apply(_ plan: Plan, dryRun: Bool) async {
+        do {
+            let result = try await session.apply(plan: plan, dryRun: dryRun,
+                                                 saveConfig: Store.shared.settings.saveConfigAfterApply)
+            if result.applied { outcome = result }
+        } catch {
+            alert = AlertPayload(title: "Возврат не удался", message: session.describe(error))
+        }
+    }
+
     private func snapshot() async {
         do {
             let text = try await session.readConfigText()
@@ -224,6 +294,129 @@ struct BackupsView: View {
             if let url { select(url) }
         } catch {
             alert = AlertPayload(title: "Не удалось снять копию", message: session.describe(error))
+        }
+    }
+}
+
+struct DiffBox: Identifiable {
+    let id = UUID()
+    let value: Restore.Difference
+    init(_ value: Restore.Difference) { self.value = value }
+}
+
+/// Что именно вернётся, до того как собран план команд.
+struct RestorePreview: View {
+    let difference: Restore.Difference
+    let snapshot: String
+    var onBuild: () -> Void
+    var onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            CardHeader(icon: "clock.arrow.circlepath", title: "Возврат к резервной копии",
+                       subtitle: snapshot)
+                .padding(18)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 2),
+                              spacing: 12) {
+                        MetricTile(value: String(difference.missingDomainCount),
+                                   label: "Вернуть доменов", icon: "arrow.uturn.backward",
+                                   tint: Palette.success)
+                        MetricTile(value: String(difference.extraDomainCount),
+                                   label: "Убрать доменов", icon: "minus.circle",
+                                   tint: Palette.danger)
+                        MetricTile(value: String(difference.missingGroups.count),
+                                   label: "Создать списков", icon: "folder.badge.plus",
+                                   tint: Palette.accent)
+                        MetricTile(value: String(difference.extraGroups.count),
+                                   label: "Удалить списков", icon: "folder.badge.minus",
+                                   tint: Palette.warning)
+                    }
+
+                    section("Списки появятся заново", difference.missingGroups.map {
+                        "\($0.ident) · \($0.descriptionText) · \(Format.domains($0.includes.count))"
+                    }, tint: Palette.accent)
+
+                    section("Списки будут удалены", difference.extraGroups.map {
+                        "\($0.ident) · \($0.descriptionText) · \(Format.domains($0.includes.count))"
+                    }, tint: Palette.warning)
+
+                    section("Маршруты списков вернутся", difference.missingRouteLines,
+                            tint: Palette.success)
+                    section("Маршруты списков снимутся", difference.extraRouteLines,
+                            tint: Palette.danger)
+                    section("Статические маршруты вернутся",
+                            difference.missingRoutes.map(\.command), tint: Palette.success)
+                    section("Статические маршруты снимутся",
+                            difference.extraRoutes.map(\.command), tint: Palette.danger)
+
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(.secondary)
+                            .font(.system(size: 11))
+                        Text("Возвращается только то, чем управляет приложение: списки FQDN, "
+                             + "их маршруты и статические маршруты. Wi-Fi, NAT, межсетевой экран "
+                             + "и прочее из снимка не трогаются.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(18)
+            }
+            .background(Palette.canvas)
+
+            Divider()
+
+            HStack {
+                Button("Отмена", action: onCancel)
+                    .buttonStyle(SubtleButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Text(difference.summary.joined(separator: " · "))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Button("Собрать план") { onBuild() }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+        }
+        .frame(width: 760, height: 620)
+        .background(Palette.surface)
+    }
+
+    @ViewBuilder
+    private func section(_ title: String, _ lines: [String], tint: Color) -> some View {
+        if !lines.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Circle().fill(tint).frame(width: 6, height: 6)
+                    Text(title).font(.system(size: 12, weight: .semibold))
+                    Text(String(lines.count))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(lines.prefix(40).enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(line)
+                }
+                if lines.count > 40 {
+                    Text("и ещё \(lines.count - 40)")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .inset()
         }
     }
 }

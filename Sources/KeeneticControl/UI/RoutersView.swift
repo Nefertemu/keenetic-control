@@ -13,12 +13,14 @@ struct RoutersView: View {
     /// nil — ещё не спрашивали: пока проверка идёт, писать «нет пароля»
     /// нельзя, это выглядит как поломка на ровном месте.
     @State private var havePassword: Set<UUID>?
+    @ObservedObject private var updater = AutoUpdater.shared
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 routers
                 settings
+                autoUpdate
                 storage
             }
             .padding(20)
@@ -131,7 +133,8 @@ struct RoutersView: View {
             if fromEnvironment {
                 StatusPill(text: "пароль из окружения", tint: Palette.success)
             } else if known == nil {
-                StatusPill(text: "проверяю связку ключей…", tint: .secondary)
+                StatusPill(text: "проверяю…", tint: .secondary)
+                    .help("Читаю пароль из связки ключей macOS")
             } else {
                 StatusPill(text: hasPassword ? "пароль сохранён" : "нет пароля",
                            tint: hasPassword ? Palette.success : Palette.warning)
@@ -226,6 +229,95 @@ struct RoutersView: View {
             }
             Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
         }
+    }
+
+    // MARK: - Фоновая сверка
+
+    private var autoUpdate: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                CardHeader(icon: "arrow.triangle.2.circlepath", title: "Сверка источников",
+                           subtitle: "Приложение само проверяет, не разошлись ли списки")
+                Spacer()
+                Button {
+                    Task { await updater.check(manual: true) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if updater.checking { ProgressView().controlSize(.small) }
+                        Text(updater.checking ? "Проверяю…" : "Проверить сейчас")
+                    }
+                }
+                .buttonStyle(SubtleButtonStyle())
+                .disabled(updater.checking)
+            }
+
+            Toggle(isOn: Binding(get: { store.settings.autoUpdateEnabled },
+                                 set: { store.settings.autoUpdateEnabled = $0; updater.reschedule() })) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Проверять в фоне").font(.system(size: 12, weight: .medium))
+                    Text("Сверка только читает источники и сравнивает их с последней "
+                         + "прочитанной конфигурацией. На роутер она НИЧЕГО не отправляет "
+                         + "и сама к нему не подключается — применять план решаешь ты.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(alignment: .top, spacing: 20) {
+                numberField("Раз в сколько часов", value: Binding(
+                    get: { store.settings.autoUpdateHours },
+                    set: { store.settings.autoUpdateHours = $0; updater.reschedule() }),
+                            range: 1...168,
+                            hint: "Проверка запускается и при открытии приложения.")
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Состояние").font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(updater.lastMessage ?? "ещё не проверялось")
+                        .font(.system(size: 12))
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let last = updater.lastCheck {
+                        Text("последняя проверка \(Format.age(last))")
+                            .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+            }
+
+            Toggle(isOn: $store.settings.autoUpdateNotify) {
+                Text("Показывать системное уведомление при расхождении")
+                    .font(.system(size: 12))
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Какие источники сверять").font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(store.settings.autoUpdateSources.isEmpty
+                     ? "Ничего не отмечено — сверяются все."
+                     : "Отмечено: \(store.settings.autoUpdateSources.count)")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 2),
+                          alignment: .leading, spacing: 6) {
+                    ForEach(store.allSources) { spec in
+                        let picked = store.settings.autoUpdateSources.contains(spec.key)
+                        Toggle(isOn: Binding(
+                            get: { picked },
+                            set: { on in
+                                var chosen = store.settings.autoUpdateSources
+                                if on { chosen.append(spec.key) } else { chosen.removeAll { $0 == spec.key } }
+                                store.settings.autoUpdateSources = chosen
+                            })) {
+                            Text(spec.title).font(.system(size: 11)).lineLimit(1)
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                }
+            }
+        }
+        .card()
     }
 
     // MARK: - Данные на диске

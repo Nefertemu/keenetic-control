@@ -9,6 +9,11 @@ enum Format {
         return "\(Int(delta / 86_400)) дн назад"
     }
 
+    /// «12 с назад», «3 мин назад» — для времени последнего рукопожатия.
+    static func ago(seconds: Int) -> String {
+        seconds < 5 ? "только что" : "\(duration(TimeInterval(seconds))) назад"
+    }
+
     static func duration(_ seconds: TimeInterval) -> String {
         let total = Int(max(0, seconds))
         if total < 60 { return "\(total) с" }

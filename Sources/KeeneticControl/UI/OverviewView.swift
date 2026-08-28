@@ -161,6 +161,11 @@ struct OverviewView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             }
+                            // Живое состояние: проверка связи и рукопожатие.
+                            // «включён» не отличает рабочий туннель от повисшего.
+                            LiveStateLine(check: state.pingCheck(for: item.ident),
+                                          handshake: item.freshestHandshake,
+                                          online: item.isUp && !item.peers.isEmpty)
                         }
                         .help(item.displayName
                               + (item.statusText.isEmpty ? "" : "\n" + item.statusText))
