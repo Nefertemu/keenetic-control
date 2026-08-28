@@ -28,9 +28,14 @@ enum NDW4 {
         let message: String
         /// Подпись сервера не сошлась — роутер не знает пароля либо он подменён.
         let serverUntrusted: Bool
-        init(_ message: String, serverUntrusted: Bool = false) {
+        /// Осечка на первой фазе значит, что роутер объявил схему, но не ведёт
+        /// её. Пароль тут ни при чём, и второй раз пробовать бессмысленно.
+        let handshakeUnsupported: Bool
+        init(_ message: String, serverUntrusted: Bool = false,
+             handshakeUnsupported: Bool = false) {
             self.message = message
             self.serverUntrusted = serverUntrusted
+            self.handshakeUnsupported = handshakeUnsupported
         }
         var errorDescription: String? { message }
     }
@@ -42,7 +47,7 @@ enum NDW4 {
 
         let first = try send(["login": login, "nonce": clientNonceB64])
         guard first.status == 401 else {
-            throw Failure("Фаза 1: неожиданный ответ HTTP \(first.status).")
+            throw Failure("Фаза 1: неожиданный ответ HTTP \(first.status).", handshakeUnsupported: true)
         }
         guard let payload = first.data,
               let salt = payload["salt"] as? String,
@@ -50,20 +55,20 @@ enum NDW4 {
               let iterations = intValue(payload["iter"]),
               let memoryCost = intValue(payload["memcost"])
         else {
-            throw Failure("Фаза 1: роутер не прислал соль и параметры.")
+            throw Failure("Фаза 1: роутер не прислал соль и параметры.", handshakeUnsupported: true)
         }
         guard let saltBytes = Data(base64Encoded: salt) else {
-            throw Failure("Фаза 1: соль не разбирается.")
+            throw Failure("Фаза 1: соль не разбирается.", handshakeUnsupported: true)
         }
 
         // Параметры приходят от роутера: на абсурдных значениях мы бы
         // выделили гигабайты памяти или считали ключ часами.
         guard (1...16).contains(iterations), (8...(1 << 20)).contains(memoryCost) else {
             throw Failure("Фаза 1: роутер прислал неправдоподобные параметры "
-                          + "(проходов \(iterations), памяти \(memoryCost) КиБ).")
+                          + "(проходов \(iterations), памяти \(memoryCost) КиБ).", handshakeUnsupported: true)
         }
         guard saltBytes.count >= 8, saltBytes.count <= 64 else {
-            throw Failure("Фаза 1: длина соли \(saltBytes.count) байт выглядит неправильной.")
+            throw Failure("Фаза 1: длина соли \(saltBytes.count) байт выглядит неправильной.", handshakeUnsupported: true)
         }
 
         // --- Вывод ключей из пароля.

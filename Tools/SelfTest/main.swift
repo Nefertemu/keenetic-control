@@ -424,6 +424,44 @@ do {
     check("Argon2id, контрольный пример RFC 9106", tag.hexString,
           "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
 } catch { failures += 1; checks += 1; print("  FAIL Argon2id: \(error)") }
+print("\n== Защита от лишних неудачных входов ==")
+// Роутер объявляет x-ndw4, но на первой фазе не присылает соль. Пароль тут
+// ни при чём: вторая попытка только потратит лимит роутера.
+func ndw4Failure(_ reply: NDW4.Reply) -> NDW4.Failure? {
+    do {
+        try NDW4.authenticate(login: "admin", password: "x") { _ in reply }
+        return nil
+    } catch let failure as NDW4.Failure {
+        return failure
+    } catch {
+        return nil
+    }
+}
+
+let noSalt = ndw4Failure(NDW4.Reply(status: 401, data: nil))
+check("первая фаза без соли распознана", noSalt?.handshakeUnsupported ?? false)
+check("это не обвинение пароля", !(noSalt?.serverUntrusted ?? true))
+
+let wrongStatus = ndw4Failure(NDW4.Reply(status: 200, data: nil))
+check("неожиданный статус первой фазы — тоже несовместимость",
+      wrongStatus?.handshakeUnsupported ?? false)
+
+let badSalt = ndw4Failure(NDW4.Reply(
+    status: 401, data: ["salt": "///", "iterations": 3, "memory": 4096]))
+check("нечитаемая соль — несовместимость", badSalt?.handshakeUnsupported ?? false)
+
+let wildParameters = ndw4Failure(NDW4.Reply(
+    status: 401,
+    data: ["salt": Data(repeating: 7, count: 16).base64EncodedString(),
+           "iterations": 9999, "memory": 4096]))
+check("неправдоподобные параметры — несовместимость",
+      wildParameters?.handshakeUnsupported ?? false)
+
+check("до отказа схему не пропускаем", !RCITransport.skipsModernAuth(host: "192.168.1.1"))
+RCITransport.rememberModernAuthUnusable(host: "192.168.1.1")
+check("после отказа пропускаем", RCITransport.skipsModernAuth(host: "192.168.1.1"))
+check("и только для этого адреса", !RCITransport.skipsModernAuth(host: "192.168.1.2"))
+
 check("разбор endpoint из WWW-Authenticate",
   RCITransport.endpoint(in: "x-ndw4-interactive endpoint=\"/auth\" data=\"e30=\"") ?? "nil", "auth")
 check("endpoint отсутствует — не выдумываем",

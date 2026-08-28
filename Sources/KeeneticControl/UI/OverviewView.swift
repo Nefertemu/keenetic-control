@@ -66,8 +66,13 @@ struct OverviewView: View {
     }
 
     private func failure(_ message: String) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            CardHeader(icon: "exclamationmark.triangle.fill", title: "Не удалось подключиться",
+        // Пароль отвергнут — «Повторить» не поможет, а счётчик защиты роутера
+        // подвинет. Ведём к настройкам, а не к новой попытке.
+        let blocked = session.authBlock(session.router.id) != nil
+
+        return VStack(alignment: .leading, spacing: 14) {
+            CardHeader(icon: "exclamationmark.triangle.fill",
+                       title: blocked ? "Роутер не принял пароль" : "Не удалось подключиться",
                        subtitle: session.router.endpoint, tint: Palette.danger)
             Text(message)
                 .font(.system(size: 12, design: .monospaced))
@@ -76,10 +81,22 @@ struct OverviewView: View {
                 .padding(12)
                 .inset()
             HStack {
-                Button("Повторить") { Task { await connect() } }
-                    .buttonStyle(PrimaryButtonStyle())
-                Button("Настройки роутера") { section = .routers }
-                    .buttonStyle(SubtleButtonStyle())
+                if blocked {
+                    Button("Впиши пароль в настройках") { section = .routers }
+                        .buttonStyle(PrimaryButtonStyle())
+                    Button("Всё равно попробовать") {
+                        session.clearAuthBlock(session.router.id)
+                        Task { await connect() }
+                    }
+                    .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
+                    .help("Ещё одна неудачная попытка приближает отключение веб-панели "
+                          + "роутера для этого компьютера на 15 минут")
+                } else {
+                    Button("Повторить") { Task { await connect() } }
+                        .buttonStyle(PrimaryButtonStyle())
+                    Button("Настройки роутера") { section = .routers }
+                        .buttonStyle(SubtleButtonStyle())
+                }
             }
         }
         .card()

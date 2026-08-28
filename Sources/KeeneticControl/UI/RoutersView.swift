@@ -34,6 +34,9 @@ struct RoutersView: View {
                 Task {
                     if let password {
                         await Task.detached { updated.password = password }.value
+                        // Учётные данные поменялись — прежний отказ больше
+                        // ничего не значит, пробовать снова можно.
+                        session.clearAuthBlock(updated.id)
                     }
                     await session.switchTo(updated)
                     refreshPasswordFlags()

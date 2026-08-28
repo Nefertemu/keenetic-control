@@ -130,6 +130,10 @@ final class RouterSlot {
     /// заливка списков на один, второй должен оставаться рабочим.
     var progress: ProgressInfo?
     var activity: String?
+    /// Роутер уже отверг эти учётные данные. Повторять нельзя: у веб-панели
+    /// Keenetic есть защита от подбора (ip http lockout-policy), и лишние
+    /// попытки отключают панель для этого компьютера на четверть часа.
+    var authRejected: String?
     var connectTask: Task<KeeneticTransport, Error>?
     /// По чему судим, что профиль поменялся и соединение пора выбросить.
     var connectionKey: String
@@ -254,6 +258,16 @@ final class RouterSession: ObservableObject {
         stale?.abort()
     }
 
+    /// Пароль поправили — снова можно пробовать.
+    func clearAuthBlock(_ id: UUID) {
+        guard slots[id]?.authRejected != nil else { return }
+        slots[id]?.authRejected = nil
+        if id == router.id, case .failed = status { status = .offline }
+    }
+
+    /// Почему подключение к роутеру заблокировано, если заблокировано.
+    func authBlock(_ id: UUID) -> String? { slots[id]?.authRejected }
+
     /// Роутер удалили из списка — его соединение и состояние больше не нужны.
     func forget(_ id: UUID) {
         guard let slot = slots.removeValue(forKey: id) else { return }
@@ -311,6 +325,13 @@ final class RouterSession: ObservableObject {
 
         let slot = activeSlot
 
+        // Пароль уже отвергли. Каждая новая попытка — ещё одна отметка в
+        // счётчике защиты роутера, а не шанс на успех.
+        if let rejected = slot.authRejected {
+            status = .failed(rejected)
+            throw TransportError(rejected, isAuthFailure: true)
+        }
+
         // Попытка уже идёт — дожидаемся её, а не поднимаем вторую сессию.
         if let running = slot.connectTask {
             _ = try await running.value
@@ -329,8 +350,16 @@ final class RouterSession: ObservableObject {
             let opened = try await task.value
             store(transport: opened, status: .online(profile.transport), owner: owner)
         } catch {
-            store(transport: nil, status: .failed(describe(error)), owner: owner)
-            log(.error, "Подключение к \(profile.name): \(describe(error))")
+            var message = describe(error)
+            if (error as? TransportError)?.isAuthFailure == true {
+                message += "\n\nДальнейшие попытки заблокированы: у веб-панели Keenetic "
+                    + "есть защита от подбора пароля, и лишние заходы отключают её "
+                    + "для этого компьютера примерно на 15 минут. Впиши верный пароль "
+                    + "в «Роутеры и настройки» — запрет снимется сам."
+                slots[owner]?.authRejected = message
+            }
+            store(transport: nil, status: .failed(message), owner: owner)
+            log(.error, "Подключение к \(profile.name): \(message)")
             throw error
         }
     }

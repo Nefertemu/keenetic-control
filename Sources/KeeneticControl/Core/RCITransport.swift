@@ -79,7 +79,12 @@ final class RCITransport: KeeneticTransport {
 
         // Новые прошивки принимают только x-ndw4; старая схема у них отвечает,
         // но отвергает даже верный пароль. Пробуем сначала её.
-        if advertisesModernAuth {
+        //
+        // Но не вслепую: каждая неудачная схема — отдельный неудачный вход в
+        // счётчике роутера, а после пяти он отключает веб-панель для этого
+        // адреса. Роутер, который объявил x-ndw4, но не ведёт её, мы
+        // запоминаем и больше на нём эту схему не пробуем.
+        if advertisesModernAuth, !RCITransport.skipsModernAuth(host: baseURL.host ?? profile.host) {
             do {
                 try runModernAuth(login: profile.user, password: password, endpoint: modernEndpoint)
                 authorized = true
@@ -92,8 +97,14 @@ final class RCITransport: KeeneticTransport {
                         + "либо по этому адресу отвечает не твой роутер.",
                     isAuthFailure: true)
             } catch {
-                log(.warn, "RCI: x-ndw4 не прошла (\(error.localizedDescription)), "
-                    + "пробую старую схему.")
+                if (error as? NDW4.Failure)?.handshakeUnsupported == true {
+                    RCITransport.rememberModernAuthUnusable(host: baseURL.host ?? profile.host)
+                    log(.warn, "RCI: роутер объявляет x-ndw4, но не ведёт её "
+                        + "(\(error.localizedDescription)). Дальше — только старая схема.")
+                } else {
+                    log(.warn, "RCI: x-ndw4 не прошла (\(error.localizedDescription)), "
+                        + "пробую старую схему.")
+                }
             }
         }
 
@@ -136,6 +147,23 @@ final class RCITransport: KeeneticTransport {
             }
             return NDW4.Reply(status: response.statusCode, data: parsed)
         }
+    }
+
+    /// Роутеры, которые объявляют x-ndw4, но спотыкаются на первой фазе.
+    /// Живёт до перезапуска приложения — прошивку могут и обновить.
+    private static let modernAuthLock = NSLock()
+    private static var modernAuthBlacklist: Set<String> = []
+
+    static func skipsModernAuth(host: String) -> Bool {
+        modernAuthLock.lock()
+        defer { modernAuthLock.unlock() }
+        return modernAuthBlacklist.contains(host)
+    }
+
+    static func rememberModernAuthUnusable(host: String) {
+        modernAuthLock.lock()
+        modernAuthBlacklist.insert(host)
+        modernAuthLock.unlock()
     }
 
     /// endpoint="/auth" из заголовка WWW-Authenticate.
