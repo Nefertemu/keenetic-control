@@ -49,10 +49,46 @@ struct RouterState {
         return note.isEmpty ? nil : note
     }
 
-    /// «Wireguard0 · Dataforest» — имя вместе с примечанием.
+    /// «Dataforest · Wireguard0» — сначала имя, которое дал человек.
     func label(for ident: String) -> String {
         guard let note = note(for: ident) else { return ident }
-        return "\(ident) · \(note)"
+        return "\(note) · \(ident)"
+    }
+
+    /// Как назвать интерфейс одним словом там, где места мало.
+    func shortLabel(for ident: String) -> String { note(for: ident) ?? ident }
+
+    /// Несколько интерфейсов одной строкой. Названные идут своими именами
+    /// («Dataforest, Infomaniak»), безымянные из одного семейства
+    /// сворачиваются в «Wireguard 0, 3» — иначе слово повторяется впустую.
+    func targetSummary(_ idents: [String]) -> String {
+        var named: [String] = []
+        var families: [(family: String, numbers: [String])] = []
+
+        for ident in idents {
+            if let note = note(for: ident) { named.append(note); continue }
+            let parts = InterfaceName.split(ident)
+            guard let number = parts.number else { named.append(ident); continue }
+            if let index = families.firstIndex(where: { $0.family == parts.family }) {
+                if !families[index].numbers.contains(number) {
+                    families[index].numbers.append(number)
+                }
+            } else {
+                families.append((parts.family, [number]))
+            }
+        }
+
+        let collapsed = families.map { item -> String in
+            item.numbers.count == 1
+                ? item.family + item.numbers[0]
+                : item.family + " " + item.numbers.joined(separator: ", ")
+        }
+        return (named + collapsed).joined(separator: ", ")
+    }
+
+    /// Полная расшифровка для подсказки: по строке на интерфейс.
+    func targetTooltip(_ idents: [String]) -> String {
+        idents.map { label(for: $0) }.joined(separator: "\n")
     }
     var totalDomains: Int { groups.values.reduce(0) { $0 + $1.includes.count } }
     var routedGroups: Int { groups.values.filter { !$0.routeLines.isEmpty }.count }
@@ -90,6 +126,10 @@ final class RouterSlot {
     var transport: KeeneticTransport?
     var state: RouterState?
     var status: ConnectionStatus = .offline
+    /// Ход длинной операции принадлежит роутеру, а не окну: пока идёт
+    /// заливка списков на один, второй должен оставаться рабочим.
+    var progress: ProgressInfo?
+    var activity: String?
     var connectTask: Task<KeeneticTransport, Error>?
     /// По чему судим, что профиль поменялся и соединение пора выбросить.
     var connectionKey: String
@@ -113,8 +153,12 @@ final class RouterSession: ObservableObject {
     @Published private(set) var state: RouterState? {
         didSet { slots[router.id]?.state = state }
     }
-    @Published private(set) var progress: ProgressInfo?
-    @Published private(set) var activity: String?
+    @Published private(set) var progress: ProgressInfo? {
+        didSet { slots[router.id]?.progress = progress }
+    }
+    @Published private(set) var activity: String? {
+        didSet { slots[router.id]?.activity = activity }
+    }
     @Published var router: RouterProfile
 
     private var transport: KeeneticTransport? {
@@ -173,8 +217,14 @@ final class RouterSession: ObservableObject {
         transport = target.transport
         state = target.state
         status = target.status
-        progress = nil
-        activity = nil
+        progress = target.progress
+        activity = target.activity
+    }
+
+    /// Занят ли конкретный роутер длинной операцией — чтобы кнопки
+    /// блокировались только у него.
+    func isBusy(_ id: UUID) -> Bool {
+        (id == router.id ? progress : slots[id]?.progress) != nil
     }
 
     /// Сменили адрес, порт или транспорт — старое соединение уже не про этот роутер.
@@ -187,6 +237,8 @@ final class RouterSession: ObservableObject {
         target.transport = nil
         target.state = nil
         target.status = .offline
+        target.progress = nil
+        target.activity = nil
         target.connectTask?.cancel()
         target.connectTask = nil
 
@@ -194,10 +246,21 @@ final class RouterSession: ObservableObject {
             transport = nil
             state = nil
             status = .offline
+            progress = nil
+            activity = nil
         }
         // abort() безопасен из любого потока и не блокирует: закрывает
         // дескриптор и добивает процесс, ждать его на очереди слота незачем.
         stale?.abort()
+    }
+
+    /// Роутер удалили из списка — его соединение и состояние больше не нужны.
+    func forget(_ id: UUID) {
+        guard let slot = slots.removeValue(forKey: id) else { return }
+        slot.connectTask?.cancel()
+        slot.transport?.abort()
+        slot.transport = nil
+        slot.state = nil
     }
 
     /// Закрыть все живые соединения — при выходе из приложения.
@@ -229,8 +292,18 @@ final class RouterSession: ObservableObject {
         if owner == router.id { state = newValue } else { slots[owner]?.state = newValue }
     }
 
-    private func clearActivity(owner: UUID) {
-        if owner == router.id { activity = nil }
+    private func clearActivity(owner: UUID) { store(activity: nil, owner: owner) }
+
+    private func store(activity newValue: String?, owner: UUID) {
+        if owner == router.id { activity = newValue } else { slots[owner]?.activity = newValue }
+    }
+
+    private func store(progress newValue: ProgressInfo?, owner: UUID) {
+        if owner == router.id { progress = newValue } else { slots[owner]?.progress = newValue }
+    }
+
+    private func bump(progress done: Int, owner: UUID) {
+        if owner == router.id { progress?.done = done } else { slots[owner]?.progress?.done = done }
     }
 
     func connect() async throws {
@@ -271,9 +344,10 @@ final class RouterSession: ObservableObject {
         var lastError: Error = TransportError("Не удалось подключиться.")
 
         for attempt in 1...attempts {
-            activity = attempt == 1
-                ? "Подключаюсь к \(profile.endpoint)…"
-                : "Попытка \(attempt) из \(attempts): \(profile.endpoint)…"
+            store(activity: attempt == 1
+                    ? "Подключаюсь к \(profile.endpoint)…"
+                    : "Попытка \(attempt) из \(attempts): \(profile.endpoint)…",
+                  owner: profile.id)
 
             let created: KeeneticTransport = profile.transport == .ssh
                 ? SSHTransport(profile: profile, password: password)
@@ -358,7 +432,7 @@ final class RouterSession: ObservableObject {
     @discardableResult
     func refresh() async throws -> RouterState {
         let owner = router.id
-        activity = "Читаю конфигурацию роутера…"
+        store(activity: "Читаю конфигурацию роутера…", owner: owner)
         defer { clearActivity(owner: owner) }
 
         let fresh: RouterState = try await guarded(budget: 200) { transport in
@@ -401,6 +475,7 @@ final class RouterSession: ObservableObject {
 
     func apply(plan: Plan, dryRun: Bool, saveConfig: Bool) async throws -> ApplyOutcome {
         guard !plan.isEmpty else { return ApplyOutcome(applied: true) }
+        let owner = router.id
 
         if dryRun {
             log(.info, "Предпросмотр «\(plan.title)»: \(Format.commands(plan.commands.count)), на роутер ничего не ушло.")
@@ -414,11 +489,11 @@ final class RouterSession: ObservableObject {
            Date().timeIntervalSince(current.readAt) < 300 {
             configText = current.configText
         } else {
-            activity = "Читаю конфигурацию перед изменением…"
+            store(activity: "Читаю конфигурацию перед изменением…", owner: owner)
             configText = try await watch(transport, budget: 200) {
                 try transport.fetchText("show running-config", timeout: 180)
             }
-            activity = nil
+            clearActivity(owner: owner)
         }
 
         let backupURL = Backups.saveRunningConfig(
@@ -429,13 +504,14 @@ final class RouterSession: ObservableObject {
         let batchSize = max(1, Store.shared.settings.batchSize)
         let limit = Store.shared.settings.maxDomainsPerList
 
-        progress = ProgressInfo(label: plan.title, done: 0, total: plan.commands.count)
-        defer { progress = nil }
+        store(progress: ProgressInfo(label: plan.title, done: 0, total: plan.commands.count),
+              owner: owner)
+        defer { store(progress: nil, owner: owner) }
 
         log(.info, "\(plan.title): отправляю \(Format.commands(plan.commands.count)).")
 
         do {
-            try await execute(plan.commands, transport: transport, batchSize: batchSize)
+            try await execute(plan.commands, transport: transport, batchSize: batchSize, owner: owner)
         } catch {
             log(.error, "Выполнение остановлено: \(describe(error))")
             log(.warn, "Конфигурация НЕ сохранена. Часть команд могла примениться — проверь бэкап.")
@@ -443,11 +519,11 @@ final class RouterSession: ObservableObject {
         }
 
         if saveConfig {
-            activity = "Сохраняю конфигурацию роутера…"
+            store(activity: "Сохраняю конфигурацию роутера…", owner: owner)
             let output = try await watch(transport, budget: 200) {
                 try transport.run("system configuration save", timeout: 180)
             }
-            activity = nil
+            clearActivity(owner: owner)
             if CLI.failed(output) {
                 log(.error, "Не удалось сохранить конфигурацию: \(output)")
                 throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
@@ -455,9 +531,9 @@ final class RouterSession: ObservableObject {
             log(.ok, "Конфигурация сохранена.")
         }
 
-        activity = "Перечитываю конфигурацию для проверки…"
+        store(activity: "Перечитываю конфигурацию для проверки…", owner: owner)
         let problems = try await verify(plan: plan, transport: transport, limit: limit)
-        activity = nil
+        clearActivity(owner: owner)
 
         let elapsed = Date().timeIntervalSince(started)
         if problems.isEmpty {
@@ -470,7 +546,8 @@ final class RouterSession: ObservableObject {
     }
 
     /// Пакетная отправка: `include`-команды летят пачками, остальные по одной.
-    private func execute(_ commands: [String], transport: KeeneticTransport, batchSize: Int) async throws {
+    private func execute(_ commands: [String], transport: KeeneticTransport,
+                         batchSize: Int, owner: UUID) async throws {
         let bulk = try! NSRegularExpression(pattern: "^(?:no\\s+)?object-group\\s+fqdn\\s+\\S+\\s+include\\s+")
         func isBulk(_ command: String) -> Bool {
             bulk.firstMatch(in: command, range: NSRange(command.startIndex..., in: command)) != nil
@@ -516,7 +593,7 @@ final class RouterSession: ObservableObject {
 
             done += batch.count
             index += batch.count
-            progress?.done = done
+            bump(progress: done, owner: owner)
         }
     }
 
@@ -579,10 +656,12 @@ final class RouterSession: ObservableObject {
     @discardableResult
     func runCommands(_ commands: [String], title: String, saveConfig: Bool = true) async throws -> String {
         guard !commands.isEmpty else { return "" }
+        let owner = router.id
         let transport = try await session()
 
-        progress = ProgressInfo(label: title, done: 0, total: commands.count + (saveConfig ? 1 : 0))
-        defer { progress = nil }
+        store(progress: ProgressInfo(label: title, done: 0,
+                                     total: commands.count + (saveConfig ? 1 : 0)), owner: owner)
+        defer { store(progress: nil, owner: owner) }
 
         var outputs: [String] = []
         for (index, command) in commands.enumerated() {
@@ -594,7 +673,7 @@ final class RouterSession: ObservableObject {
                 throw TransportError("Роутер отверг команду: \(command)", hint: output)
             }
             if !output.isEmpty { outputs.append(output) }
-            progress?.done = index + 1
+            bump(progress: index + 1, owner: owner)
         }
 
         if saveConfig {
@@ -604,7 +683,7 @@ final class RouterSession: ObservableObject {
             if CLI.failed(output) {
                 throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
             }
-            progress?.done = commands.count + 1
+            bump(progress: commands.count + 1, owner: owner)
             log(.ok, "Конфигурация сохранена.")
         }
 
@@ -629,18 +708,28 @@ final class RouterSession: ObservableObject {
 
     func loadSource(_ spec: SourceSpec, forceRefresh: Bool) async throws -> SourceData {
         let ttl = Store.shared.settings.cacheTTLMinutes
-        activity = "Загружаю «\(spec.title)»…"
-        defer { activity = nil }
+        let owner = router.id
+        store(activity: "Загружаю «\(spec.title)»…", owner: owner)
+        defer { clearActivity(owner: owner) }
         return try await background { try SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh) }
     }
 
     // MARK: - Инструменты
 
-    func setActivity(_ text: String?) { activity = text }
+    /// Кому принадлежит то, что делается прямо сейчас.
+    var activeRouterID: UUID { router.id }
 
-    func setProgress(_ info: ProgressInfo?) { progress = info }
+    func setActivity(_ text: String?, owner: UUID? = nil) {
+        store(activity: text, owner: owner ?? router.id)
+    }
 
-    func bumpProgress(_ done: Int) { progress?.done = done }
+    func setProgress(_ info: ProgressInfo?, owner: UUID? = nil) {
+        store(progress: info, owner: owner ?? router.id)
+    }
+
+    func bumpProgress(_ done: Int, owner: UUID? = nil) {
+        bump(progress: done, owner: owner ?? router.id)
+    }
 
     /// Блокирующая работа уходит с главного потока, интерфейс остаётся живым.
     func background<T>(_ body: @escaping () throws -> T) async throws -> T {
@@ -670,10 +759,24 @@ final class RouterSession: ObservableObject {
 }
 
 enum Backups {
+    /// Имя файла собирается из адреса роутера — приводим его к безопасному виду.
+    static func safeHost(_ host: String) -> String {
+        host.replacingOccurrences(of: "[^A-Za-z0-9_.-]+", with: "_", options: .regularExpression)
+    }
+
+    private static let namePattern = try! NSRegularExpression(
+        pattern: "^(.+)_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}_running-config$")
+
+    /// Чей это снимок. Снимки всех роутеров лежат в одной папке, и без
+    /// разбора имени их не отфильтровать.
+    static func host(of url: URL) -> String {
+        let name = url.deletingPathExtension().lastPathComponent
+        return RouterConfigParser.capture(namePattern, in: name, group: 1) ?? ""
+    }
+
     @discardableResult
     static func saveRunningConfig(host: String, text: String, keep: Int) -> URL? {
-        let safeHost = host.replacingOccurrences(
-            of: "[^A-Za-z0-9_.-]+", with: "_", options: .regularExpression)
+        let safeHost = safeHost(host)
         let url = AppPaths.backups
             .appendingPathComponent("\(safeHost)_\(Format.stamp())_running-config.txt")
 
@@ -698,7 +801,7 @@ enum Backups {
     }
 
     private static func prune(prefix: String, keep: Int) {
-        let matching = list().filter { $0.lastPathComponent.hasPrefix(prefix + "_") }
+        let matching = list().filter { host(of: $0) == prefix }
         guard matching.count > keep else { return }
         for url in matching.dropFirst(keep) { try? FileManager.default.removeItem(at: url) }
     }

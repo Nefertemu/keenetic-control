@@ -68,6 +68,11 @@ struct PingCheckView: View {
             }
             .padding(20)
         }
+        .onChange(of: session.router.id) { _, _ in
+            // Иначе правки, набранные на одном роутере, уехали бы
+            // на другой — и применились бы там.
+            pending.removeAll()
+        }
         .sheet(item: $editing) { item in
             PingCheckEditor(profile: item.profile, isNew: item.isNew) { edited in
                 editing = nil
@@ -161,9 +166,13 @@ struct PingCheckView: View {
             if assigned.isEmpty {
                 StatusPill(text: "не используется", tint: Palette.warning)
             } else {
-                StatusPill(text: "\(Format.plural(assigned.count, "интерфейс", "интерфейса", "интерфейсов"))",
+                // Само имя полезнее числа: с одним-двумя туннелями видно сразу,
+                // а расшифровка целиком всё равно остаётся в подсказке.
+                StatusPill(text: assigned.count <= 2
+                             ? (session.state?.targetSummary(assigned) ?? assigned.joined(separator: ", "))
+                             : Format.plural(assigned.count, "интерфейс", "интерфейса", "интерфейсов"),
                            tint: Palette.success)
-                    .help(assigned.joined(separator: ", "))
+                    .help(session.state?.targetTooltip(assigned) ?? assigned.joined(separator: "\n"))
             }
 
             Button("Изменить") {
@@ -238,16 +247,17 @@ struct PingCheckView: View {
                     .fill(item.isUp ? Palette.success : Color.secondary.opacity(0.4))
                     .frame(width: 6, height: 6)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(item.ident).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    Text(item.shortName).font(.system(size: 12, weight: .medium)).lineLimit(1)
                     if !item.descriptionText.isEmpty {
-                        Text(item.descriptionText)
-                            .font(.system(size: 10))
-                            .foregroundStyle(Palette.accent)
+                        Text(item.ident)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
             }
             .frame(width: 250, alignment: .leading)
+            .help(item.displayName)
 
             Picker("", selection: Binding(
                 get: { current.profile },
@@ -309,7 +319,6 @@ struct PingCheckView: View {
             if result.applied {
                 outcome = result
                 pending.removeAll()
-                _ = try? await session.refresh()
             }
         } catch {
             alert = AlertPayload(title: "Не удалось применить", message: session.describe(error))

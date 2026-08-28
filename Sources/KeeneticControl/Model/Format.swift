@@ -32,6 +32,8 @@ enum Format {
     static func domains(_ count: Int) -> String { plural(count, "домен", "домена", "доменов") }
     static func commands(_ count: Int) -> String { plural(count, "команда", "команды", "команд") }
     static func lists(_ count: Int) -> String { plural(count, "список", "списка", "списков") }
+    /// Предложный падеж: «в 14 списках», а не «в 14 списков».
+    static func inLists(_ count: Int) -> String { plural(count, "списке", "списках", "списках") }
     static func routes(_ count: Int) -> String { plural(count, "маршрут", "маршрута", "маршрутов") }
 
     static func stamp(_ date: Date = Date()) -> String {

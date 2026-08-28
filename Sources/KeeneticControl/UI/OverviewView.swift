@@ -101,9 +101,12 @@ struct OverviewView: View {
                            icon: "list.bullet.rectangle")
                 MetricTile(value: String(state.totalDomains), label: "Доменов в списках",
                            icon: "globe", tint: Palette.success)
-                MetricTile(value: "\(state.routedGroups) / \(state.groups.count)", label: "С маршрутом",
+                MetricTile(value: state.groups.isEmpty
+                             ? "—" : "\(state.routedGroups) / \(state.groups.count)",
+                           label: "С маршрутом",
                            icon: "arrow.triangle.branch",
-                           tint: state.routedGroups == state.groups.count ? Palette.success : Palette.warning)
+                           tint: state.groups.isEmpty ? .secondary
+                             : (state.routedGroups == state.groups.count ? Palette.success : Palette.warning))
                 MetricTile(value: String(state.staticRoutes.count), label: "Статических маршрутов",
                            icon: "point.topleft.down.to.point.bottomright.curvepath")
             }
@@ -125,23 +128,25 @@ struct OverviewView: View {
                             .frame(width: 7, height: 7)
 
                         VStack(alignment: .leading, spacing: 1) {
-                            HStack(spacing: 5) {
-                                Text(item.ident).font(.system(size: 12, weight: .medium))
-                                if !item.descriptionText.isEmpty {
-                                    Text(item.descriptionText)
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(Palette.accent)
-                                        .lineLimit(1)
-                                }
-                            }
-                            if !item.statusText.isEmpty {
-                                Text(item.statusText)
+                            Text(item.shortName)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                            // Под именем — технический идентификатор и состояние:
+                            // имя опознаёт человек, идентификатор нужен командам.
+                            let details = (item.descriptionText.isEmpty
+                                           ? [item.statusText]
+                                           : [item.ident, item.statusText])
+                                .filter { !$0.isEmpty }
+                                .joined(separator: " · ")
+                            if !details.isEmpty {
+                                Text(details)
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
-                                    .help(item.statusText)
                             }
                         }
+                        .help(item.displayName
+                              + (item.statusText.isEmpty ? "" : "\n" + item.statusText))
 
                         Spacer(minLength: 8)
 
@@ -181,7 +186,7 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 CardHeader(icon: "list.bullet.rectangle", title: "Списки FQDN",
-                           subtitle: "\(Format.domains(state.totalDomains)) в \(Format.lists(state.groups.count))")
+                           subtitle: "\(Format.domains(state.totalDomains)) в \(Format.inLists(state.groups.count))")
                 Spacer()
                 Button("Все списки") { section = .dnsRoutes }
                     .buttonStyle(SubtleButtonStyle())
@@ -194,38 +199,7 @@ struct OverviewView: View {
                 VStack(spacing: 0) {
                     let visible = Array(state.sortedGroups.prefix(9))
                     ForEach(visible) { group in
-                        HStack(spacing: 10) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(group.descriptionText.isEmpty ? group.ident : group.descriptionText)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .lineLimit(1)
-                                    .help(group.descriptionText.isEmpty ? group.ident : group.descriptionText)
-                                Text(group.ident)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                            Text(String(group.count))
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                            // Список бывает направлен на несколько интерфейсов,
-                            // а карточка узкая: собираем их в один ярлык,
-                            // полные имена с примечаниями — в подсказке.
-                            if group.routedInterfaces.isEmpty {
-                                StatusPill(text: "без маршрута", tint: Palette.warning)
-                            } else {
-                                let targets = group.routedInterfaces
-                                let extra = targets.count - 1
-                                StatusPill(text: extra > 0 ? "\(targets[0]) +\(extra)" : targets[0],
-                                           tint: Palette.success)
-                                    .help(targets.map { state.label(for: $0) }
-                                        .joined(separator: "\n"))
-                            }
-                        }
-                        .padding(.vertical, 7)
-
+                        listRow(group, state: state)
                         if group.id != visible.last?.id { Divider() }
                     }
 
@@ -244,6 +218,60 @@ struct OverviewView: View {
             }
         }
         .card()
+    }
+
+    /// Строка списка. Маршруты стоят под именем и занимают всю ширину
+    /// карточки: ярлык сбоку вмещал только один интерфейс, а их бывает
+    /// несколько, и остальные молча пропадали.
+    private func listRow(_ group: FqdnGroup, state: RouterState) -> some View {
+        let targets = group.routedInterfaces
+
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(group.descriptionText.isEmpty ? group.ident : group.descriptionText)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                Text(String(group.count))
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 5) {
+                Text(group.ident)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .layoutPriority(0)
+
+                if targets.isEmpty {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(Palette.warning)
+                    Text("без маршрута")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Palette.warning)
+                        .layoutPriority(1)
+                } else {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                    Text(state.targetSummary(targets))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Palette.success)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                }
+
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.vertical, 7)
+        .contentShape(Rectangle())
+        .help(targets.isEmpty
+              ? "\(group.ident): маршрут не назначен"
+              : "\(group.ident) →\n" + state.targetTooltip(targets))
+        .onTapGesture { section = .dnsRoutes }
     }
 
     private func connect() async {

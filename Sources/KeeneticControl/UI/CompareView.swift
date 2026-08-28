@@ -12,6 +12,11 @@ struct CompareView: View {
     @State private var referenceID: UUID?
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
+    /// Разница считается один раз на пару прочитанных конфигураций.
+    /// Пока она была вычисляемым свойством, десятки тысяч доменов
+    /// пересчитывались на каждую перерисовку — в том числе на каждый
+    /// шаг индикатора выполнения.
+    @State private var comparison: Comparison?
 
     private var candidates: [RouterProfile] {
         let read = session.routersWithState()
@@ -23,11 +28,31 @@ struct CompareView: View {
         return candidates.first { $0.id == referenceID } ?? candidates.first
     }
 
-    private var comparison: Comparison? {
+    /// Домены обоих роутеров прочитаны, а разницу ещё не посчитали.
+    private var counting: some View {
+        VStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Сверяю списки…").font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
+        .card()
+    }
+
+    /// Что должно измениться, чтобы пересчитать разницу.
+    private var comparisonKey: String {
         guard let reference,
               let theirs = session.readState(for: reference.id),
-              let ours = session.state else { return nil }
-        return Comparison(reference: reference, theirs: theirs, ours: ours)
+              let ours = session.state else { return "" }
+        return "\(reference.id)|\(ours.readAt.timeIntervalSince1970)"
+             + "|\(theirs.readAt.timeIntervalSince1970)"
+    }
+
+    private func rebuildComparison() {
+        guard let reference,
+              let theirs = session.readState(for: reference.id),
+              let ours = session.state else { comparison = nil; return }
+        comparison = Comparison(reference: reference, theirs: theirs, ours: ours)
     }
 
     var body: some View {
@@ -43,10 +68,13 @@ struct CompareView: View {
                     picker(comparison)
                     summary(comparison)
                     details(comparison)
+                } else {
+                    counting
                 }
             }
             .padding(20)
         }
+        .task(id: comparisonKey) { rebuildComparison() }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, applyTitle: "Перенести") { dryRun in
                 plan = nil

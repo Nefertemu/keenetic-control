@@ -10,7 +10,9 @@ struct RoutersView: View {
     @State private var confirmDelete: RouterProfile?
     /// Связку ключей дёргаем по разу на роутер, а не на каждую перерисовку:
     /// каждое обращение — потенциальный системный запрос доступа.
-    @State private var havePassword: Set<UUID> = []
+    /// nil — ещё не спрашивали: пока проверка идёт, писать «нет пароля»
+    /// нельзя, это выглядит как поломка на ровном месте.
+    @State private var havePassword: Set<UUID>?
 
     var body: some View {
         ScrollView {
@@ -29,15 +31,30 @@ struct RoutersView: View {
                 } else {
                     store.add(updated)
                 }
-                if let password { updated.password = password }
-                Task { await session.switchTo(updated) }
+                Task {
+                    if let password {
+                        await Task.detached { updated.password = password }.value
+                    }
+                    await session.switchTo(updated)
+                    refreshPasswordFlags()
+                }
             } onCancel: { editing = nil }
         }
         .confirmationDialog("Удалить роутер?", isPresented: Binding(
             get: { confirmDelete != nil },
             set: { if !$0 { confirmDelete = nil } }), titleVisibility: .visible) {
             Button("Удалить", role: .destructive) {
-                if let victim = confirmDelete { store.remove(victim) }
+                if let victim = confirmDelete {
+                    let wasActive = victim.id == session.router.id
+                    store.remove(victim)
+                    session.forget(victim.id)
+                    // Иначе окно осталось бы на роутере, которого уже нет
+                    // в списке: карточка в панели показывала призрак.
+                    if wasActive, let next = store.selectedRouter {
+                        Task { await session.switchTo(next) }
+                    }
+                    refreshPasswordFlags()
+                }
                 confirmDelete = nil
             }
             Button("Отмена", role: .cancel) { confirmDelete = nil }
@@ -86,7 +103,8 @@ struct RoutersView: View {
     private func routerRow(_ router: RouterProfile) -> some View {
         let isCurrent = router.id == session.router.id
         let fromEnvironment = router.environmentPassword != nil
-        let hasPassword = fromEnvironment || havePassword.contains(router.id)
+        let known = havePassword
+        let hasPassword = fromEnvironment || (known?.contains(router.id) ?? false)
 
         return HStack(spacing: 11) {
             Image(systemName: isCurrent ? "wifi.router.fill" : "wifi.router")
@@ -107,9 +125,14 @@ struct RoutersView: View {
             Spacer(minLength: 8)
 
             StatusPill(text: router.transport.shortTitle, tint: .secondary, icon: router.transport.icon)
-            StatusPill(text: fromEnvironment ? "пароль из окружения"
-                             : (hasPassword ? "пароль сохранён" : "нет пароля"),
-                       tint: hasPassword ? Palette.success : Palette.warning)
+            if fromEnvironment {
+                StatusPill(text: "пароль из окружения", tint: Palette.success)
+            } else if known == nil {
+                StatusPill(text: "проверяю связку ключей…", tint: .secondary)
+            } else {
+                StatusPill(text: hasPassword ? "пароль сохранён" : "нет пароля",
+                           tint: hasPassword ? Palette.success : Palette.warning)
+            }
 
             Button("Изменить") { editing = router }
                 .buttonStyle(SubtleButtonStyle())
@@ -187,9 +210,13 @@ struct RoutersView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                TextField("", value: value, format: .number)
+                TextField("", value: Binding(
+                    get: { value.wrappedValue },
+                    set: { value.wrappedValue = min(range.upperBound, max(range.lowerBound, $0)) }),
+                          format: .number)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 90)
+                    .help("От \(range.lowerBound) до \(range.upperBound)")
                 Stepper("", value: value, in: range)
                     .labelsHidden()
                 Spacer()
@@ -337,9 +364,13 @@ struct RouterEditor: View {
         .padding(22)
         .frame(width: 560)
         .background(Palette.surface)
-        .onAppear {
+        .task {
             guard !passwordLoaded else { return }
-            password = profile.password ?? ""
+            let account = profile.keychainAccount
+            // SecItemCopyMatching умеет показать системный запрос доступа и
+            // ждать ответа сколько угодно — на главном потоке окно бы замерло.
+            let stored = await Task.detached { Keychain.load(account: account) }.value
+            password = stored ?? ""
             passwordLoaded = true
         }
     }

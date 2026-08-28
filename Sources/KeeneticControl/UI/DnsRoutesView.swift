@@ -56,6 +56,13 @@ struct DnsRoutesView: View {
         .padding(20)
         .onAppear(perform: pickDefaultInterface)
         .onChange(of: session.state?.readAt) { _, _ in pickDefaultInterface() }
+        .onChange(of: session.router.id) { _, _ in
+            // Идентификаторы списков у роутеров свои: чужое выделение
+            // здесь ничего не значит и только вводит в заблуждение.
+            selection.removeAll()
+            query = ""
+            pickDefaultInterface()
+        }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
             PlanSheet(plan: box.plan) { dryRun in
                 plan = nil
@@ -67,7 +74,7 @@ struct DnsRoutesView: View {
         }
         .confirmationDialog("Удалить выбранные списки с роутера?",
                             isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("Удалить \(Format.lists(selection.count))", role: .destructive) {
+            Button("Удалить \(Format.lists(selectedGroups.count))", role: .destructive) {
                 plan = Planner.planDeleteGroups(selectedGroups)
             }
             Button("Отмена", role: .cancel) {}
@@ -110,21 +117,23 @@ struct DnsRoutesView: View {
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 5) {
-                    Text("Выбрано: \(selection.count)")
+                    Text("Выбрано: \(selectedGroups.count)")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                     HStack(spacing: 8) {
                         Button("Назначить") { buildRoutePlan() }
                             .buttonStyle(PrimaryButtonStyle())
-                            .disabled(selection.isEmpty || interfaceIdent.isEmpty)
+                            .disabled(selectedGroups.isEmpty || interfaceIdent.isEmpty
+                                      || session.progress != nil)
 
                         Button("Снять") { buildUnroutePlan() }
                             .buttonStyle(SubtleButtonStyle())
-                            .disabled(selection.isEmpty || interfaceIdent.isEmpty)
+                            .disabled(selectedGroups.isEmpty || interfaceIdent.isEmpty
+                                      || session.progress != nil)
 
                         Button("Удалить") { confirmDelete = true }
                             .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
-                            .disabled(selection.isEmpty)
+                            .disabled(selectedGroups.isEmpty || session.progress != nil)
                     }
                 }
             }
@@ -150,10 +159,13 @@ struct DnsRoutesView: View {
 
                 Spacer()
 
-                Button(selection.count == groups.count && !groups.isEmpty ? "Снять выделение" : "Выбрать всё") {
-                    selection = (selection.count == groups.count && !groups.isEmpty)
-                        ? []
-                        : Set(groups.map(\.ident))
+                // Считаем именно по видимым спискам: под фильтром «Без маршрута»
+                // счётчик выделенного мог совпасть с числом строк случайно.
+                let visibleIdents = Set(groups.map(\.ident))
+                let allPicked = !groups.isEmpty && visibleIdents.isSubset(of: selection)
+                Button(allPicked ? "Снять выделение" : "Выбрать всё") {
+                    selection = allPicked ? selection.subtracting(visibleIdents)
+                                          : selection.union(visibleIdents)
                 }
                 .buttonStyle(SubtleButtonStyle())
                 .disabled(groups.isEmpty)
@@ -224,10 +236,16 @@ struct DnsRoutesView: View {
                 if group.routedInterfaces.isEmpty {
                     StatusPill(text: "нет маршрута", tint: Palette.warning)
                 } else {
-                    ForEach(group.routedInterfaces, id: \.self) { target in
-                        StatusPill(text: session.state?.label(for: target) ?? target,
+                    // Ярлык подписан именем интерфейса, а полное
+                    // «Dataforest · Wireguard0» — в подсказке.
+                    ForEach(group.routedInterfaces.prefix(3), id: \.self) { target in
+                        StatusPill(text: session.state?.shortLabel(for: target) ?? target,
                                    tint: target == interfaceIdent ? Palette.success : Palette.accent)
-                            .help(target)
+                            .help(session.state?.label(for: target) ?? target)
+                    }
+                    if group.routedInterfaces.count > 3 {
+                        StatusPill(text: "+\(group.routedInterfaces.count - 3)", tint: .secondary)
+                            .help(session.state?.targetTooltip(group.routedInterfaces) ?? "")
                     }
                 }
                 Spacer(minLength: 0)

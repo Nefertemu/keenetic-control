@@ -5,9 +5,32 @@ struct BackupsView: View {
     @EnvironmentObject private var session: RouterSession
     @Binding var alert: AlertPayload?
 
-    @State private var files: [URL] = []
+    /// Размер и дату файла собираем один раз при обновлении списка.
+    /// Раньше это читалось с диска прямо в body — на каждую перерисовку.
+    private struct Snapshot: Identifiable, Hashable {
+        let url: URL
+        let date: Date?
+        let size: Int
+        let host: String
+        var id: URL { url }
+    }
+
+    @State private var files: [Snapshot] = []
     @State private var selection: URL?
     @State private var preview = ""
+    @State private var loadingPreview = false
+    @State private var onlyThisRouter = true
+
+    private var selected: Snapshot? {
+        guard let selection else { return nil }
+        return files.first { $0.url == selection }
+    }
+
+    private var visible: [Snapshot] {
+        guard onlyThisRouter else { return files }
+        let mine = Backups.safeHost(session.router.host)
+        return files.filter { $0.host == mine }
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -17,6 +40,12 @@ struct BackupsView: View {
         }
         .padding(20)
         .onAppear(perform: reload)
+        .onChange(of: session.router.id) { _, _ in
+            // Снимки лежат вперемешку, и выделенный принадлежал прошлому
+            // роутеру — под фильтром «только этот» он просто исчезал бы.
+            if onlyThisRouter, let selection,
+               !visible.contains(where: { $0.url == selection }) { clearSelection() }
+        }
     }
 
     private var list: some View {
@@ -42,15 +71,24 @@ struct BackupsView: View {
                     .buttonStyle(SubtleButtonStyle())
             }
 
-            if files.isEmpty {
-                EmptyHint(icon: "tray", title: "Копий пока нет",
-                          message: "Первая появится перед первым изменением конфигурации.")
+            Toggle(isOn: $onlyThisRouter) {
+                Text("Только «\(session.router.name)»")
+                    .font(.system(size: 11))
+            }
+            .toggleStyle(.checkbox)
+            .help("Снимки всех роутеров лежат в одной папке — фильтр оставляет только этот")
+
+            if visible.isEmpty {
+                EmptyHint(icon: "tray", title: files.isEmpty ? "Копий пока нет" : "Для этого роутера копий нет",
+                          message: files.isEmpty
+                            ? "Первая появится перед первым изменением конфигурации."
+                            : "Сними копию сейчас или сними галочку, чтобы увидеть остальные.")
             } else {
                 ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(files, id: \.self) { url in
-                            row(url)
-                            if url != files.last { Divider() }
+                    LazyVStack(spacing: 0) {
+                        ForEach(visible) { item in
+                            row(item)
+                            if item.id != visible.last?.id { Divider() }
                         }
                     }
                     .padding(.horizontal, 12)
@@ -62,24 +100,22 @@ struct BackupsView: View {
         .card()
     }
 
-    private func row(_ url: URL) -> some View {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let date = attributes?[.modificationDate] as? Date
-        let size = (attributes?[.size] as? Int) ?? 0
-        let selected = selection == url
+    private func row(_ item: Snapshot) -> some View {
+        let selected = selection == item.url
 
         return HStack(spacing: 9) {
             Image(systemName: "doc.text")
                 .font(.system(size: 12))
                 .foregroundStyle(selected ? Palette.accent : .secondary)
             VStack(alignment: .leading, spacing: 1) {
-                Text(url.deletingPathExtension().lastPathComponent)
-                    .font(.system(size: 11, design: .monospaced))
+                Text(item.date.map(Format.humanDate) ?? item.url.lastPathComponent)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                Text("\(item.host.isEmpty ? "—" : item.host) · \(Format.bytes(item.size))")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text("\(date.map(Format.humanDate) ?? "—") · \(Format.bytes(size))")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
         }
@@ -88,11 +124,17 @@ struct BackupsView: View {
         .background(RoundedRectangle(cornerRadius: 7)
             .fill(selected ? Palette.accent.opacity(0.12) : .clear))
         .contentShape(Rectangle())
-        .onTapGesture { select(url) }
+        .help(item.url.lastPathComponent)
+        .onTapGesture { select(item.url) }
         .contextMenu {
-            Button("Показать в Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            Button("Показать в Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
+            Button("Скопировать путь") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(item.url.path, forType: .string)
+            }
             Button("Удалить", role: .destructive) {
-                try? FileManager.default.removeItem(at: url)
+                try? FileManager.default.removeItem(at: item.url)
+                if selection == item.url { clearSelection() }
                 reload()
             }
         }
@@ -100,11 +142,30 @@ struct BackupsView: View {
 
     private var detail: some View {
         VStack(alignment: .leading, spacing: 12) {
-            CardHeader(icon: "doc.plaintext",
-                       title: selection?.lastPathComponent ?? "Содержимое копии",
-                       subtitle: selection == nil ? "Выбери файл слева" : "running-config на момент снимка")
+            HStack {
+                CardHeader(icon: "doc.plaintext",
+                           title: selected.map { $0.date.map(Format.humanDate) ?? $0.url.lastPathComponent }
+                             ?? "Содержимое копии",
+                           subtitle: selected.map { "running-config · \($0.host) · \($0.url.lastPathComponent)" }
+                             ?? "Выбери файл слева")
+                Spacer()
+                if !preview.isEmpty {
+                    Button("Копировать") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(preview, forType: .string)
+                    }
+                    .buttonStyle(SubtleButtonStyle())
+                }
+            }
 
-            if preview.isEmpty {
+            if loadingPreview {
+                VStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Читаю файл…").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 40)
+            } else if preview.isEmpty {
                 EmptyHint(icon: "doc.text.magnifyingglass", title: "Ничего не выбрано",
                           message: "Слева — все снимки конфигурации. Здесь будет их содержимое.")
             } else {
@@ -122,16 +183,35 @@ struct BackupsView: View {
     }
 
     private func reload() {
-        files = Backups.list()
-        if let selection, !files.contains(selection) {
-            self.selection = nil
-            preview = ""
+        files = Backups.list().map { url in
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            return Snapshot(url: url,
+                            date: values?.contentModificationDate,
+                            size: values?.fileSize ?? 0,
+                            host: Backups.host(of: url))
         }
+        if let selection, !files.contains(where: { $0.url == selection }) { clearSelection() }
     }
 
+    private func clearSelection() {
+        selection = nil
+        preview = ""
+        loadingPreview = false
+    }
+
+    /// Конфигурация бывает и на мегабайт — читаем её не на главном потоке.
     private func select(_ url: URL) {
         selection = url
-        preview = (try? String(contentsOf: url, encoding: .utf8)) ?? "Файл не читается."
+        preview = ""
+        loadingPreview = true
+        Task {
+            let text = await Task.detached {
+                (try? String(contentsOf: url, encoding: .utf8)) ?? "Файл не читается."
+            }.value
+            guard selection == url else { return }
+            preview = text
+            loadingPreview = false
+        }
     }
 
     private func snapshot() async {

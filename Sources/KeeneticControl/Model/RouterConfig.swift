@@ -16,18 +16,30 @@ struct KeeneticInterface: Identifiable, Hashable {
 
     var isUp: Bool { state == "up" || link == "up" || connected == "yes" }
 
+    /// Имя, которое дал человек, — впереди: по нему и опознают интерфейс.
+    /// Технический идентификатор идёт следом, он нужен для команд.
     var displayName: String {
-        descriptionText.isEmpty ? ident : "\(ident) · \(descriptionText)"
+        descriptionText.isEmpty ? ident : "\(descriptionText) · \(ident)"
     }
+
+    /// Одно слово для тесных мест: примечание, если оно есть.
+    var shortName: String { descriptionText.isEmpty ? ident : descriptionText }
 
     var statusText: String {
         var parts: [String] = []
+        // Тип — собственное имя из прошивки (Wireguard, Vlan, GigabitEthernet),
+        // его не переводим. А состояние — обычные слова, и они были по-английски
+        // рядом с русским «шлюз по умолчанию».
         if !type.isEmpty { parts.append(type) }
-        let status = state.isEmpty ? link : state
-        if !status.isEmpty { parts.append(status) }
-        if connected == "yes" { parts.append("connected") }
+        switch state.isEmpty ? link : state {
+        case "up":   parts.append("включён")
+        case "down": parts.append("выключен")
+        case let other where !other.isEmpty: parts.append(other)
+        default: break
+        }
+        if connected == "yes" { parts.append("есть связь") }
         if defaultGW == "yes" { parts.append("шлюз по умолчанию") }
-        if isGlobal == "yes" { parts.append("global") }
+        if isGlobal == "yes" { parts.append("выход в интернет") }
         return parts.joined(separator: ", ")
     }
 
@@ -35,6 +47,17 @@ struct KeeneticInterface: Identifiable, Hashable {
         let haystack = ([ident, type, descriptionText] + aliases).joined(separator: " ")
         return RouterConfigParser.vpnPattern.firstMatch(
             in: haystack, range: NSRange(haystack.startIndex..., in: haystack)) != nil
+    }
+}
+
+/// Разбор имени интерфейса на семейство и номер: «Wireguard0» → «Wireguard» + «0».
+/// Нужен, чтобы несколько соседних туннелей показывать одной строкой
+/// «Wireguard 0, 3», а не повторять слово целиком для каждого.
+enum InterfaceName {
+    static func split(_ ident: String) -> (family: String, number: String?) {
+        let digits = ident.reversed().prefix { $0.isNumber }
+        guard !digits.isEmpty, digits.count < ident.count else { return (ident, nil) }
+        return (String(ident.dropLast(digits.count)), String(digits.reversed()))
     }
 }
 
@@ -147,7 +170,11 @@ enum RouterConfigParser {
             // Маршрут может ссылаться на список по имени, а не по идентификатору.
             var targetKey: String? = groups[ident] != nil ? ident : nil
             if targetKey == nil {
-                targetKey = groups.first { $0.value.descriptionText == ident }?.key
+                // Описание не обязано быть уникальным, а порядок обхода
+                // словаря не определён: без сортировки один и тот же конфиг
+                // разбирался бы по-разному от запуска к запуску.
+                targetKey = groups.filter { $0.value.descriptionText == ident }
+                    .keys.sorted().first
             }
             guard let key = targetKey else { continue }
 

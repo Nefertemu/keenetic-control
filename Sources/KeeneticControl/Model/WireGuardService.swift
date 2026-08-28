@@ -2,6 +2,9 @@ import Foundation
 
 struct WireGuardUpdateResult {
     var interface: String
+    /// «Dataforest · Wireguard0» — чтобы в итоговом окне было видно,
+    /// какой именно туннель обновился.
+    var label: String = ""
     var warnings: [String] = []
     var routesBefore: Int = 0
     var routesAfter: Int = 0
@@ -18,9 +21,12 @@ enum WireGuardService {
                            interface: String,
                            config: WireGuardConfig) async throws -> WireGuardUpdateResult {
         var result = WireGuardUpdateResult(interface: interface)
+        // Обновление длинное: если за это время переключат роутер, подпись
+        // о ходе работы должна остаться у своего.
+        let owner = session.activeRouterID
 
         // --- Снимок «до» -------------------------------------------------
-        session.setActivity("Снимаю резервную копию перед обновлением…")
+        session.setActivity("Снимаю резервную копию перед обновлением…", owner: owner)
         let configBefore = try await session.readConfigText()
         result.backupURL = Backups.saveRunningConfig(
             host: session.router.host, text: configBefore,
@@ -31,7 +37,7 @@ enum WireGuardService {
                 "\(interface)_\(Format.stamp())_startup-config.txt")
             try? startup.write(to: url, atomically: true, encoding: .utf8)
         }
-        session.setActivity(nil)
+        session.setActivity(nil, owner: owner)
 
         let stateBefore = WireGuardState.parse(config: configBefore, interface: interface)
         result.routesBefore = routeCount(configBefore)

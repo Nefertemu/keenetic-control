@@ -170,14 +170,14 @@ struct PrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.white)
+            .foregroundStyle(isEnabled ? Color.white : Color.white.opacity(0.4))
             .lineLimit(1)
             .fixedSize()
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(tint.opacity(isEnabled ? (configuration.isPressed ? 0.78 : 1) : 0.35)))
+                    .fill(tint.opacity(isEnabled ? (configuration.isPressed ? 0.78 : 1) : 0.22)))
             .contentShape(Rectangle())
     }
 }

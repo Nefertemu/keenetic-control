@@ -22,6 +22,12 @@ struct StaticRoutesView: View {
         return all.filter { $0.searchText.contains(query.lowercased()) }
     }
 
+    /// Выделение переживает смену поиска, поэтому действия и счётчики
+    /// работают только по тому, что человек сейчас видит.
+    private var selectedRoutes: [StaticRoute] {
+        routes.filter { selection.contains($0.id) }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let progress = session.progress { ProgressBanner(info: progress) }
@@ -29,6 +35,12 @@ struct StaticRoutesView: View {
             table
         }
         .padding(20)
+        .onChange(of: session.router.id) { _, _ in
+            // Маршруты у роутеров разные — чужое выделение здесь ничего
+            // не значит, а кнопка «Удалить выбранные» выглядела активной.
+            selection.removeAll()
+            query = ""
+        }
         .sheet(isPresented: $showAdd) {
             RouteEditor(interfaces: session.state?.candidates ?? []) { route in
                 showAdd = false
@@ -67,8 +79,8 @@ struct StaticRoutesView: View {
                            title: "Статические маршруты",
                            subtitle: "\(Format.routes(session.state?.staticRoutes.count ?? 0)) в конфигурации роутера")
                 Spacer()
-                StatusPill(text: "выбрано: \(selection.count)",
-                           tint: selection.isEmpty ? .secondary : Palette.accent)
+                StatusPill(text: "выбрано: \(selectedRoutes.count)",
+                           tint: selectedRoutes.isEmpty ? .secondary : Palette.accent)
             }
 
             HStack(spacing: 10) {
@@ -78,18 +90,18 @@ struct StaticRoutesView: View {
 
                 Button("Добавить…") { showAdd = true }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(session.state == nil)
+                    .disabled(session.state == nil || session.progress != nil)
 
                 Button("Удалить выбранные") { buildDeletePlan() }
                     .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
-                    .disabled(selection.isEmpty)
+                    .disabled(selectedRoutes.isEmpty || session.progress != nil)
 
                 Spacer()
 
                 Button("Импорт из BAT/TXT…") { importFile() }
                     .buttonStyle(SubtleButtonStyle())
 
-                Menu(selection.isEmpty ? "Экспорт" : "Экспорт выбранных") {
+                Menu(selectedRoutes.isEmpty ? "Экспорт" : "Экспорт выбранных") {
                     Button("В BAT для Windows…") { export(bat: true) }
                     Button("В команды Keenetic…") { export(bat: false) }
                 }
@@ -115,11 +127,13 @@ struct StaticRoutesView: View {
                             : "По запросу «\(query)» ничего не нашлось.")
             } else {
                 HStack(spacing: 10) {
+                    let visibleIDs = Set(routes.map(\.id))
+                    let allPicked = !routes.isEmpty && visibleIDs.isSubset(of: selection)
                     Button {
-                        selection = selection.count == routes.count ? [] : Set(routes.map(\.id))
+                        selection = allPicked ? selection.subtracting(visibleIDs)
+                                              : selection.union(visibleIDs)
                     } label: {
-                        Image(systemName: selection.count == routes.count && !routes.isEmpty
-                              ? "checkmark.square.fill" : "square")
+                        Image(systemName: allPicked ? "checkmark.square.fill" : "square")
                             .font(.system(size: 13))
                             .foregroundStyle(Palette.accent)
                     }
@@ -175,13 +189,15 @@ struct StaticRoutesView: View {
             .help(route.rawLine.isEmpty ? route.command : route.rawLine)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(route.via)
-                    .font(.system(size: 12, design: .monospaced))
+                let note = session.state?.note(for: route.via)
+                Text(note ?? route.via)
+                    .font(.system(size: 12, weight: note == nil ? .regular : .medium,
+                                  design: note == nil ? .monospaced : .default))
                     .lineLimit(1)
-                if let note = session.state?.note(for: route.via) {
-                    Text(note)
-                        .font(.system(size: 10))
-                        .foregroundStyle(Palette.accent)
+                if note != nil {
+                    Text(route.via)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
@@ -224,7 +240,7 @@ struct StaticRoutesView: View {
     // MARK: - Действия
 
     private func buildDeletePlan() {
-        let victims = routes.filter { selection.contains($0.id) }
+        let victims = selectedRoutes
         guard !victims.isEmpty else { return }
         var built = Plan(title: "Удаление \(Format.routes(victims.count))")
         built.commands = victims.map(\.deleteCommand)
@@ -262,9 +278,8 @@ struct StaticRoutesView: View {
 
     private func export(bat: Bool) {
         // Если что-то выделено — выгружаем выделенное, иначе всё.
-        let everything = session.state?.staticRoutes ?? []
-        let chosen = everything.filter { selection.contains($0.id) }
-        let all = chosen.isEmpty ? everything : chosen
+        let chosen = selectedRoutes
+        let all = chosen.isEmpty ? (session.state?.staticRoutes ?? []) : chosen
         guard !all.isEmpty else { return }
 
         let panel = NSSavePanel()
@@ -278,6 +293,20 @@ struct StaticRoutesView: View {
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
             log(.ok, "Экспортировано \(Format.routes(all.count)): \(url.path)")
+
+            // Windows не умеет IPv6, reject и маршрут по умолчанию — говорим
+            // об этом прямо, а не оставляем человека гадать, куда делись строки.
+            let unsupported = bat ? StaticRouteParser.batUnsupported(all) : []
+            if !unsupported.isEmpty {
+                log(.warn, "В BAT не переносятся \(Format.routes(unsupported.count)) — "
+                    + "они записаны комментарием rem.")
+                alert = AlertPayload(
+                    title: "Экспортировано с оговоркой",
+                    message: "\(Format.routes(unsupported.count)) Windows выполнить не сможет: "
+                           + "IPv6, запрещающие (reject) и маршрут по умолчанию. "
+                           + "В файле они остались строками rem — ничего не потерялось.",
+                    isError: false)
+            }
         } catch {
             alert = AlertPayload(title: "Не удалось сохранить", message: error.localizedDescription)
         }
@@ -290,7 +319,6 @@ struct StaticRoutesView: View {
             if result.applied {
                 outcome = result
                 selection.removeAll()
-                _ = try? await session.refresh()
             }
         } catch {
             alert = AlertPayload(title: "Не удалось применить", message: session.describe(error))
@@ -341,7 +369,7 @@ struct RouteEditor: View {
                         .font(.system(size: 12, design: .monospaced))
                     Menu {
                         ForEach(interfaces) { item in
-                            Button(item.displayName) { via = item.ident }
+                            Button(item.displayName + (item.isUp ? " ✓" : "")) { via = item.ident }
                         }
                     } label: {
                         Image(systemName: "list.bullet")
@@ -475,6 +503,11 @@ struct ImportPreview: View {
                 Button("Отмена", action: onCancel)
                     .buttonStyle(SubtleButtonStyle())
                     .keyboardShortcut(.cancelAction)
+                // Файлы бывают на сотни строк — отмечать вручную мучение.
+                Button(excluded.isEmpty ? "Снять все" : "Выбрать все") {
+                    excluded = excluded.isEmpty ? Set(routes.map(\.id)) : []
+                }
+                .buttonStyle(SubtleButtonStyle())
                 Spacer()
                 Text("К добавлению: \(accepted.count)")
                     .font(.system(size: 11)).foregroundStyle(.secondary)

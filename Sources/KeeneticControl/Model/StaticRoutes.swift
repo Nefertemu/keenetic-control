@@ -90,12 +90,16 @@ enum StaticRouteParser {
     /// Разбирает `ip route` / `ipv6 route` из running-config.
     static func parse(config text: String) -> [StaticRoute] {
         var routes: [StaticRoute] = []
+        // Идентификатор маршрута — его строка. Повтор в конфигурации дал бы
+        // два элемента с одним id: ForEach на таком ломается, а выделение
+        // цепляло бы оба сразу.
+        var seen = Set<String>()
 
         for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw)
             guard !line.isEmpty, !(line.first?.isWhitespace ?? false) else { continue }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard let route = parse(line: trimmed) else { continue }
+            guard let route = parse(line: trimmed), seen.insert(route.id).inserted else { continue }
             routes.append(route)
         }
         return routes
@@ -243,14 +247,26 @@ enum StaticRouteParser {
         return route
     }
 
+    /// Что Windows не умеет: IPv6, запрещающие маршруты и маршрут по умолчанию.
+    /// Раньше такие строки просто исчезали из выгрузки — без единого слова.
+    static func batUnsupported(_ routes: [StaticRoute]) -> [StaticRoute] {
+        routes.filter { $0.family != .ipv4 || $0.reject || $0.destination.lowercased() == "default" }
+    }
+
     /// Экспорт в BAT — так же, как это делает windows-версия.
     static func exportBAT(_ routes: [StaticRoute]) -> String {
         var lines = ["@echo off", "chcp 65001 > nul", "rem Экспорт маршрутов Keenetic — \(Format.humanDate(Date()))", ""]
 
+        let unsupported = Set(batUnsupported(routes).map(\.id))
         for route in routes {
-            guard route.family == .ipv4, !route.reject else { continue }
+            // Непереносимое остаётся в файле комментарием: из выгрузки
+            // ничего не пропадает молча.
+            guard !unsupported.contains(route.id) else {
+                lines.append("rem не переносится в Windows: "
+                             + (route.rawLine.isEmpty ? route.command : route.rawLine))
+                continue
+            }
             let destination = route.destination
-            if destination.lowercased() == "default" { continue }
 
             let address: String
             let mask: String

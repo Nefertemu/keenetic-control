@@ -144,11 +144,7 @@ struct RootView: View {
                         } label: {
                             // Связь при переключении не рвётся — показываем,
                             // к кому уже подключены.
-                            Text(router.id == session.router.id
-                                 ? "● \(router.name)"
-                                 : (session.isConnected(router.id)
-                                    ? "\(router.name) — на связи"
-                                    : router.name))
+                            Text(routerMenuTitle(router))
                         }
                     }
                     Divider()
@@ -196,6 +192,16 @@ struct RootView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .inset(cornerRadius: 11)
+    }
+
+    /// Подпись роутера в меню выбора: где мы сейчас, кто ещё на связи
+    /// и кто занят длинной операцией — она продолжается и после переключения.
+    private func routerMenuTitle(_ router: RouterProfile) -> String {
+        var suffix: [String] = []
+        if session.isBusy(router.id) { suffix.append("занят") }
+        else if session.isConnected(router.id) { suffix.append("на связи") }
+        let tail = suffix.isEmpty ? "" : " — " + suffix.joined(separator: ", ")
+        return (router.id == session.router.id ? "● " : "") + router.name + tail
     }
 
     private var footer: some View {
@@ -259,7 +265,8 @@ struct RootView: View {
                     Label("Обновить", systemImage: "arrow.clockwise")
                 }
                 .disabled(session.progress != nil || session.status.isBusy)
-                .help("Перечитать конфигурацию роутера")
+                .keyboardShortcut("r", modifiers: .command)
+                .help("Перечитать конфигурацию роутера (⌘R)")
             }
         }
     }

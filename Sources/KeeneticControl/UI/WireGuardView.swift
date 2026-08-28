@@ -45,7 +45,7 @@ struct WireGuardView: View {
         .onAppear(perform: pickDefault)
         .onChange(of: session.state?.readAt) { _, _ in pickDefault() }
         .onChange(of: interfaceIdent) { _, _ in refreshBaseline() }
-        .confirmationDialog("Обновить \(interfaceIdent) новым конфигом?",
+        .confirmationDialog("Обновить «\(session.state?.shortLabel(for: interfaceIdent) ?? interfaceIdent)» новым конфигом?",
                             isPresented: $confirmUpdate, titleVisibility: .visible) {
             Button("Безопасно обновить") { Task { await update() } }
             Button("Отмена", role: .cancel) {}
@@ -53,7 +53,7 @@ struct WireGuardView: View {
             Text("Перед изменением снимется резервная копия конфигурации. "
                  + "Если что-то пойдёт не так, приложение само вернёт rollback-базу.")
         }
-        .confirmationDialog("Откатить \(interfaceIdent) на rollback-базу?",
+        .confirmationDialog("Откатить «\(session.state?.shortLabel(for: interfaceIdent) ?? interfaceIdent)» на rollback-базу?",
                             isPresented: $confirmRollback, titleVisibility: .visible) {
             Button("Откатить", role: .destructive) { Task { await rollback() } }
             Button("Отмена", role: .cancel) {}
@@ -83,14 +83,21 @@ struct WireGuardView: View {
     private var interfaceCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                CardHeader(icon: "shield.lefthalf.filled", title: "WireGuard / AmneziaWG",
-                           subtitle: "Безопасное обновление с бэкапом и автоматическим откатом")
+                CardHeader(icon: "shield.lefthalf.filled",
+                           title: interfaceIdent.isEmpty
+                             ? "WireGuard / AmneziaWG"
+                             : (session.state?.shortLabel(for: interfaceIdent) ?? interfaceIdent),
+                           subtitle: interfaceIdent.isEmpty
+                             ? "Безопасное обновление с бэкапом и автоматическим откатом"
+                             : "\(interfaceIdent) · безопасное обновление с бэкапом и откатом")
                 Spacer()
                 Picker("", selection: $interfaceIdent) {
-                    ForEach(interfaces, id: \.self) { Text($0).tag($0) }
+                    ForEach(interfaces, id: \.self) { ident in
+                        Text(session.state?.label(for: ident) ?? ident).tag(ident)
+                    }
                 }
                 .labelsHidden()
-                .frame(width: 170)
+                .frame(width: 230)
             }
 
             if let live = liveState {
@@ -107,9 +114,6 @@ struct WireGuardView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 7) {
-                    if !live.descriptionText.isEmpty {
-                        KeyValueRow(key: "Описание", value: live.descriptionText)
-                    }
                     if !live.addresses.isEmpty {
                         KeyValueRow(key: "Адрес интерфейса",
                                     value: live.addresses.joined(separator: ", "), monospaced: true)
@@ -333,8 +337,10 @@ struct WireGuardView: View {
         working = true
         defer { working = false }
         do {
-            result = try await WireGuardService.safeUpdate(
+            var outcome = try await WireGuardService.safeUpdate(
                 session: session, interface: interfaceIdent, config: config)
+            outcome.label = session.state?.label(for: interfaceIdent) ?? interfaceIdent
+            result = outcome
             refreshBaseline()
         } catch {
             alert = AlertPayload(title: "Обновление не удалось", message: session.describe(error))
@@ -374,7 +380,8 @@ struct WireGuardResultSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(result.rolledBack ? "Откачено" : "Интерфейс обновлён")
                         .font(.system(size: 16, weight: .semibold))
-                    Text(result.interface).font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text(result.label.isEmpty ? result.interface : result.label)
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
             }

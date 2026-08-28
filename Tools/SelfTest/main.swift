@@ -91,6 +91,54 @@ let interfaces = RouterConfigParser.parseConfigInterfaces(sampleConfig)
 check("интерфейсы из конфига", String(interfaces.count), "2")
 check("описание интерфейса", interfaces["Wireguard0"]?.descriptionText ?? "nil", "NL-VPN")
 
+print("\n== Имена интерфейсов ==")
+check("семейство и номер", "\(InterfaceName.split("Wireguard0"))", "(family: \"Wireguard\", number: Optional(\"0\"))")
+check("двузначный номер", InterfaceName.split("Wireguard12").number ?? "nil", "12")
+check("без номера — имя целиком", InterfaceName.split("ISP").number == nil)
+check("одни цифры не режем", InterfaceName.split("42").family, "42")
+
+var naming = RouterState()
+naming.interfaces = [
+    "Wireguard0": KeeneticInterface(ident: "Wireguard0", descriptionText: "Dataforest"),
+    "Wireguard1": KeeneticInterface(ident: "Wireguard1", descriptionText: "Infomaniak"),
+    "Wireguard2": KeeneticInterface(ident: "Wireguard2"),
+    "Wireguard5": KeeneticInterface(ident: "Wireguard5"),
+    "ISP": KeeneticInterface(ident: "ISP"),
+]
+check("имя вперёд идентификатора", naming.label(for: "Wireguard0"), "Dataforest · Wireguard0")
+check("без примечания — только идентификатор", naming.label(for: "ISP"), "ISP")
+check("короткое имя — примечание", naming.shortLabel(for: "Wireguard1"), "Infomaniak")
+check("короткое имя без примечания", naming.shortLabel(for: "ISP"), "ISP")
+check("сводка по примечаниям",
+      naming.targetSummary(["Wireguard0", "Wireguard1"]), "Dataforest, Infomaniak")
+check("безымянные сворачиваются в семейство",
+      naming.targetSummary(["Wireguard2", "Wireguard5"]), "Wireguard 2, 5")
+check("один безымянный — точное имя",
+      naming.targetSummary(["Wireguard2"]), "Wireguard2")
+check("смешанный случай",
+      naming.targetSummary(["Wireguard0", "Wireguard2", "Wireguard5"]),
+      "Dataforest, Wireguard 2, 5")
+check("неизвестный интерфейс не теряется",
+      naming.targetSummary(["Wireguard0", "Tunnel9"]), "Dataforest, Tunnel9")
+check("подсказка — по строке на интерфейс",
+      naming.targetTooltip(["Wireguard0", "ISP"]), "Dataforest · Wireguard0\nISP")
+check("пустой список даёт пустую строку", naming.targetSummary([]), "")
+
+print("\n== Имена файлов резервных копий ==")
+check("владелец снимка",
+      Backups.host(of: URL(fileURLWithPath: "/b/192.168.1.1_2026-08-27_10-00-00_running-config.txt")),
+      "192.168.1.1")
+check("адрес с подчёркиванием",
+      Backups.host(of: URL(fileURLWithPath: "/b/my_router.local_2026-08-27_10-00-00_running-config.txt")),
+      "my_router.local")
+check("соседний адрес не путается",
+      Backups.host(of: URL(fileURLWithPath: "/b/192.168.1.10_2026-08-27_10-00-00_running-config.txt")),
+      "192.168.1.10")
+check("посторонний файл — не наш",
+      Backups.host(of: URL(fileURLWithPath: "/b/README.txt")), "")
+check("адрес приводится к безопасному виду",
+      Backups.safeHost("router.example.com:8080"), "router.example.com_8080")
+
 print("\n== Статические маршруты ==")
 let routes = StaticRouteParser.parse(config: sampleConfig)
 check("нашли 4 маршрута", String(routes.count), "4")
@@ -122,6 +170,27 @@ check("пропущена 1 строка", String(imported.skipped.count), "1")
 check("cidr из маски", imported.routes[0].destination, "100.64.0.0/10")
 check("хост /32 без префикса", imported.routes[1].destination, "8.8.8.8")
 check("keenetic-строка", imported.routes[2].command, "ip route 172.16.0.0 255.240.0.0 Wireguard0 auto")
+
+print("\n== Экспорт в BAT ==")
+// «routes» разобраны выше из sampleConfig: ipv4+auto, default, ipv6 и reject.
+let unsupported = StaticRouteParser.batUnsupported(routes)
+check("непереносимое посчитано", String(unsupported.count), "3")
+let batOut = StaticRouteParser.exportBAT(routes)
+check("переносимый маршрут выгружен",
+      batOut.contains("route -p add 10.50.0.0 mask 255.255.0.0 Wireguard0"))
+check("ipv6 не выброшен, а помечен", batOut.contains("rem не переносится в Windows: ipv6 route"))
+check("default помечен", batOut.contains("rem не переносится в Windows: ip route default"))
+check("reject помечен", batOut.contains("rem не переносится в Windows: ip route 203.0.113.77 ISP reject"))
+check("ни одна строка не потерялась",
+      String(batOut.split(separator: "\r\n").filter {
+          $0.hasPrefix("route -p add") || $0.hasPrefix("rem не переносится")
+      }.count), "4")
+
+let duplicated = StaticRouteParser.parse(config: """
+ip route 10.0.0.0 255.0.0.0 Wireguard0 auto
+ip route 10.0.0.0 255.0.0.0 Wireguard0 auto
+""")
+check("повтор в конфигурации не даёт двойного id", String(duplicated.count), "1")
 
 print("\n== WireGuard ==")
 let wgText = """

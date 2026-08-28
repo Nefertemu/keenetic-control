@@ -210,14 +210,17 @@ final class Store: ObservableObject {
     }
 
     func remove(_ router: RouterProfile) {
-        router.password = nil
-        // Вместе с роутером убираем и его rollback-базы WireGuard,
-        // иначе они остаются в связке ключей навсегда.
-        for name in WireGuardVault.baselineAccounts(router: router) {
-            Keychain.delete(account: name)
-        }
         routers.removeAll { $0.id == router.id }
         if selectedRouterID == router.id { selectedRouterID = routers.first?.id }
+
+        // Связка ключей умеет показать системный запрос и ждать ответа
+        // сколько угодно — из списка роутер убираем сразу, чистим следом.
+        let accounts = [router.keychainAccount] + WireGuardVault.baselineAccounts(router: router)
+        Task.detached {
+            // Вместе с роутером убираем и его rollback-базы WireGuard,
+            // иначе они остаются в связке ключей навсегда.
+            for name in accounts { Keychain.delete(account: name) }
+        }
     }
 
     private func persistRouters() {
