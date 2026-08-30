@@ -45,6 +45,27 @@ struct CustomSource: Codable, Identifiable, Hashable {
             .filter { !$0.isEmpty }
     }
 
+    /// Planner считает пробел, двоеточие, подчёркивание и дефис
+    /// взаимозаменяемыми в описании группы. Для проверки владения
+    /// источниками приводим префиксы к той же форме, иначе «my list» и
+    /// «my-list» начнут управлять одним списком.
+    static func canonicalPrefix(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "[\\s:_-]+", with: " ", options: .regularExpression)
+            .lowercased()
+    }
+
+    /// Имена источников, которым один и тот же список на роутере мог бы
+    /// показаться «своим». Нужна не только редактору: старый файл настроек
+    /// уже может содержать такую пару.
+    static func conflictingSourceTitles(_ specs: [SourceSpec]) -> [String] {
+        Dictionary(grouping: specs, by: { canonicalPrefix($0.descriptionPrefix) })
+            .values
+            .filter { $0.count > 1 }
+            .map { $0.map(\.title).sorted().joined(separator: " / ") }
+            .sorted()
+    }
+
     static func validate(_ source: CustomSource, existing: [CustomSource]) throws {
         let title = source.title.trimmingCharacters(in: .whitespaces)
         guard !title.isEmpty else { throw TransportError("Дай источнику название.") }
@@ -54,11 +75,16 @@ struct CustomSource: Codable, Identifiable, Hashable {
             throw TransportError("Укажи префикс описания — по нему приложение "
                                  + "узнаёт свои списки на роутере.")
         }
+        guard !prefix.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw TransportError("Префикс описания не может содержать переводы строк "
+                                 + "или управляющие символы.")
+        }
         // Совпадение префикса означало бы, что два источника считают одни и те
         // же списки роутера своими и будут затирать записи друг друга.
         let taken = SourceCatalog.all.map(\.descriptionPrefix)
             + existing.filter { $0.id != source.id }.map(\.descriptionPrefix)
-        guard !taken.contains(where: { $0.caseInsensitiveCompare(prefix) == .orderedSame }) else {
+        let canonical = canonicalPrefix(prefix)
+        guard !taken.contains(where: { canonicalPrefix($0) == canonical }) else {
             throw TransportError("Префикс «\(prefix)» уже занят другим источником.",
                                  hint: "Иначе два источника будут спорить за одни и те же "
                                      + "списки на роутере.")
@@ -71,6 +97,9 @@ struct CustomSource: Codable, Identifiable, Hashable {
     }
 
     private static func validateAddress(_ address: String) throws {
+        guard !address.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw TransportError("Адрес источника содержит перевод строки или служебный символ.")
+        }
         if address.hasPrefix("/") {
             guard FileManager.default.fileExists(atPath: address) else {
                 throw TransportError("Файла нет: \(address)")
@@ -83,6 +112,15 @@ struct CustomSource: Codable, Identifiable, Hashable {
         }
         guard ["http", "https", "file"].contains(scheme) else {
             throw TransportError("Схема \(scheme):// не поддерживается: \(address)")
+        }
+        guard url.user == nil, url.password == nil else {
+            throw TransportError("Адрес источника не должен содержать логин или пароль.",
+                                 hint: "Секреты хранятся отдельно и не попадут в журнал загрузки.")
+        }
+        if scheme == "http" || scheme == "https" {
+            guard url.host != nil else {
+                throw TransportError("В адресе источника не найден сервер: \(address)")
+            }
         }
         if scheme == "file" {
             guard FileManager.default.fileExists(atPath: url.path) else {

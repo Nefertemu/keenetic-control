@@ -76,7 +76,7 @@ dns-proxy
 !
 dns-proxy route object-group domain-list1 Wireguard0 auto
 !
-ip route 10.50.0.0 255.255.0.0 Wireguard0 auto !корпоративка
+ip route 10.50.0.0 255.255.0.0 Wireguard0 metric 10 auto !корпоративка
 ip route default ISP auto
 ipv6 route 2001:db8::/32 Wireguard0
 ip route 203.0.113.77 ISP reject
@@ -248,13 +248,27 @@ check("нашли 4 маршрута", String(routes.count), "4")
 check("маска → cidr", routes[0].destination, "10.50.0.0/16")
 check("комментарий", routes[0].comment, "корпоративка")
 check("флаг auto", routes[0].auto)
+check("метрика не теряется при разборе", String(routes[0].metric ?? -1), "10")
 check("default", routes[1].destination, "default")
 check("ipv6", routes[2].destination, "2001:db8::/32")
 check("reject", routes[3].reject)
 check("команда собирается обратно",
-      routes[0].command, "ip route 10.50.0.0 255.255.0.0 Wireguard0 auto !корпоративка")
+      routes[0].command, "ip route 10.50.0.0 255.255.0.0 Wireguard0 metric 10 auto !корпоративка")
 check("удаление берёт исходную строку",
       routes[3].deleteCommand, "no ip route 203.0.113.77 ISP reject")
+do {
+    try StaticRoute.validate(family: .ipv4, destination: "10.0.0.0/8", via: "ISP extra")
+    check("интерфейс с лишним токеном должен быть отклонён", false)
+} catch {
+    check("интерфейс с лишним токеном не попадёт в CLI", true)
+}
+do {
+    try StaticRoute.validate(family: .ipv4, destination: "10.0.0.0/8", via: "ISP",
+                             comment: "обычный\nкомментарий")
+    check("многострочный комментарий должен быть отклонён", false)
+} catch {
+    check("многострочный комментарий не попадёт в CLI", true)
+}
 
 print("\n== Импорт из BAT ==")
 let bat = """
@@ -272,6 +286,7 @@ check("распознано 3", String(imported.routes.count), "3")
 check("пропущена 1 строка", String(imported.skipped.count), "1")
 check("cidr из маски", imported.routes[0].destination, "100.64.0.0/10")
 check("хост /32 без префикса", imported.routes[1].destination, "8.8.8.8")
+check("метрика Windows сохраняется", String(imported.routes[1].metric ?? -1), "1")
 check("keenetic-строка", imported.routes[2].command, "ip route 172.16.0.0 255.240.0.0 Wireguard0 auto")
 
 print("\n== Экспорт в BAT ==")
@@ -323,7 +338,6 @@ let wg = try WireGuardConfig.parse(text: wgText, fileName: "test.conf")
 check("тип определён", wg.flavour, "AmneziaWG")
 check("приватный ключ", wg.privateKey.hasPrefix("uEjNGm+"))
 check("публичный ключ пира", wg.publicKey, "pUbLiCkEy1234567890abcdefghijklmnopqrstuv=")
-
 let stages = try WireGuardPlanner.stages(interface: "Wireguard0", config: wg)
 let wgCommands = stages.flatMap(\.commands)
 check("первая команда — down", wgCommands.first ?? "nil", "interface Wireguard0 down")
@@ -346,12 +360,80 @@ check("connect в конце", wgCommands.last?.hasSuffix("connect") ?? false)
 
 let plainWG = try WireGuardConfig.parse(text: wgText.replacingOccurrences(of: "Jc = 4", with: ""), fileName: "x")
 check("без Jc всё ещё amnezia (есть Jmin)", plainWG.isAmnezia)
+do {
+    var unsafe = wg
+    unsafe.peers[0]["endpoint"] = "203.0.113.9:51820;interface Wireguard0 down"
+    _ = try WireGuardPlanner.stages(interface: "Wireguard0", config: unsafe)
+    check("служебный символ в endpoint должен быть отклонён", false)
+} catch {
+    check("служебный символ в endpoint не попадёт в CLI", true)
+}
+do {
+    var unsafe = wg
+    unsafe.interfaceValues["h1"] = "123;interface Wireguard0 down"
+    _ = try WireGuardPlanner.stages(interface: "Wireguard0", config: unsafe)
+    check("служебный символ в ASC должен быть отклонён", false)
+} catch {
+    check("служебный символ в ASC не попадёт в CLI", true)
+}
+do {
+    var unsafe = wg
+    unsafe.interfaceValues["i1"] = "GET / HTTP/1.1"
+    unsafe.interfaceValues["s3"] = "1;interface Wireguard0 down"
+    _ = try WireGuardPlanner.stages(interface: "Wireguard0", config: unsafe)
+    check("служебный символ в S3 не попадёт в CLI", false)
+} catch {
+    check("служебный символ в S3 не попадёт в CLI", true)
+}
+do {
+    var unsafe = wg
+    unsafe.peers[0]["allowedips"] = "2001:db8::/129"
+    _ = try WireGuardPlanner.stages(interface: "Wireguard0", config: unsafe)
+    check("IPv6-префикс вне диапазона не попадёт в CLI", false)
+} catch {
+    check("IPv6-префикс вне диапазона не попадёт в CLI", true)
+}
+do {
+    _ = try WireGuardConfig.parse(text: wgText + """
+
+[Peer]
+PublicKey = secondPeerExample1234567890abcdefghijklmnop=
+AllowedIPs = 10.0.0.0/8
+""", fileName: "two-peers.conf")
+    check("несколько пиров должны быть отклонены", false)
+} catch {
+    check("несколько пиров не приводят к частичному обновлению", true)
+}
+do {
+    _ = try WireGuardConfig.parse(
+        text: wgText.replacingOccurrences(of: "AllowedIPs = 0.0.0.0/0, ::/0", with: ""),
+        fileName: "no-routes.conf")
+    check("конфиг без AllowedIPs должен быть отклонён", false)
+} catch {
+    check("конфиг без AllowedIPs не выключит маршруты", true)
+}
 
 let live = WireGuardState.parse(config: sampleConfig, interface: "Wireguard0")
 check("пир прочитан", live.peerKeys == ["aBcDeFgH1234567890abcdefghijklmnopqrstuv="])
 check("порт прочитан", live.listenPort, "51820")
 check("интерфейс поднят", live.isUp)
 check("список wg-интерфейсов", WireGuardState.interfaceNames(config: sampleConfig) == ["Wireguard0"])
+let renamePlan = try? WireGuardPlanner.planRename(interface: "Wireguard0",
+                                                  current: "старое имя",
+                                                  desired: "Hetzner FIN")
+check("имя WireGuard меняется через description",
+      renamePlan?.commands.first ?? "nil",
+      "interface Wireguard0 description \"Hetzner FIN\"")
+let clearNamePlan = try? WireGuardPlanner.planRename(interface: "Wireguard0",
+                                                    current: "старое имя",
+                                                    desired: "   ")
+check("пустое имя WireGuard снимает description",
+      clearNamePlan?.commands.first ?? "nil",
+      "interface Wireguard0 no description")
+check("имя WireGuard с переводом строки отклоняется",
+      (try? WireGuardPlanner.planRename(interface: "Wireguard0",
+                                        current: "старое имя",
+                                        desired: "bad\nname")) == nil)
 
 print("\n== Планировщик импорта ==")
 let spec = SourceCatalog.spec(for: "kinopub")!
@@ -372,12 +454,124 @@ check("удаления идут первыми в merge",
 check("маршруты не трогаются",
       !plan.commands.contains(where: { $0.contains("dns-proxy") }))
 
+let firstRouter = UUID()
+let secondRouter = UUID()
+let boundPlan = plan.forRouter(firstRouter)
+var firstProfile = RouterProfile()
+firstProfile.id = firstRouter
+firstProfile.host = "192.168.1.1"
+check("привязка плана не меняет его идентификатор", boundPlan.id == plan.id)
+check("план помнит роутер", boundPlan.routerID == firstRouter)
+let profileBoundPlan = plan.forRouter(firstProfile)
+check("план помнит ключ подключения", profileBoundPlan.routerConnectionKey == firstProfile.connectionKey)
+var webProfile = RouterProfile()
+webProfile.transport = .http
+webProfile.webURL = "https://admin:secret@example.com/rci?token=leak"
+check("credentials в webURL распознаются", webProfile.hasEmbeddedWebCredentials)
+check("effective URL не содержит credentials", webProfile.effectiveWebURL, "https://example.com/")
+webProfile.removeEmbeddedWebCredentials()
+check("credentials удаляются из профиля", !webProfile.hasEmbeddedWebCredentials)
+check("merge сохраняет общего владельца",
+      Planner.merge(title: "t", plans: [boundPlan]).routerID == firstRouter)
+check("merge разных роутеров не выбирает владельца",
+      Planner.merge(title: "t", plans: [boundPlan, plan.forRouter(secondRouter)]).routerID == nil)
+var syncReserved: Set<String> = []
+let syncReference = [
+    "one": FqdnGroup(ident: "one", descriptionText: "первый", includes: ["repeat.example"]),
+    "two": FqdnGroup(ident: "two", descriptionText: "второй", includes: ["repeat.example"]),
+]
+let syncPlan = Planner.planSync(reference: syncReference, current: [:], chunkSize: 300,
+                                reservedIDs: &syncReserved)
+check("перенос не добавляет один домен дважды", syncPlan.addCount == 1)
+
 print("\n== Планировщик маршрутов ==")
 let routePlan = Planner.planRoutes(groups: Array(groups.values), interface: "ISP", auto: true, reject: false)
 check("2 команды маршрутов", String(routePlan.commands.count), "2")
 check("формат команды", routePlan.commands.allSatisfy { $0.hasSuffix(" ISP auto") })
 let skipPlan = Planner.planRoutes(groups: Array(groups.values), interface: "Wireguard0", auto: true, reject: false)
 check("уже назначенное пропускается", skipPlan.isEmpty)
+let failoverPlan = Planner.planRoutes(groups: Array(groups.values),
+                                     interfaces: ["Wireguard0", "ISP"], auto: true, reject: false)
+let failoverAdds = failoverPlan.commands.filter { $0.hasPrefix("dns-proxy route object-group ") }
+check("резервирование назначает каждый список на оба интерфейса",
+      failoverPlan.routeTargets.count == 4 && failoverAdds.count == 4)
+let primaryIndexes = failoverAdds.indices.filter { failoverAdds[$0].contains(" Wireguard0 auto") }
+check("резервирование сохраняет порядок интерфейсов",
+      primaryIndexes.count == 2
+      && primaryIndexes.allSatisfy { $0 + 1 < failoverAdds.count
+          && failoverAdds[$0 + 1].contains(" ISP auto") })
+check("старые маршруты перед резервированием снимаются",
+      failoverPlan.commands.first?.hasPrefix("no dns-proxy route object-group ") ?? false)
+check("план запоминает точную failover-цепочку",
+      failoverPlan.exactRouteChains.values.allSatisfy {
+          $0 == [
+              DnsRouteAssignment(interface: "Wireguard0", auto: true, reject: false),
+              DnsRouteAssignment(interface: "ISP", auto: true, reject: false),
+          ]
+      })
+
+var exactFailoverGroups = groups
+for ident in Array(exactFailoverGroups.keys) {
+    exactFailoverGroups[ident]?.routeLines = [
+        "dns-proxy route object-group \(ident) Wireguard0 auto",
+        "dns-proxy route object-group \(ident) ISP auto",
+    ]
+}
+check("проверка принимает точный порядок и флаги",
+      PlanVerifier.problems(plan: failoverPlan, groups: exactFailoverGroups, limit: 300).isEmpty)
+
+var reversedFailoverGroups = exactFailoverGroups
+if let ident = reversedFailoverGroups.keys.sorted().first {
+    reversedFailoverGroups[ident]?.routeLines.reverse()
+}
+check("проверка замечает переставленный failover",
+      PlanVerifier.problems(plan: failoverPlan, groups: reversedFailoverGroups, limit: 300)
+        .contains { $0.contains("цепочка маршрутов не совпала") })
+
+var wrongFlagsGroups = exactFailoverGroups
+if let ident = wrongFlagsGroups.keys.sorted().first {
+    wrongFlagsGroups[ident]?.routeLines[0] =
+        "dns-proxy route object-group \(ident) Wireguard0 reject"
+}
+check("проверка замечает неверные auto/reject",
+      PlanVerifier.problems(plan: failoverPlan, groups: wrongFlagsGroups, limit: 300)
+        .contains { $0.contains("цепочка маршрутов не совпала") })
+
+var extraRouteGroups = exactFailoverGroups
+if let ident = extraRouteGroups.keys.sorted().first {
+    extraRouteGroups[ident]?.routeLines.append(
+        "dns-proxy route object-group \(ident) Wireguard9 auto")
+}
+check("проверка замечает лишний маршрут в цепочке",
+      PlanVerifier.problems(plan: failoverPlan, groups: extraRouteGroups, limit: 300)
+        .contains { $0.contains("цепочка маршрутов не совпала") })
+
+let strictSinglePlan = Planner.planRoutes(
+    groups: [FqdnGroup(ident: "single")], interface: "ISP", auto: true, reject: false)
+let strictSingleActual = [
+    "single": FqdnGroup(
+        ident: "single",
+        routeLines: ["dns-proxy route object-group single ISP reject"]),
+]
+check("обычное назначение тоже проверяет флаги",
+      PlanVerifier.problems(plan: strictSinglePlan, groups: strictSingleActual, limit: 300)
+        .contains { $0.contains("с другими флагами") })
+let flagRepairPlan = Planner.planRoutes(
+    groups: [strictSingleActual["single"]!], interface: "ISP", auto: true, reject: false)
+check("неверные флаги не считаются уже назначенным маршрутом",
+      flagRepairPlan.commands == [
+          "no dns-proxy route object-group single ISP reject",
+          "dns-proxy route object-group single ISP auto",
+      ])
+
+let manualPlan = try? ManualFqdnPlanner.plan(ident: "test", description: "test",
+                                             entriesText: "2ip.io\nwhoer.net")
+check("ручной список test создаётся", manualPlan?.createdGroups.first?.ident ?? "", "test")
+check("ручной список содержит два домена", String(manualPlan?.addCount ?? 0), "2")
+check("опасное имя ручного списка отбивается",
+      (try? ManualFqdnPlanner.plan(ident: "test;rm", description: "test", entriesText: "a.com")) == nil)
+check("битая строка ручного списка не пропускается",
+      (try? ManualFqdnPlanner.plan(ident: "test2", description: "test2", entriesText: "not-a-domain")) == nil)
 
 print("\n== Детектор ошибок CLI ==")
 check("error[code]", CLI.failed("Command::Base error[7405600]: no such interface"))
@@ -388,6 +582,12 @@ check("пустой вывод чистый", !CLI.failed(""))
 check("кавычки CLI", CLI.quote("itdog ru inside 2"), "\"itdog ru inside 2\"")
 check("раскавычивание", CLI.unquote("\"itdog ru inside 2\""), "itdog ru inside 2")
 check("ANSI вычищается", CLI.stripNoise("\u{1B}[32mok\u{1B}[0m\r\n"), "ok\n")
+check("секрет WireGuard не попадает в журнал",
+      CLI.redactSecrets("interface Wireguard0 wireguard private-key \"super-secret\""),
+      "interface Wireguard0 wireguard private-key •••")
+check("preshared-key без кавычек тоже скрывается",
+      CLI.redactSecrets("wireguard peer key preshared-key another-secret"),
+      "wireguard peer key preshared-key •••")
 
 print("\n== SSH-транспорт: обработка недоступного хоста ==")
 var probe = RouterProfile()
@@ -489,6 +689,14 @@ check("режим URI требует схему",
       { do { try PingCheckProfile.validate(
                  PingCheckProfile(name: "t", uri: "example.com", mode: .uri)); return false }
         catch { return true } }())
+check("узел с переводом строки не превращается в команду",
+      { do { try PingCheckProfile.validate(
+                 PingCheckProfile(name: "t", host: "1.1.1.1\nsystem configuration save")); return false }
+        catch { return true } }())
+check("URI со встроенным паролем не принимается",
+      { do { try PingCheckProfile.validate(
+                 PingCheckProfile(name: "t", uri: "https://user:pass@example.com", mode: .uri)); return false }
+        catch { return true } }())
 check("режимы ровно те, что в справочнике",
       PingCheckProfile.Mode.allCases.map(\.rawValue).joined(separator: ","),
       "icmp,connect,tls,uri")
@@ -527,6 +735,29 @@ do {
     check("Argon2id, контрольный пример RFC 9106", tag.hexString,
           "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
 } catch { failures += 1; checks += 1; print("  FAIL Argon2id: \(error)") }
+
+print("\n== Защищённые резервные копии ==")
+let backupKey = Data((0..<32).map(UInt8.init))
+let backupText = "interface Wireguard0\n    wireguard private-key top-secret\n!\n"
+do {
+    let encrypted = try SecureBackup.seal(backupText, keyData: backupKey)
+    check("контейнер помечен как зашифрованный", SecureBackup.isEncrypted(encrypted))
+    check("секрет не лежит в контейнере открытым текстом",
+          !String(decoding: encrypted, as: UTF8.self).contains("top-secret"))
+    check("AES-GCM расшифровывает снимок",
+          try SecureBackup.open(encrypted, keyData: backupKey), backupText)
+
+    var damaged = encrypted
+    damaged[damaged.index(before: damaged.endIndex)] ^= 0x01
+    check("подмена контейнера обнаруживается",
+          (try? SecureBackup.open(damaged, keyData: backupKey)) == nil)
+    check("чужой ключ не открывает снимок",
+          (try? SecureBackup.open(encrypted, keyData: Data(repeating: 9, count: 32))) == nil)
+} catch {
+    failures += 1; checks += 5
+    print("  FAIL AES-GCM backup: \(error)")
+}
+
 print("\n== Настройки переживают обновление приложения ==")
 // Файл настроек от прошлой версии не знает новых полей. Синтезированный
 // декодер на этом спотыкается, а Store в таком случае берёт значения по
@@ -566,7 +797,7 @@ object-group fqdn domain-list1
     include three.example
 !
 dns-proxy route object-group domain-list0 Wireguard0 auto
-ip route 10.50.0.0 255.255.0.0 Wireguard0 auto
+ip route 10.50.0.0 255.255.0.0 Wireguard0 metric 10 auto
 !
 """
 let currentConfig = """
@@ -588,6 +819,10 @@ ip route 172.16.0.0 255.240.0.0 Wireguard0 auto
 """
 let diff = Restore.compare(backup: snapshotConfig, current: currentConfig)
 check("расхождения найдены", !diff.isEmpty)
+check("сверка сохраняет идентификатор при копировании", { () -> Bool in
+    let copy = diff
+    return copy.id == diff.id
+}())
 check("пропавший домен замечен", diff.missingDomains["domain-list0"] == ["two.example"])
 check("лишний домен замечен", diff.extraDomains["domain-list0"] == ["added.example"])
 check("исчезнувший список", diff.missingGroups.map(\.ident), ["domain-list1"])
@@ -611,7 +846,7 @@ check("исчезнувший список создаётся заново",
       restoreText.contains("object-group fqdn domain-list1 description \"второй\""))
 check("и наполняется", restoreText.contains("object-group fqdn domain-list1 include three.example"))
 check("статический маршрут возвращается",
-      restoreText.contains("ip route 10.50.0.0 255.255.0.0 Wireguard0 auto"))
+      restoreText.contains("ip route 10.50.0.0 255.255.0.0 Wireguard0 metric 10 auto"))
 check("лишний статический снимается",
       restoreText.contains("no ip route 172.16.0.0 255.240.0.0 Wireguard0 auto"))
 
@@ -657,6 +892,17 @@ check("несуществующий файл отбивается",
 check("чужая схема отбивается",
       sourceError(CustomSource(title: "Мой", descriptionPrefix: "my",
                                urls: ["ftp://a/x"])) != nil)
+check("старый источник не запускает чужую схему",
+      (try? SourceLoader.fetch("ftp://a/x")) == nil)
+check("префикс с переводом строки отбивается",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my\nlist",
+                               urls: ["https://a/x"])) != nil)
+check("адрес источника с паролем отбивается",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my",
+                               urls: ["https://user:pass@example.com/x"])) != nil)
+check("сетевой адрес без сервера отбивается",
+      sourceError(CustomSource(title: "Мой", descriptionPrefix: "my",
+                               urls: ["https:///x"])) != nil)
 check("префикс встроенного источника занят",
       sourceError(CustomSource(title: "Мой", descriptionPrefix: "kinopub",
                                urls: ["https://a/x"])) != nil)
@@ -664,8 +910,60 @@ check("префикс встроенного источника занят",
 let mine = CustomSource(title: "Мой", descriptionPrefix: "my list", urls: ["https://a/x"])
 check("ключ своего источника отличим", mine.spec.key.hasPrefix("custom-"))
 check("свой кэш отдельным файлом", mine.spec.cacheName.hasPrefix("custom-"))
+check("разные разделители в префиксе считаются одним владельцем",
+      CustomSource.canonicalPrefix("My-list:_  2") == "my list 2")
+check("префикс с дефисом не обходит защиту",
+      sourceError(CustomSource(title: "Похожий", descriptionPrefix: "hoaxisr-ru-block",
+                               urls: ["https://a/x"])) != nil)
+check("старые конфликтующие источники распознаются",
+      !CustomSource.conflictingSourceTitles([
+        mine.spec,
+        CustomSource(title: "Второй", descriptionPrefix: "my_list", urls: ["https://b/x"]).spec,
+      ]).isEmpty)
 check("путь к файлу не переписывается под github",
       SourceSpec.rawGitHub("/tmp/github.com/x.txt"), "/tmp/github.com/x.txt")
+
+print("\n== Целостность источников подсетей ==")
+// IPv4 и IPv6 — независимые обязательные части одного источника. Если одна
+// часть не приехала, загрузчик не должен отдавать Planner неполную склейку:
+// removeStale тогда удалил бы отсутствующие записи с роутера.
+let subnetRoot = FileManager.default.temporaryDirectory
+    .appendingPathComponent("keenetic-control-subnets-\(UUID().uuidString)", isDirectory: true)
+try? FileManager.default.createDirectory(at: subnetRoot, withIntermediateDirectories: true)
+let subnetDomain = subnetRoot.appendingPathComponent("domains.txt")
+let subnetV4 = subnetRoot.appendingPathComponent("v4.txt")
+let subnetV6 = subnetRoot.appendingPathComponent("v6.txt")
+let subnetKey = "selftest-subnets-\(UUID().uuidString)"
+let subnetCache = AppPaths.cache.appendingPathComponent("subnets-\(subnetKey).txt")
+let domainCache = AppPaths.cache.appendingPathComponent("\(subnetKey).txt")
+let partialSpec = SourceSpec(
+    key: subnetKey, title: "Тест подсетей", subtitle: "selftest",
+    descriptionPrefix: "selftest subnets", icon: "network",
+    urls: [subnetDomain.path], cacheName: domainCache.lastPathComponent,
+    subnetURLs: [subnetV4.path, subnetV6.path], minDomains: 1)
+try? "example.com\n".write(to: subnetDomain, atomically: true, encoding: .utf8)
+try? "1.1.1.0/24\n".write(to: subnetV4, atomically: true, encoding: .utf8)
+try? "this-is-not-a-subnet\n".write(to: subnetV6, atomically: true, encoding: .utf8)
+do {
+    _ = try SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
+    check("частичная загрузка подсетей отклоняется", false)
+} catch let error as TransportError {
+    check("частичная загрузка подсетей отклоняется", true)
+    check("ошибка объясняет, почему частичный список отброшен",
+          (error.hint ?? "").contains("Частичный результат отброшен"))
+} catch {
+    check("частичная загрузка подсетей отклоняется", true)
+}
+try? "2001:db8::/32\n".write(to: subnetV6, atomically: true, encoding: .utf8)
+let completeSubnets = try? SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
+check("полный набор подсетей загружается", completeSubnets?.subnetCount == 2)
+try? "broken-again\n".write(to: subnetV6, atomically: true, encoding: .utf8)
+let cachedSubnets = try? SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
+check("при следующей частичной загрузке берётся полный кэш",
+      cachedSubnets?.fromCache == true && cachedSubnets?.subnetCount == 2)
+try? FileManager.default.removeItem(at: subnetRoot)
+try? FileManager.default.removeItem(at: subnetCache)
+try? FileManager.default.removeItem(at: domainCache)
 
 print("\n== Защита от лишних неудачных входов ==")
 // Роутер объявляет x-ndw4, но на первой фазе не присылает соль. Пароль тут
@@ -690,15 +988,68 @@ check("неожиданный статус первой фазы — тоже н
       wrongStatus?.handshakeUnsupported ?? false)
 
 let badSalt = ndw4Failure(NDW4.Reply(
-    status: 401, data: ["salt": "///", "iterations": 3, "memory": 4096]))
+    status: 401, data: ["salt": "///",
+                         "nonce": "server",
+                         "iter": 3,
+                         "memcost": 4096]))
 check("нечитаемая соль — несовместимость", badSalt?.handshakeUnsupported ?? false)
 
 let wildParameters = ndw4Failure(NDW4.Reply(
     status: 401,
     data: ["salt": Data(repeating: 7, count: 16).base64EncodedString(),
-           "iterations": 9999, "memory": 4096]))
+           "nonce": "server",
+           "iter": 9999, "memcost": 4096]))
 check("неправдоподобные параметры — несовместимость",
       wildParameters?.handshakeUnsupported ?? false)
+let hugeMemory = ndw4Failure(NDW4.Reply(
+    status: 401,
+    data: ["salt": Data(repeating: 7, count: 16).base64EncodedString(),
+           "nonce": "server",
+           "iter": 3,
+           "memcost": 65_537]))
+check("слишком большая память отклоняется до Argon2",
+      hugeMemory?.handshakeUnsupported ?? false)
+
+do {
+    let empty = try RCITransport.decodeJSONResponse(Data(), method: "GET", path: "rci/show/test")
+    check("пустой JSON-ответ допустим", empty == nil)
+} catch {
+    check("пустой JSON-ответ допустим", false)
+}
+do {
+    let object = try RCITransport.decodeJSONResponse(
+        Data("{\"status\":\"ok\"}".utf8), method: "GET", path: "rci/show/test")
+    check("корректный JSON-объект разбирается", (object as? [String: Any])?["status"] as? String == "ok")
+} catch {
+    check("корректный JSON-объект разбирается", false)
+}
+do {
+    let fragment = try RCITransport.decodeJSONResponse(
+        Data("true".utf8), method: "GET", path: "rci/show/test")
+    check("JSON-фрагмент тоже разбирается", (fragment as? Bool) == true)
+} catch {
+    check("JSON-фрагмент тоже разбирается", false)
+}
+do {
+    _ = try RCITransport.decodeJSONResponse(
+        Data("<html><body>not json</body></html>".utf8), method: "GET", path: "rci/show/test")
+    check("невалидный JSON не считается успешным ответом", false)
+} catch let error as TransportError {
+    check("невалидный JSON не считается успешным ответом",
+          error.message.contains("не в формате JSON"))
+} catch {
+    check("невалидный JSON не считается успешным ответом", false)
+}
+do {
+    _ = try RCITransport.decodeJSONResponse(
+        Data("{\"password\":\"super-secret\"".utf8), method: "GET", path: "rci/show/test")
+    check("секрет не проходит из битого JSON в ошибку", false)
+} catch let error as TransportError {
+    let rendered = error.message + "\n" + (error.hint ?? "")
+    check("секрет не проходит из битого JSON в ошибку", !rendered.contains("super-secret"))
+} catch {
+    check("секрет не проходит из битого JSON в ошибку", false)
+}
 
 check("до отказа схему не пропускаем", !RCITransport.skipsModernAuth(host: "192.168.1.1"))
 RCITransport.rememberModernAuthUnusable(host: "192.168.1.1")
@@ -709,6 +1060,14 @@ check("разбор endpoint из WWW-Authenticate",
   RCITransport.endpoint(in: "x-ndw4-interactive endpoint=\"/auth\" data=\"e30=\"") ?? "nil", "auth")
 check("endpoint отсутствует — не выдумываем",
   RCITransport.endpoint(in: "x-ndw2-interactive realm=\"X\"") == nil)
+check("внешний endpoint не принимаем",
+      RCITransport.endpoint(in: "x-ndw4 endpoint=\"https://other.example/auth\"") == nil)
+check("endpoint с неявной схемой не принимаем",
+      RCITransport.endpoint(in: "x-ndw4 endpoint=\"https:other.example/auth\"") == nil)
+check("сетевой endpoint не принимаем",
+      RCITransport.endpoint(in: "x-ndw4 endpoint=\"//other.example/auth\"") == nil)
+check("endpoint выше корня не принимаем",
+      RCITransport.endpoint(in: "x-ndw4 endpoint=\"../auth\"") == nil)
 
 if ProcessInfo.processInfo.environment["SELFTEST_NETWORK"] != nil {
     print("\n== Живая загрузка источников ==")

@@ -14,6 +14,10 @@ import Foundation
 enum NDW4 {
     private static let clientKeyLabel = "NDW4 Interactive Client Key"
     private static let serverKeyLabel = "NDW4 Interactive Server Key"
+    /// Argon2 выделяет память до начала вычислений. 64 МиБ с запасом хватает
+    /// штатной схеме Keenetic, но не позволяет ответу удалённого сервера
+    /// занять гигабайт памяти процесса.
+    private static let maximumMemoryCostKiB = 1 << 16
 
     struct Reply {
         let status: Int
@@ -63,7 +67,9 @@ enum NDW4 {
 
         // Параметры приходят от роутера: на абсурдных значениях мы бы
         // выделили гигабайты памяти или считали ключ часами.
-        guard (1...16).contains(iterations), (8...(1 << 20)).contains(memoryCost) else {
+        guard (1...16).contains(iterations),
+              (8...maximumMemoryCostKiB).contains(memoryCost)
+        else {
             throw Failure("Фаза 1: роутер прислал неправдоподобные параметры "
                           + "(проходов \(iterations), памяти \(memoryCost) КиБ).", handshakeUnsupported: true)
         }

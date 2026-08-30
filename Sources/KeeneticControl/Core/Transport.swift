@@ -34,6 +34,11 @@ extension KeeneticTransport {
 enum CLI {
     static let ansi = try! NSRegularExpression(
         pattern: "\\x1B(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])")
+    /// Такие аргументы не должны попадать ни в журнал, ни в подсказку
+    /// ошибки. Значение бывает кавычечным (как его собирает quote) или
+    /// одним токеном — закрываем обе формы.
+    private static let secretArgumentPattern = try! NSRegularExpression(
+        pattern: #"(?i)\b(private-key|preshared-key)\s+(?:"(?:\\.|[^"])*"|\S+)"#)
 
     /// Прошивка отдаёт конфигурацию с CRLF. В Swift «\r\n» — ОДИН символ,
     /// поэтому split(separator: "\n") такой текст не разбивает вовсе: парсеры
@@ -128,6 +133,15 @@ enum CLI {
             lines.removeLast()
         }
         return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Маскируем секреты WireGuard в сообщениях, которые увидит пользователь
+    /// или которые сохраняются на диск. Команды роутеру отдаются исходными.
+    static func redactSecrets(_ text: String) -> String {
+        secretArgumentPattern.stringByReplacingMatches(
+            in: text,
+            range: NSRange(text.startIndex..., in: text),
+            withTemplate: "$1 •••")
     }
 
     /// Кавычим строку так, как её понимает Keenetic CLI.

@@ -21,7 +21,13 @@ final class RCITransport: KeeneticTransport {
         self.profile = profile
         self.password = password
 
-        guard let url = URL(string: profile.effectiveWebURL) else {
+        guard let url = URL(string: profile.effectiveWebURL),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil,
+              url.user == nil,
+              url.password == nil
+        else {
             throw TransportError("Некорректный адрес веб-панели: \(profile.effectiveWebURL)")
         }
         self.baseURL = url
@@ -49,7 +55,7 @@ final class RCITransport: KeeneticTransport {
 
     private func authenticate() throws {
         let (_, probe) = try perform(request(path: "auth", method: "GET"))
-        adoptRedirect(from: probe)
+        try adoptRedirect(from: probe)
 
         let offered = probe.value(forHTTPHeaderField: "WWW-Authenticate") ?? ""
         advertisesModernAuth = offered.lowercased().contains("ndw4")
@@ -154,7 +160,7 @@ final class RCITransport: KeeneticTransport {
     /// явно: `showInterfaceApi.read({details: "yes"})`. Форму запроса
     /// прошивки понимают по-разному, поэтому пробуем обе и запоминаем ту,
     /// что сработала.
-    static func interfaceStatusJSON(_ transport: RCITransport) -> Any? {
+    static func interfaceStatusJSON(_ transport: RCITransport, logResult: Bool = true) -> Any? {
         let attempts: [(String, () throws -> Any?)] = [
             ("GET с параметром", {
                 try transport.json(method: "GET", path: "rci/show/interface?details=yes")
@@ -172,12 +178,12 @@ final class RCITransport: KeeneticTransport {
         for (name, attempt) in attempts {
             guard let result = try? attempt() else { continue }
             if hasDetails(result) {
-                log(.info, "RCI: состояние интерфейсов с подробностями (\(name)).")
+                if logResult { log(.info, "RCI: состояние интерфейсов с подробностями (\(name)).") }
                 return result
             }
             if fallback == nil { fallback = result }
         }
-        if fallback != nil {
+        if fallback != nil, logResult {
             log(.warn, "RCI: роутер отдал состояние интерфейсов без секции details — "
                 + "проверка связи показана не будет.")
         }
@@ -207,13 +213,30 @@ final class RCITransport: KeeneticTransport {
         modernAuthLock.unlock()
     }
 
-    /// endpoint="/auth" из заголовка WWW-Authenticate.
+    /// endpoint="/auth" из заголовка WWW-Authenticate. Роутер вправе
+    /// выбрать другой путь на себе, но не адрес другого сервера: дальше по
+    /// этому endpoint уйдёт доказательство знания пароля.
     static func endpoint(in header: String) -> String? {
         guard let range = header.range(of: "endpoint=\"") else { return nil }
         let tail = header[range.upperBound...]
         guard let end = tail.firstIndex(of: "\"") else { return nil }
         let value = String(tail[tail.startIndex..<end])
-        return value.hasPrefix("/") ? String(value.dropFirst()) : value
+        guard !value.isEmpty,
+              !value.contains("\\"),
+              !value.hasPrefix("//"),
+              let components = URLComponents(string: value),
+              components.scheme == nil,
+              components.host == nil,
+              components.user == nil,
+              components.password == nil
+        else { return nil }
+
+        let path = value.hasPrefix("/") ? String(value.dropFirst()) : value
+        guard !path.isEmpty,
+              !path.hasPrefix("/"),
+              !path.split(separator: "/").contains("..")
+        else { return nil }
+        return path
     }
 
     private func hex<H: Sequence>(_ digest: H) -> String where H.Element == UInt8 {
@@ -364,14 +387,64 @@ final class RCITransport: KeeneticTransport {
             }
 
             guard (200..<300).contains(response.statusCode) else {
-                let text = String(data: data, encoding: .utf8) ?? ""
-                throw TransportError("RCI \(method) \(path) → HTTP \(response.statusCode). \(text)")
+                let preview = RCITransport.responsePreview(data)
+                throw TransportError(
+                    "RCI \(method) \(path) → HTTP \(response.statusCode).",
+                    hint: preview.isEmpty ? nil : "Ответ роутера: \(preview)")
             }
 
-            if data.isEmpty { return nil }
-            return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            return try RCITransport.decodeJSONResponse(data, method: method, path: path)
         }
     }
+
+    /// RCI-методы возвращают JSON, кроме документированных ответов без тела.
+    /// Раньше ошибка декодирования превращалась в `nil`, а вызывающий код
+    /// принимал такой ответ за успешное выполнение команды.
+    static func decodeJSONResponse(_ data: Data, method: String, path: String) throws -> Any? {
+        guard !data.isEmpty else { return nil }
+        do {
+            return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        } catch {
+            let preview = responsePreview(data)
+            throw TransportError(
+                "RCI \(method) \(path) вернул ответ не в формате JSON.",
+                hint: preview.isEmpty
+                    ? "Ответ непустой, но в нём нет читаемого текста."
+                    : "Начало ответа: \(preview)")
+        }
+    }
+
+    /// В ошибку кладём только короткое, однострочное и обезличенное начало
+    /// ответа. Помимо общих CLI-секретов закрываем типичные поля HTTP/JSON:
+    /// роутер или прокси не должны случайно вернуть пароль, токен или cookie
+    /// целиком в журнал приложения.
+    private static func responsePreview(_ data: Data) -> String {
+        guard !data.isEmpty else { return "" }
+        let sampleLimit = 2_048
+        let previewLimit = 240
+        var text = String(decoding: data.prefix(sampleLimit), as: UTF8.self)
+        text = CLI.redactSecrets(text)
+
+        let range = NSRange(text.startIndex..., in: text)
+        text = responseSecretPattern.stringByReplacingMatches(
+            in: text, range: range, withTemplate: "$1•••")
+
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(text.unicodeScalars.count)
+        for scalar in text.unicodeScalars {
+            scalars.append(CharacterSet.controlCharacters.contains(scalar) ? " " : scalar)
+        }
+        let compact = String(scalars)
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+
+        guard !compact.isEmpty else { return "" }
+        let truncated = compact.count > previewLimit || data.count > sampleLimit
+        return String(compact.prefix(previewLimit)) + (truncated ? "…" : "")
+    }
+
+    private static let responseSecretPattern = try! NSRegularExpression(
+        pattern: #"(?i)([\"']?(?:password|passwd|token|secret|authorization|cookie|set-cookie)[\"']?\s*[:=]\s*)(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^\s,;}\]]+)"#)
 
     private func textGET(_ path: String) throws -> String {
         if !authorized { try authenticate() }
@@ -394,12 +467,38 @@ final class RCITransport: KeeneticTransport {
         }
     }
 
-    /// Запоминаем адрес, на который роутер увёл нас редиректом.
-    private func adoptRedirect(from response: HTTPURLResponse) {
+    /// Запоминаем адрес, на который роутер увёл нас редиректом. Переход на
+    /// HTTPS и смена порта у того же роутера нормальны, а перенос авторизации
+    /// на другой хост, подстановка учётных данных или откат с HTTPS на HTTP
+    /// нельзя принимать молча: следующим запросом туда может уйти
+    /// подтверждение знания пароля.
+    private func adoptRedirect(from response: HTTPURLResponse) throws {
         guard let final = response.url,
               var components = URLComponents(url: final, resolvingAgainstBaseURL: false)
         else { return }
+        guard let scheme = final.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              final.user == nil,
+              final.password == nil
+        else {
+            throw TransportError(
+                "Веб-панель перенаправила вход на небезопасный адрес.",
+                hint: "Проверь конечный адрес веб-панели в «Роутеры и настройки».")
+        }
+        guard final.host?.caseInsensitiveCompare(baseURL.host ?? "") == .orderedSame else {
+            throw TransportError(
+                "Веб-панель перенаправила вход на другой адрес.",
+                hint: "Для безопасности пароль не будет отправлен на \(final.host ?? "неизвестный адрес"). "
+                    + "Укажи конечный адрес веб-панели вручную в «Роутеры и настройки».")
+        }
+        if baseURL.scheme?.caseInsensitiveCompare("https") == .orderedSame, scheme == "http" {
+            throw TransportError(
+                "Веб-панель пытается переключить защищённое соединение на HTTP.",
+                hint: "Для безопасности пароль не будет отправлен по незащищённому соединению.")
+        }
         components.path = "/"
+        components.user = nil
+        components.password = nil
         components.query = nil
         components.fragment = nil
         guard let pinned = components.url, pinned.absoluteString != baseURL.absoluteString
@@ -420,22 +519,38 @@ final class RCITransport: KeeneticTransport {
     /// Вызывается только с фоновой очереди сессии роутера.
     private func perform(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
         let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
         var result: Result<(Data, HTTPURLResponse), Error>?
 
         let task = session.dataTask(with: request) { data, response, error in
+            let value: Result<(Data, HTTPURLResponse), Error>
             if let error {
-                result = .failure(TransportError(RCITransport.describe(error)))
+                value = .failure(TransportError(RCITransport.describe(error)))
             } else if let http = response as? HTTPURLResponse {
-                result = .success((data ?? Data(), http))
+                value = .success((data ?? Data(), http))
             } else {
-                result = .failure(TransportError("Пустой ответ от роутера."))
+                value = .failure(TransportError("Пустой ответ от роутера."))
             }
+
+            lock.lock()
+            result = value
+            lock.unlock()
             semaphore.signal()
         }
         task.resume()
-        semaphore.wait()
 
-        switch result {
+        // URLSession должен вызвать callback и при отмене, но отдельный предел
+        // нужен как последняя страховка от зависшего сетевого стека: watchdog
+        // сессии оборвёт транспорт, а эта очередь не останется ждать навечно.
+        guard semaphore.wait(timeout: .now() + 60) == .success else {
+            task.cancel()
+            throw TransportError("Роутер не ответил за 60 с.")
+        }
+
+        lock.lock()
+        let finished = result
+        lock.unlock()
+        switch finished {
         case .success(let value): return value
         case .failure(let error): throw error
         case nil: throw TransportError("Запрос к роутеру не завершился.")

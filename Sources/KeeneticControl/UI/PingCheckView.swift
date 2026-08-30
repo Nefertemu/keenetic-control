@@ -53,20 +53,42 @@ struct PingCheckView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if let progress = session.progress { ProgressBanner(info: progress) }
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let progress = session.progress { ProgressBanner(info: progress) }
 
-                if session.state == nil {
-                    EmptyHint(icon: "bolt.horizontal.circle", title: "Роутер не прочитан",
-                              message: "Подключись и нажми «Обновить».")
-                        .card(padding: 24)
-                } else {
-                    profilesCard
-                    assignmentCard
+                    if session.state == nil {
+                        EmptyHint(icon: "bolt.horizontal.circle", title: "Роутер не прочитан",
+                                  message: "Подключись и нажми «Обновить».")
+                            .card(padding: 24)
+                    } else {
+                        profilesCard
+                        assignmentCard
+                    }
+                }
+                .padding(.top, 4)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
+                .id("ping-check-top")
+            }
+            // При переходе из другой длинной вкладки macOS мог сохранить
+            // старую позицию ScrollView, из-за чего шапка Ping‑Check
+            // оказывалась обрезанной под toolbar. Всегда начинаем экран с
+            // собственной шапки, но не вмешиваемся в обычную прокрутку.
+            .onAppear {
+                // Ждём один layout pass: на macOS вызов прямо из onAppear
+                // иногда происходит до того, как ScrollView зарегистрировал
+                // цель, и старый offset тогда не сбрасывается.
+                DispatchQueue.main.async {
+                    proxy.scrollTo("ping-check-top", anchor: .top)
                 }
             }
-            .padding(20)
+            .onChange(of: session.router.id) { _, _ in
+                DispatchQueue.main.async {
+                    proxy.scrollTo("ping-check-top", anchor: .top)
+                }
+            }
         }
         .onChange(of: session.router.id) { _, _ in
             // Иначе правки, набранные на одном роутере, уехали бы
@@ -75,8 +97,9 @@ struct PingCheckView: View {
         }
         .sheet(item: $editing) { item in
             PingCheckEditor(profile: item.profile, isNew: item.isNew) { edited in
-                editing = nil
-                buildSavePlan(edited)
+                if buildSavePlan(edited, isNew: item.isNew) {
+                    editing = nil
+                }
             } onCancel: { editing = nil }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
@@ -95,6 +118,7 @@ struct PingCheckView: View {
             Button("Удалить", role: .destructive) {
                 if let victim = confirmDelete {
                     plan = PingCheckParser.planDelete(victim, usedBy: users(of: victim))
+                        .forRouter(session.router)
                 }
                 confirmDelete = nil
             }
@@ -108,17 +132,18 @@ struct PingCheckView: View {
 
     private var profilesCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "waveform.path.ecg", title: "Профили Ping-Check",
-                           subtitle: "Роутер проверяет связь и гасит интерфейс, если узел не отвечает")
-                Spacer()
-                Button("Добавить профиль") {
-                    // Пустые поля роутер заполнит своими значениями по умолчанию.
-                    editing = Editing(profile: PingCheckProfile(name: "", host: "", mode: .icmp,
-                                                                updateInterval: 10),
-                                      isNew: true)
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    profilesHeader
+                    Spacer()
+                    addProfileButton
                 }
-                .buttonStyle(PrimaryButtonStyle())
+                .frame(minWidth: 600)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    profilesHeader
+                    addProfileButton
+                }
             }
 
             if profiles.isEmpty {
@@ -143,7 +168,44 @@ struct PingCheckView: View {
     private func profileRow(_ profile: PingCheckProfile) -> some View {
         let assigned = users(of: profile)
 
-        return HStack(spacing: 11) {
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 11) {
+                profileIdentity(profile)
+                Spacer(minLength: 8)
+                profileAssignment(assigned)
+                profileActions(profile)
+            }
+            .frame(minWidth: 650)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 9) {
+                    profileIdentity(profile)
+                    Spacer(minLength: 4)
+                    profileActions(profile)
+                }
+                profileAssignment(assigned)
+            }
+        }
+        .padding(.vertical, 9)
+    }
+
+    private var profilesHeader: some View {
+        CardHeader(icon: "waveform.path.ecg", title: "Профили Ping-Check",
+                   subtitle: "Роутер проверяет связь и гасит интерфейс, если узел не отвечает")
+    }
+
+    private var addProfileButton: some View {
+        Button("Добавить профиль") {
+            // Пустые поля роутер заполнит своими значениями по умолчанию.
+            editing = Editing(profile: PingCheckProfile(name: "", host: "", mode: .icmp,
+                                                        updateInterval: 10),
+                              isNew: true)
+        }
+        .buttonStyle(PrimaryButtonStyle())
+    }
+
+    private func profileIdentity(_ profile: PingCheckProfile) -> some View {
+        HStack(spacing: 11) {
             Image(systemName: profile.isBuiltIn ? "lock.circle" : "waveform.path.ecg")
                 .font(.system(size: 14))
                 .foregroundStyle(profile.isBuiltIn ? Color.secondary : Palette.accent)
@@ -151,18 +213,22 @@ struct PingCheckView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 7) {
-                    Text(profile.name).font(.system(size: 13, weight: .semibold))
+                    Text(profile.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     if profile.isBuiltIn { StatusPill(text: "встроенный", tint: .secondary) }
                 }
                 Text(profile.isBuiltIn ? "Настраивается самим роутером" : profile.summary)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                     .help(profile.isBuiltIn ? "Профиль встроен в прошивку" : profile.summary)
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 
-            Spacer(minLength: 8)
-
+    private func profileAssignment(_ assigned: [String]) -> some View {
+        Group {
             if assigned.isEmpty {
                 StatusPill(text: "не используется", tint: Palette.warning)
             } else {
@@ -174,7 +240,11 @@ struct PingCheckView: View {
                            tint: Palette.success)
                     .help(session.state?.targetTooltip(assigned) ?? assigned.joined(separator: "\n"))
             }
+        }
+    }
 
+    private func profileActions(_ profile: PingCheckProfile) -> some View {
+        HStack(spacing: 8) {
             Button("Изменить") {
                 editing = Editing(profile: profile, isNew: false)
             }
@@ -190,52 +260,73 @@ struct PingCheckView: View {
             .foregroundStyle(profile.isBuiltIn ? Color.secondary : Palette.danger)
             .disabled(profile.isBuiltIn)
         }
-        .padding(.vertical, 9)
     }
 
     // MARK: - Привязка к интерфейсам
 
     private var assignmentCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "point.3.connected.trianglepath.dotted",
-                           title: "Назначение на интерфейсы",
-                           subtitle: "«Перезапуск» поднимает туннель заново, когда связь пропала")
-                Spacer()
-                if !changes.isEmpty {
-                    Button("Отменить правки") { pending.removeAll() }
-                        .buttonStyle(SubtleButtonStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    assignmentHeader
+                    Spacer()
+                    assignmentActions
                 }
-                Button(changes.isEmpty ? "Изменений нет" : "Применить (\(changes.count))") {
-                    buildAssignPlan()
+                .frame(minWidth: 700)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    assignmentHeader
+                    assignmentActions
                 }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(changes.isEmpty || session.progress != nil)
             }
 
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    Text("Интерфейс").frame(width: 250, alignment: .leading)
-                    Text("Профиль").frame(width: 190, alignment: .leading)
-                    Text("Перезапуск").frame(width: 110, alignment: .leading)
-                    Text("Сейчас").frame(width: 150, alignment: .leading)
-                    Spacer()
-                }
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.vertical, 8)
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        Text("Интерфейс").frame(width: 250, alignment: .leading)
+                        Text("Профиль").frame(width: 190, alignment: .leading)
+                        Text("Перезапуск").frame(width: 110, alignment: .leading)
+                        Text("Сейчас").frame(width: 150, alignment: .leading)
+                        Spacer()
+                    }
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 8)
 
-                Divider()
+                    Divider()
 
-                ForEach(interfaces) { item in
-                    interfaceRow(item)
-                    if item.id != interfaces.last?.id { Divider() }
+                    ForEach(interfaces) { item in
+                        interfaceRow(item)
+                        if item.id != interfaces.last?.id { Divider() }
+                    }
                 }
+                .frame(minWidth: 760, alignment: .leading)
             }
             .padding(.horizontal, 12)
             .inset()
         }
         .card()
+    }
+
+    private var assignmentHeader: some View {
+        CardHeader(icon: "point.3.connected.trianglepath.dotted",
+                   title: "Назначение на интерфейсы",
+                   subtitle: "«Перезапуск» поднимает туннель заново, когда связь пропала")
+    }
+
+    @ViewBuilder
+    private var assignmentActions: some View {
+        HStack(spacing: 8) {
+            if !changes.isEmpty {
+                Button("Отменить правки") { pending.removeAll() }
+                    .buttonStyle(SubtleButtonStyle())
+            }
+            Button(changes.isEmpty ? "Изменений нет" : "Применить (\(changes.count))") {
+                buildAssignPlan()
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(changes.isEmpty || session.progress != nil)
+        }
     }
 
     private func interfaceRow(_ item: KeeneticInterface) -> some View {
@@ -298,16 +389,33 @@ struct PingCheckView: View {
 
     // MARK: - Действия
 
-    private func buildSavePlan(_ profile: PingCheckProfile) {
+    @discardableResult
+    private func buildSavePlan(_ profile: PingCheckProfile, isNew: Bool) -> Bool {
+        var cleaned = profile
+        cleaned.name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            try PingCheckProfile.validate(profile)
+            try PingCheckProfile.validate(cleaned)
         } catch {
             alert = AlertPayload(title: "Профиль не сохранён",
                                  message: (error as? TransportError)?.message ?? error.localizedDescription)
-            return
+            return false
         }
-        let existing = profiles.first { $0.name == profile.name && !$0.isBuiltIn }
-        plan = PingCheckParser.planSave(profile, existing: existing)
+        let duplicate = profiles.first {
+            $0.name.caseInsensitiveCompare(cleaned.name) == .orderedSame
+        }
+        if isNew, let duplicate {
+            alert = AlertPayload(
+                title: "Такой профиль уже есть",
+                message: "Профиль «\(duplicate.name)» уже создан. Выбери другое имя или измени существующий.",
+                isError: false)
+            return false
+        }
+        let existing = isNew ? nil : profiles.first {
+            $0.name.caseInsensitiveCompare(cleaned.name) == .orderedSame && !$0.isBuiltIn
+        }
+        plan = PingCheckParser.planSave(cleaned, existing: existing)
+            .forRouter(session.router)
+        return true
     }
 
     private func buildAssignPlan() {
@@ -323,7 +431,7 @@ struct PingCheckView: View {
             pending.removeAll()
             return
         }
-        plan = merged
+        plan = merged.forRouter(session.router)
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {
@@ -428,7 +536,7 @@ struct PingCheckEditor: View {
             }
         }
         .padding(22)
-        .frame(width: 580)
+        .frame(minWidth: 460, idealWidth: 580, maxWidth: 580)
         .background(Palette.surface)
     }
 

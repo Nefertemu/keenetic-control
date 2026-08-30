@@ -71,6 +71,22 @@ struct RouterProfile: Identifiable, Codable, Hashable {
     /// Пароль, с которым реально идём на роутер.
     var resolvedPassword: String? { environmentPassword ?? password }
 
+    /// В веб-адресе не должно быть логина/пароля: пароль хранится отдельно в
+    /// Keychain, а URL попадает в профиль, журнал и резервные копии настроек.
+    var hasEmbeddedWebCredentials: Bool {
+        guard !webURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let components = webURLComponents(webURL)
+        else { return false }
+        return components.user != nil || components.password != nil
+    }
+
+    /// Убираем встроенные учётные данные перед сохранением профиля. Заодно
+    /// приводим URL к тому же виду, который фактически использует RCI.
+    mutating func removeEmbeddedWebCredentials() {
+        guard hasEmbeddedWebCredentials else { return }
+        webURL = normalizeWebURL(webURL)
+    }
+
     var effectiveWebURL: String {
         let trimmed = webURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return normalizeWebURL(trimmed) }
@@ -96,7 +112,7 @@ struct RouterProfile: Identifiable, Codable, Hashable {
     /// По чему судим, что профиль изменился настолько, что старое
     /// соединение к нему уже не относится.
     var connectionKey: String {
-        "\(transport.rawValue)|\(host)|\(port)|\(user)|\(webURL)"
+        "\(transport.rawValue)|\(host)|\(port)|\(user)|\(effectiveWebURL)"
     }
 
     /// Локальная панель живёт по http, KeenDNS и любой внешний адрес — по https.
@@ -112,17 +128,25 @@ struct RouterProfile: Identifiable, Codable, Hashable {
 
     /// Приводим адрес к виду «http://host:port/» — без /auth, /rci и прочих путей.
     private func normalizeWebURL(_ value: String) -> String {
+        guard var components = webURLComponents(value) else { return value }
+        components.user = nil
+        components.password = nil
+        components.path = "/"
+        components.query = nil
+        components.fragment = nil
+        return components.url?.absoluteString ?? value
+    }
+
+    /// URLComponents не распознаёт голый адрес как host, поэтому сначала
+    /// добавляем тот же scheme, который использовался ранее при нормализации.
+    private func webURLComponents(_ value: String) -> URLComponents? {
         var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.contains("://") {
             let bareHost = String(text.split(separator: "/").first ?? "")
                 .split(separator: ":").first.map(String.init) ?? text
             text = (RouterProfile.looksLocal(bareHost) ? "http://" : "https://") + text
         }
-        guard var components = URLComponents(string: text) else { return value }
-        components.path = "/"
-        components.query = nil
-        components.fragment = nil
-        return components.url?.absoluteString ?? value
+        return URLComponents(string: text)
     }
 }
 
@@ -221,7 +245,11 @@ final class Store: ObservableObject {
         if let data = try? Data(contentsOf: AppPaths.routersFile),
            let saved = try? decoder.decode([RouterProfile].self, from: data),
            !saved.isEmpty {
-            routers = saved
+            routers = saved.map { router in
+                var sanitized = router
+                sanitized.removeEmbeddedWebCredentials()
+                return sanitized
+            }
         } else {
             routers = Store.seedRouters
         }
@@ -251,13 +279,17 @@ final class Store: ObservableObject {
     }
 
     func add(_ router: RouterProfile) {
-        routers.append(router)
-        selectedRouterID = router.id
+        var sanitized = router
+        sanitized.removeEmbeddedWebCredentials()
+        routers.append(sanitized)
+        selectedRouterID = sanitized.id
     }
 
     func update(_ router: RouterProfile) {
-        guard let index = routers.firstIndex(where: { $0.id == router.id }) else { return }
-        routers[index] = router
+        var sanitized = router
+        sanitized.removeEmbeddedWebCredentials()
+        guard let index = routers.firstIndex(where: { $0.id == sanitized.id }) else { return }
+        routers[index] = sanitized
     }
 
     func remove(_ router: RouterProfile) {
@@ -278,7 +310,12 @@ final class Store: ObservableObject {
         guard !loading else { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? encoder.encode(routers).write(to: AppPaths.routersFile, options: .atomic)
+        let sanitized = routers.map { router in
+            var copy = router
+            copy.removeEmbeddedWebCredentials()
+            return copy
+        }
+        try? encoder.encode(sanitized).write(to: AppPaths.routersFile, options: .atomic)
     }
 
     func addSource(_ source: CustomSource) { customSources.append(source) }

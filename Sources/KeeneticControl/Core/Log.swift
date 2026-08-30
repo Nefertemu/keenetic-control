@@ -56,16 +56,22 @@ final class LogStore: ObservableObject {
         fileFormatter = DateFormatter()
         fileFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         try? FileManager.default.createDirectory(at: AppPaths.logs, withIntermediateDirectories: true)
+        redactExistingFile()
     }
 
     func append(_ level: LogLevel, _ text: String) {
-        let entry = LogEntry(date: Date(), level: level, text: text)
+        let entry = LogEntry(date: Date(), level: level, text: CLI.redactSecrets(text))
         entries.append(entry)
         if entries.count > limit { entries.removeFirst(entries.count - limit) }
         write(entry)
     }
 
-    func clear() { entries.removeAll() }
+    func clear() {
+        entries.removeAll()
+        // Кнопка «Очистить» должна убрать и полную копию на диске:
+        // иначе старые команды снова останутся в журнале после перезапуска.
+        try? Data().write(to: fileURL, options: .atomic)
+    }
 
     var plainText: String {
         entries.map { "[\($0.stamp)] \($0.level.rawValue.uppercased())  \($0.text)" }
@@ -84,6 +90,15 @@ final class LogStore: ObservableObject {
         } else {
             try? data.write(to: fileURL)
         }
+    }
+
+    /// В прошлых версиях WireGuard-команды записывались целиком. При первом
+    /// запуске новой версии заменяем их значения секретов прямо в старом логе.
+    private func redactExistingFile() {
+        guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
+        let redacted = CLI.redactSecrets(text)
+        guard redacted != text else { return }
+        try? redacted.write(to: fileURL, atomically: true, encoding: .utf8)
     }
 
     /// Без ротации файл журнала растёт бесконечно.

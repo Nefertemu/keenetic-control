@@ -121,11 +121,21 @@ struct ProgressInfo: Equatable {
     }
 }
 
-struct ApplyOutcome {
+struct ApplyOutcome: Identifiable {
+    let id = UUID()
     var applied: Bool
     var problems: [String] = []
     var backupURL: URL?
     var elapsed: TimeInterval = 0
+}
+
+/// Снимок конкретного подключения, с которым началась длинная операция.
+/// UUID сам по себе не достаточен: пользователь может отредактировать тот же
+/// профиль и направить его на другой роутер, пока операция ждёт сеть.
+struct RouterOperation: Equatable {
+    let routerID: UUID
+    let connectionKey: String
+    let generation: Int
 }
 
 /// Живое соединение с одним роутером. Переключение между роутерами их не
@@ -133,6 +143,9 @@ struct ApplyOutcome {
 /// подключения, так что долгое чтение одного не блокирует другой.
 @MainActor
 final class RouterSlot {
+    /// Последняя сохранённая версия профиля. Она нужна, чтобы продолжать
+    /// подключение и чтение уже неактивного роутера после переключения UI.
+    var profile: RouterProfile
     var transport: KeeneticTransport?
     var state: RouterState?
     var status: ConnectionStatus = .offline
@@ -147,9 +160,13 @@ final class RouterSlot {
     var connectTask: Task<KeeneticTransport, Error>?
     /// По чему судим, что профиль поменялся и соединение пора выбросить.
     var connectionKey: String
+    /// Меняется при отмене или изменении профиля. Запоздавшая задача
+    /// подключения не сможет положить старый транспорт обратно в слот.
+    var connectionGeneration = 0
     let queue: DispatchQueue
 
     init(profile: RouterProfile) {
+        self.profile = profile
         connectionKey = profile.connectionKey
         queue = DispatchQueue(
             label: "pro.netcraze.KeeneticControl.session.\(profile.id.uuidString)",
@@ -180,8 +197,12 @@ final class RouterSession: ObservableObject {
     }
     private var slots: [UUID: RouterSlot] = [:]
 
-    private var activeSlot: RouterSlot { slot(for: router) }
-    private var queue: DispatchQueue { activeSlot.queue }
+    /// Операция может завершаться уже после удаления её роутера из списка.
+    /// В таком случае ей нельзя занимать очередь текущего, совсем другого
+    /// роутера — у неё есть отдельная очередь для аккуратного завершения.
+    private static let orphanedOperationQueue = DispatchQueue(
+        label: "pro.netcraze.KeeneticControl.session.orphaned",
+        qos: .utility)
 
     init(router: RouterProfile) {
         self.router = router
@@ -189,15 +210,73 @@ final class RouterSession: ObservableObject {
     }
 
     private func slot(for profile: RouterProfile) -> RouterSlot {
-        if let existing = slots[profile.id] { return existing }
+        if let existing = slots[profile.id] {
+            existing.profile = profile
+            return existing
+        }
         let created = RouterSlot(profile: profile)
         slots[profile.id] = created
         return created
     }
 
+    private func isCurrentConnection(_ profile: RouterProfile, generation: Int) -> Bool {
+        guard let slot = slots[profile.id] else { return false }
+        return slot.connectionGeneration == generation && slot.connectionKey == profile.connectionKey
+    }
+
+    /// Зафиксировать подключение активного роутера для составной операции.
+    /// Все её следующие шаги должны использовать этот же адрес и поколение
+    /// сессии — иначе после редактирования профиля старые команды могли бы
+    /// уйти на новый адрес.
+    func beginOperation() -> RouterOperation {
+        let profile = router
+        guard let slot = slots[profile.id] else {
+            // Активный профиль уже удалили из Store, но UI ещё не успел
+            // переключиться на следующий. Не создаём для удалённого роутера
+            // новый слот, иначе случайное действие могло бы снова подключиться
+            // к нему.
+            return RouterOperation(routerID: profile.id, connectionKey: profile.connectionKey,
+                                   generation: Int.min)
+        }
+        return RouterOperation(routerID: profile.id, connectionKey: slot.connectionKey,
+                               generation: slot.connectionGeneration)
+    }
+
+    private func beginOperation(owner: UUID) throws -> RouterOperation {
+        guard let slot = slots[owner] else {
+            throw TransportError("Роутер был удалён во время операции.")
+        }
+        return RouterOperation(routerID: owner, connectionKey: slot.connectionKey,
+                               generation: slot.connectionGeneration)
+    }
+
+    /// Можно ли ещё безопасно продолжать именно эту операцию.
+    func isCurrent(_ operation: RouterOperation) -> Bool {
+        guard let slot = slots[operation.routerID] else { return false }
+        return slot.connectionGeneration == operation.generation
+            && slot.connectionKey == operation.connectionKey
+    }
+
+    private func requireCurrent(_ operation: RouterOperation) throws {
+        guard isCurrent(operation) else {
+            throw TransportError(
+                "Параметры подключения изменились во время операции.",
+                hint: "Результат старой операции отброшен. Повтори действие для обновлённого профиля.")
+        }
+    }
+
     /// Какие роутеры сейчас на связи — для отметок в списке выбора.
     func isConnected(_ id: UUID) -> Bool {
-        slots[id]?.status.isOnline ?? false
+        connectionStatus(for: id).isOnline
+    }
+
+    /// Состояние любого роутера, а не только выбранного в боковой панели.
+    func connectionStatus(for id: UUID) -> ConnectionStatus {
+        id == router.id ? status : (slots[id]?.status ?? .offline)
+    }
+
+    func activity(for id: UUID) -> String? {
+        id == router.id ? activity : slots[id]?.activity
     }
 
     /// Прочитанное состояние любого роутера из пула — для сравнения между собой.
@@ -238,7 +317,8 @@ final class RouterSession: ObservableObject {
     /// Занят ли конкретный роутер длинной операцией — чтобы кнопки
     /// блокировались только у него.
     func isBusy(_ id: UUID) -> Bool {
-        (id == router.id ? progress : slots[id]?.progress) != nil
+        connectionStatus(for: id).isBusy
+            || (id == router.id ? progress : slots[id]?.progress) != nil
     }
 
     /// Сменили адрес, порт или транспорт — старое соединение уже не про этот роутер.
@@ -253,6 +333,7 @@ final class RouterSession: ObservableObject {
         target.status = .offline
         target.progress = nil
         target.activity = nil
+        target.connectionGeneration &+= 1
         target.connectTask?.cancel()
         target.connectTask = nil
 
@@ -268,11 +349,43 @@ final class RouterSession: ObservableObject {
         stale?.abort()
     }
 
+    /// Профиль могли изменить в настройках, пока активен другой роутер.
+    /// Обновление активного окна тогда не вызовет switchTo, поэтому отдельно
+    /// инвалидируем слот неактивного роутера и его длинные операции.
+    func profileDidChange(_ profile: RouterProfile) {
+        guard slots[profile.id] != nil else { return }
+        dropIfProfileChanged(profile)
+    }
+
     /// Пароль поправили — снова можно пробовать.
     func clearAuthBlock(_ id: UUID) {
         guard slots[id]?.authRejected != nil else { return }
         slots[id]?.authRejected = nil
         if id == router.id, case .failed = status { status = .offline }
+    }
+
+    /// Учётные данные меняются отдельно от адреса профиля. Уже открытая
+    /// сессия держит старый пароль, поэтому закрываем её сразу: следующая
+    /// операция подключится именно с новым значением из связки ключей.
+    func credentialsDidChange(_ id: UUID) {
+        guard let slot = slots[id] else { return }
+        slot.authRejected = nil
+        slot.connectionGeneration &+= 1
+        let stale = slot.transport
+        slot.transport = nil
+        slot.connectTask?.cancel()
+        slot.connectTask = nil
+        slot.status = .offline
+        slot.activity = nil
+        slot.progress = nil
+
+        if id == router.id {
+            transport = nil
+            status = .offline
+            activity = nil
+            progress = nil
+        }
+        stale?.abort()
     }
 
     /// Почему подключение к роутеру заблокировано, если заблокировано.
@@ -281,21 +394,37 @@ final class RouterSession: ObservableObject {
     /// Роутер удалили из списка — его соединение и состояние больше не нужны.
     func forget(_ id: UUID) {
         guard let slot = slots.removeValue(forKey: id) else { return }
+        slot.connectionGeneration &+= 1
         slot.connectTask?.cancel()
         slot.transport?.abort()
         slot.transport = nil
         slot.state = nil
+        if id == router.id {
+            transport = nil
+            state = nil
+            progress = nil
+            activity = nil
+            status = .offline
+        }
     }
 
     /// Закрыть все живые соединения — при выходе из приложения.
     func disconnectAll() {
         for slot in slots.values {
+            slot.connectionGeneration &+= 1
             slot.connectTask?.cancel()
+            slot.connectTask = nil
             slot.transport?.abort()
             slot.transport = nil
+            slot.state = nil
+            slot.progress = nil
+            slot.activity = nil
             slot.status = .offline
         }
         transport = nil
+        state = nil
+        progress = nil
+        activity = nil
         status = .offline
     }
 
@@ -307,38 +436,73 @@ final class RouterSession: ObservableObject {
             transport = newValue
             status = newStatus
         } else if let slot = slots[owner] {
+            objectWillChange.send()
             slot.transport = newValue
             slot.status = newStatus
         }
     }
 
+    private func store(status newStatus: ConnectionStatus, owner: UUID) {
+        if owner == router.id {
+            status = newStatus
+        } else if let slot = slots[owner] {
+            objectWillChange.send()
+            slot.status = newStatus
+        }
+    }
+
     private func store(state newValue: RouterState, owner: UUID) {
-        if owner == router.id { state = newValue } else { slots[owner]?.state = newValue }
+        if owner == router.id {
+            state = newValue
+        } else if let slot = slots[owner] {
+            objectWillChange.send()
+            slot.state = newValue
+        }
     }
 
     private func clearActivity(owner: UUID) { store(activity: nil, owner: owner) }
 
     private func store(activity newValue: String?, owner: UUID) {
-        if owner == router.id { activity = newValue } else { slots[owner]?.activity = newValue }
+        if owner == router.id {
+            activity = newValue
+        } else if let slot = slots[owner] {
+            objectWillChange.send()
+            slot.activity = newValue
+        }
     }
 
     private func store(progress newValue: ProgressInfo?, owner: UUID) {
-        if owner == router.id { progress = newValue } else { slots[owner]?.progress = newValue }
+        if owner == router.id {
+            progress = newValue
+        } else if let slot = slots[owner] {
+            objectWillChange.send()
+            slot.progress = newValue
+        }
     }
 
     private func bump(progress done: Int, owner: UUID) {
-        if owner == router.id { progress?.done = done } else { slots[owner]?.progress?.done = done }
+        if owner == router.id {
+            progress?.done = done
+        } else if let slot = slots[owner] {
+            objectWillChange.send()
+            slot.progress?.done = done
+        }
     }
 
-    func connect() async throws {
-        if status.isOnline, transport != nil { return }
+    func connect() async throws { try await connect(to: router) }
 
-        let slot = activeSlot
+    /// Подключить конкретный роутер, не меняя выбранную вкладку. Раньше
+    /// connect() читал только активные свойства и после переключения не мог
+    /// продолжить составную операцию для прежнего роутера.
+    func connect(to profile: RouterProfile) async throws {
+        let slot = slot(for: profile)
+        dropIfProfileChanged(profile)
+        if slot.status.isOnline, slot.transport != nil { return }
 
         // Пароль уже отвергли. Каждая новая попытка — ещё одна отметка в
         // счётчике защиты роутера, а не шанс на успех.
         if let rejected = slot.authRejected {
-            status = .failed(rejected)
+            store(status: .failed(rejected), owner: profile.id)
             throw TransportError(rejected, isAuthFailure: true)
         }
 
@@ -348,18 +512,31 @@ final class RouterSession: ObservableObject {
             return
         }
 
-        status = .connecting
-        let profile = router
+        store(status: .connecting, owner: profile.id)
         let owner = profile.id
+        let generation = slot.connectionGeneration
 
         let task = Task { try await self.openTransport(profile: profile) }
         slot.connectTask = task
-        defer { slot.connectTask = nil; clearActivity(owner: owner) }
+        defer {
+            if isCurrentConnection(profile, generation: generation) {
+                slot.connectTask = nil
+                clearActivity(owner: owner)
+            }
+        }
 
         do {
             let opened = try await task.value
+            guard !task.isCancelled, isCurrentConnection(profile, generation: generation) else {
+                opened.abort()
+                throw CancellationError()
+            }
             store(transport: opened, status: .online(profile.transport), owner: owner)
         } catch {
+            // Пока задача ждала пароль или сеть, профиль могли изменить,
+            // удалить или отключить. Старый результат не должен портить
+            // статус нового подключения.
+            guard isCurrentConnection(profile, generation: generation) else { throw error }
             var message = describe(error)
             if (error as? TransportError)?.isAuthFailure == true {
                 message += "\n\nДальнейшие попытки заблокированы: у веб-панели Keenetic "
@@ -379,10 +556,12 @@ final class RouterSession: ObservableObject {
         // Связка ключей может показать системный запрос доступа и держать
         // вызов сколько угодно — на главном потоке это заморозило бы окно.
         let password = await Task.detached { profile.resolvedPassword }.value
+        try Task.checkCancellation()
         let attempts = 3
         var lastError: Error = TransportError("Не удалось подключиться.")
 
         for attempt in 1...attempts {
+            try Task.checkCancellation()
             store(activity: attempt == 1
                     ? "Подключаюсь к \(profile.endpoint)…"
                     : "Попытка \(attempt) из \(attempts): \(profile.endpoint)…",
@@ -394,7 +573,7 @@ final class RouterSession: ObservableObject {
 
             let started = Date()
             do {
-                try await watch(created, budget: 70) { try created.connect() }
+                try await watch(created, budget: 70, owner: profile.id) { try created.connect() }
                 let elapsed = Date().timeIntervalSince(started)
                 log(.ok, "Подключение к \(profile.name) за \(String(format: "%.1f", elapsed)) с"
                     + (attempt > 1 ? " (попытка \(attempt))" : ""))
@@ -409,7 +588,7 @@ final class RouterSession: ObservableObject {
                 // Пароль не подошёл — повторять бессмысленно и вредно.
                 if (error as? TransportError)?.isAuthFailure == true { throw error }
                 if attempt < attempts {
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    try await Task.sleep(nanoseconds: 1_500_000_000)
                 }
             }
         }
@@ -420,7 +599,7 @@ final class RouterSession: ObservableObject {
     /// Сторож: если операция залипла дольше отведённого, рвём транспорт.
     /// Иначе последовательная очередь встанет намертво и интерфейс замрёт
     /// на «Подключаюсь…» без единой записи в журнале.
-    private func watch<T>(_ transport: KeeneticTransport, budget: TimeInterval,
+    private func watch<T>(_ transport: KeeneticTransport, budget: TimeInterval, owner: UUID,
                           _ body: @escaping () throws -> T) async throws -> T {
         let watchdog = Task {
             try await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
@@ -428,41 +607,86 @@ final class RouterSession: ObservableObject {
             log(.warn, "Операция превысила \(Int(budget)) с — соединение оборвано.")
         }
         defer { watchdog.cancel() }
-        return try await background(body)
+        return try await withTaskCancellationHandler(operation: {
+            try await background(owner: owner, body)
+        }, onCancel: {
+            // `background` ждёт блокирующий SSH/HTTP-вызов. Отмена Swift-задачи
+            // сама его не прерывает, а abort() разбудит ожидание немедленно.
+            transport.abort()
+        })
     }
 
-    /// То же самое для текущего транспорта.
-    private func guarded<T>(budget: TimeInterval,
+    /// То же самое для транспорта конкретной операции.
+    private func guarded<T>(operation: RouterOperation, budget: TimeInterval,
+                            preserveConnectionOnFailure: Bool = false,
                             _ body: @escaping (KeeneticTransport) throws -> T) async throws -> T {
-        let owner = router.id
-        let active = try await session()
+        try requireCurrent(operation)
+        let active = try await session(operation: operation)
         do {
-            return try await watch(active, budget: budget) { try body(active) }
+            let result = try await watch(active, budget: budget, owner: operation.routerID) {
+                try body(active)
+            }
+            try requireCurrent(operation)
+            return result
         } catch {
-            // Транспорт мёртв — следующая операция поднимет новый.
-            let slot = slots[owner]
-            if transport === active || slot?.transport === active {
-                store(transport: nil, status: .failed(describe(error)), owner: owner)
+            // Для длинных операций транспорт мёртв — следующая операция
+            // поднимет новый. Короткая живая проверка интерфейса не должна
+            // ронять весь подключённый роутер из-за одного временного сбоя:
+            // она покажет ошибку только в своей карточке и попробует снова.
+            if !preserveConnectionOnFailure {
+                let slot = slots[operation.routerID]
+                if transport === active || slot?.transport === active {
+                    store(transport: nil, status: .failed(describe(error)), owner: operation.routerID)
+                }
             }
             throw error
         }
     }
 
-    func disconnect() async {
-        guard let transport else {
+    func disconnect() async { await disconnect(router.id) }
+
+    /// Отключить роутер из его строки, не переключая текущий экран.
+    func disconnect(_ owner: UUID) async {
+        guard let slot = slots[owner] else { return }
+        slot.connectionGeneration &+= 1
+        slot.connectTask?.cancel()
+        slot.connectTask = nil
+        let closing = slot.transport
+
+        if owner == router.id {
+            transport = nil
+            state = nil
             status = .offline
-            return
+            progress = nil
+            activity = nil
+        } else {
+            objectWillChange.send()
+            slot.transport = nil
+            slot.state = nil
+            slot.status = .offline
+            slot.progress = nil
+            slot.activity = nil
         }
-        self.transport = nil
-        state = nil
-        status = .offline
-        await background { transport.close() }
+        guard let closing else { return }
+        await background(owner: owner) { closing.close() }
     }
 
-    /// Все операции идут через это: гарантируем живое соединение.
-    private func session() async throws -> KeeneticTransport {
-        if transport == nil || !status.isOnline { try await connect() }
-        guard let transport else { throw TransportError("Нет соединения с роутером.") }
+    /// Все операции идут через это: гарантируем живое соединение ровно с тем
+    /// профилем, с которым началась операция.
+    private func session(operation: RouterOperation) async throws -> KeeneticTransport {
+        try requireCurrent(operation)
+        let owner = operation.routerID
+        if let slot = slots[owner], slot.status.isOnline, let transport = slot.transport {
+            return transport
+        }
+        guard let slot = slots[owner] else {
+            throw TransportError("Роутер был удалён во время операции.")
+        }
+        try await connect(to: slot.profile)
+        try requireCurrent(operation)
+        guard let slot = slots[owner], slot.status.isOnline, let transport = slot.transport else {
+            throw TransportError("Нет соединения с роутером.")
+        }
         return transport
     }
 
@@ -470,11 +694,41 @@ final class RouterSession: ObservableObject {
 
     @discardableResult
     func refresh() async throws -> RouterState {
-        let owner = router.id
+        try await refresh(operation: beginOperation())
+    }
+
+    /// Подключить и сразу прочитать конкретный роутер. Выбор в боковой
+    /// панели на результат не влияет: состояние сохранится в его слоте.
+    @discardableResult
+    func connectAndRefresh(_ profile: RouterProfile) async throws -> RouterState {
+        let target = slot(for: profile)
+        dropIfProfileChanged(profile)
+        let operation = RouterOperation(
+            routerID: profile.id,
+            connectionKey: target.connectionKey,
+            generation: target.connectionGeneration)
+        try await connect(to: profile)
+        return try await refresh(operation: operation)
+    }
+
+    /// Перечитать состояние конкретного роутера. Длинные составные операции
+    /// (например, безопасное обновление WireGuard) передают сюда владельца,
+    /// чтобы переключение боковой панели не подменило цель следующего шага.
+    @discardableResult
+    func refresh(owner: UUID) async throws -> RouterState {
+        try await refresh(operation: try beginOperation(owner: owner))
+    }
+
+    /// Вариант для составных операций: проверяет, что профиль не был
+    /// отредактирован между несколькими чтениями и командами.
+    @discardableResult
+    func refresh(operation: RouterOperation) async throws -> RouterState {
+        let owner = operation.routerID
+        try requireCurrent(operation)
         store(activity: "Читаю конфигурацию роутера…", owner: owner)
         defer { clearActivity(owner: owner) }
 
-        let fresh: RouterState = try await guarded(budget: 200) { transport in
+        let fresh: RouterState = try await guarded(operation: operation, budget: 200) { transport in
             let configText = try transport.fetchText("show running-config", timeout: 180)
 
             var statusInterfaces: [String: KeeneticInterface] = [:]
@@ -503,6 +757,7 @@ final class RouterSession: ObservableObject {
                 readAt: Date())
         }
 
+        try requireCurrent(operation)
         store(state: fresh, owner: owner)
         log(.ok, "Прочитано: \(Format.lists(fresh.groups.count)), "
             + "\(Format.domains(fresh.totalDomains)), "
@@ -510,34 +765,105 @@ final class RouterSession: ObservableObject {
         return fresh
     }
 
+    /// Обновить только живые данные одного интерфейса. Полный running-config
+    /// здесь не нужен: Ping-Check и статистика WireGuard уже отдаются в
+    /// `show interface`, поэтому экран может обновляться каждые несколько
+    /// секунд без сброса черновиков и без ручного «Обновить».
+    @discardableResult
+    func refreshLiveInterface(_ ident: String) async throws -> KeeneticInterface? {
+        let trimmed = ident.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.range(of: "^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+                           options: .regularExpression) != nil else {
+            throw TransportError("Некорректное имя интерфейса для проверки.")
+        }
+
+        let operation = beginOperation()
+        let owner = operation.routerID
+        guard let snapshot = readState(for: owner) else {
+            throw TransportError("Сначала прочитай конфигурацию роутера.")
+        }
+
+        let statuses: [String: KeeneticInterface] = try await guarded(
+            operation: operation, budget: 35, preserveConnectionOnFailure: true) { transport in
+            if let rci = transport as? RCITransport {
+                return RouterConfigParser.parseInterfaceStatus(
+                    json: RCITransport.interfaceStatusJSON(rci, logResult: false))
+            }
+            let text = try transport.run("show interface \(trimmed)", timeout: 25)
+            return RouterConfigParser.parseInterfaceStatus(text)
+        }
+        try requireCurrent(operation)
+
+        guard let incoming = statuses[trimmed]
+                ?? statuses.values.first(where: { $0.ident == trimmed }) else {
+            return nil
+        }
+
+        var updated = snapshot
+        var merged = updated.interfaces[trimmed] ?? KeeneticInterface(ident: trimmed)
+        if !incoming.descriptionText.isEmpty { merged.descriptionText = incoming.descriptionText }
+        if !incoming.type.isEmpty { merged.type = incoming.type }
+        if !incoming.link.isEmpty { merged.link = incoming.link }
+        if !incoming.connected.isEmpty { merged.connected = incoming.connected }
+        if !incoming.state.isEmpty { merged.state = incoming.state }
+        if !incoming.isGlobal.isEmpty { merged.isGlobal = incoming.isGlobal }
+        if !incoming.defaultGW.isEmpty { merged.defaultGW = incoming.defaultGW }
+        if !incoming.securityLevel.isEmpty { merged.securityLevel = incoming.securityLevel }
+        if incoming.pingCheckStatus != nil { merged.pingCheckStatus = incoming.pingCheckStatus }
+        // Пустой массив здесь значим: у интерфейса могли исчезнуть все пиры.
+        merged.peers = incoming.peers
+        merged.aliases.formUnion(incoming.aliases)
+        updated.interfaces[trimmed] = merged
+        store(state: updated, owner: owner)
+        return merged
+    }
+
     // MARK: - Применение плана
 
     func apply(plan: Plan, dryRun: Bool, saveConfig: Bool) async throws -> ApplyOutcome {
         guard !plan.isEmpty else { return ApplyOutcome(applied: true) }
-        let owner = router.id
+        let profile = router
+        let operation = beginOperation()
+        let owner = operation.routerID
 
+        if let plannedFor = plan.routerID, plannedFor != owner {
+            throw TransportError(
+                "План составлен для другого роутера.",
+                hint: "Вернись к роутеру, для которого был открыт план, и составь его заново.")
+        }
+        if let plannedConnection = plan.routerConnectionKey,
+           plannedConnection != profile.connectionKey {
+            throw TransportError(
+                "Параметры роутера изменились после составления плана.",
+                hint: "Составь план заново: старые команды не будут отправлены на новый адрес.")
+        }
         if dryRun {
             log(.info, "Предпросмотр «\(plan.title)»: \(Format.commands(plan.commands.count)), на роутер ничего не ушло.")
             return ApplyOutcome(applied: false)
         }
+        defer { clearActivity(owner: owner) }
 
-        let transport = try await session()
+        let transport = try await session(operation: operation)
         // Бэкап должен отражать то, что на роутере сейчас, а не час назад.
         let configText: String
-        if let current = state, !current.configText.isEmpty,
+        if let current = slots[owner]?.state, !current.configText.isEmpty,
            Date().timeIntervalSince(current.readAt) < 300 {
             configText = current.configText
         } else {
             store(activity: "Читаю конфигурацию перед изменением…", owner: owner)
-            configText = try await watch(transport, budget: 200) {
+            configText = try await watch(transport, budget: 200, owner: owner) {
                 try transport.fetchText("show running-config", timeout: 180)
             }
-            clearActivity(owner: owner)
         }
+        try requireCurrent(operation)
 
-        let backupURL = Backups.saveRunningConfig(
-            host: router.host, text: configText, keep: Store.shared.settings.keepBackups)
-        log(.info, "Резервная копия конфигурации: \(backupURL?.lastPathComponent ?? "не сохранена")")
+        guard let backupURL = Backups.saveRunningConfig(
+            host: profile.host, text: configText, keep: Store.shared.settings.keepBackups) else {
+            throw TransportError(
+                "Изменения отменены: не удалось создать защищённую резервную копию.",
+                hint: "Проверь доступ приложения к связке ключей и свободное место на диске.")
+        }
+        log(.info, "Защищённая резервная копия: \(backupURL.lastPathComponent)")
 
         let started = Date()
         let batchSize = max(1, Store.shared.settings.batchSize)
@@ -550,7 +876,8 @@ final class RouterSession: ObservableObject {
         log(.info, "\(plan.title): отправляю \(Format.commands(plan.commands.count)).")
 
         do {
-            try await execute(plan.commands, transport: transport, batchSize: batchSize, owner: owner)
+            try await execute(plan.commands, transport: transport, batchSize: batchSize,
+                              operation: operation)
         } catch {
             log(.error, "Выполнение остановлено: \(describe(error))")
             log(.warn, "Конфигурация НЕ сохранена. Часть команд могла примениться — проверь бэкап.")
@@ -559,10 +886,10 @@ final class RouterSession: ObservableObject {
 
         if saveConfig {
             store(activity: "Сохраняю конфигурацию роутера…", owner: owner)
-            let output = try await watch(transport, budget: 200) {
+            let output = try await watch(transport, budget: 200, owner: owner) {
                 try transport.run("system configuration save", timeout: 180)
             }
-            clearActivity(owner: owner)
+            try requireCurrent(operation)
             if CLI.failed(output) {
                 log(.error, "Не удалось сохранить конфигурацию: \(output)")
                 throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
@@ -571,8 +898,8 @@ final class RouterSession: ObservableObject {
         }
 
         store(activity: "Перечитываю конфигурацию для проверки…", owner: owner)
-        let problems = try await verify(plan: plan, transport: transport, limit: limit)
-        clearActivity(owner: owner)
+        let problems = try await verify(plan: plan, transport: transport, limit: limit,
+                                        operation: operation)
 
         let elapsed = Date().timeIntervalSince(started)
         if problems.isEmpty {
@@ -586,7 +913,8 @@ final class RouterSession: ObservableObject {
 
     /// Пакетная отправка: `include`-команды летят пачками, остальные по одной.
     private func execute(_ commands: [String], transport: KeeneticTransport,
-                         batchSize: Int, owner: UUID) async throws {
+                         batchSize: Int, operation: RouterOperation) async throws {
+        let owner = operation.routerID
         let bulk = try! NSRegularExpression(pattern: "^(?:no\\s+)?object-group\\s+fqdn\\s+\\S+\\s+include\\s+")
         func isBulk(_ command: String) -> Bool {
             bulk.firstMatch(in: command, range: NSRange(command.startIndex..., in: command)) != nil
@@ -596,6 +924,7 @@ final class RouterSession: ObservableObject {
         var done = 0
 
         while index < commands.count {
+            try requireCurrent(operation)
             var chunk: [String] = []
             if isBulk(commands[index]) {
                 while index + chunk.count < commands.count,
@@ -608,25 +937,30 @@ final class RouterSession: ObservableObject {
             }
 
             let batch = chunk
-            let output = try await watch(transport, budget: 150) { () -> String in
+            let output = try await watch(transport, budget: 150, owner: owner) { () -> String in
                 batch.count == 1
                     ? try transport.run(batch[0], timeout: 120)
                     : try transport.runBatch(batch, timeout: 120)
             }
+            try requireCurrent(operation)
 
             if CLI.failed(output) {
                 if batch.count > 1 {
                     log(.warn, "Ошибка внутри пачки — повторяю команды по одной…")
                     for command in batch {
-                        let single = try await watch(transport, budget: 150) {
+                        try requireCurrent(operation)
+                        let single = try await watch(transport, budget: 150, owner: owner) {
                             try transport.run(command, timeout: 120)
                         }
+                        try requireCurrent(operation)
                         if CLI.failed(single) {
-                            throw TransportError("Роутер отверг команду: \(command)", hint: single)
+                            throw TransportError("Роутер отверг команду: \(CLI.redactSecrets(command))",
+                                                 hint: CLI.redactSecrets(single))
                         }
                     }
                 } else {
-                    throw TransportError("Роутер отверг команду: \(batch[0])", hint: output)
+                    throw TransportError("Роутер отверг команду: \(CLI.redactSecrets(batch[0]))",
+                                         hint: CLI.redactSecrets(output))
                 }
             }
 
@@ -636,42 +970,16 @@ final class RouterSession: ObservableObject {
         }
     }
 
-    private func verify(plan: Plan, transport: KeeneticTransport, limit: Int) async throws -> [String] {
-        let owner = router.id
-        let configText = try await watch(transport, budget: 200) {
+    private func verify(plan: Plan, transport: KeeneticTransport, limit: Int,
+                        operation: RouterOperation) async throws -> [String] {
+        let owner = operation.routerID
+        try requireCurrent(operation)
+        let configText = try await watch(transport, budget: 200, owner: owner) {
             try transport.fetchText("show running-config", timeout: 180)
         }
+        try requireCurrent(operation)
         let groups = RouterConfigParser.parseFqdnGroups(configText)
-        var problems: [String] = []
-
-        for (ident, domains) in plan.adds {
-            let current = groups[ident]?.includes ?? []
-            let missing = domains.subtracting(current)
-            if !missing.isEmpty {
-                let example = missing.sorted().prefix(3).joined(separator: ", ")
-                problems.append("\(ident): не добавлено \(missing.count) (\(example)…)")
-            }
-        }
-        for (ident, domains) in plan.removes {
-            let remained = domains.intersection(groups[ident]?.includes ?? [])
-            if !remained.isEmpty { problems.append("\(ident): не удалено \(remained.count)") }
-        }
-        for target in plan.routeTargets {
-            guard let group = groups[target.group], group.isRouted(to: target.interface) else {
-                problems.append("\(target.group): маршрут на \(target.interface) не появился")
-                continue
-            }
-        }
-        for target in plan.unrouteTargets {
-            if let group = groups[target.group], group.isRouted(to: target.interface) {
-                problems.append("\(target.group): маршрут на \(target.interface) остался")
-            }
-        }
-        for ident in Set(plan.adds.keys).union(plan.removes.keys) {
-            if let group = groups[ident], group.includes.count > limit {
-                problems.append("\(ident): превышен лимит \(group.includes.count)/\(limit)")
-            }
-        }
+        let problems = PlanVerifier.problems(plan: plan, groups: groups, limit: limit)
 
         // Обновляем состояние из уже прочитанной конфигурации — лишний раз не ходим.
         let previous = owner == router.id ? state : slots[owner]?.state
@@ -694,9 +1002,28 @@ final class RouterSession: ObservableObject {
 
     @discardableResult
     func runCommands(_ commands: [String], title: String, saveConfig: Bool = true) async throws -> String {
+        try await runCommands(commands, title: title, saveConfig: saveConfig,
+                              operation: beginOperation())
+    }
+
+    /// Выполнить команды на уже выбранном владельце операции. Если владелец
+    /// больше не активен, но его соединение ещё живо, работа продолжается
+    /// именно на нём; к новому роутеру команды не переедут.
+    @discardableResult
+    func runCommands(_ commands: [String], title: String, saveConfig: Bool,
+                     owner: UUID) async throws -> String {
+        try await runCommands(commands, title: title, saveConfig: saveConfig,
+                              operation: try beginOperation(owner: owner))
+    }
+
+    /// Выполнить команды, не меняя цель при редактировании активного профиля.
+    @discardableResult
+    func runCommands(_ commands: [String], title: String, saveConfig: Bool,
+                     operation: RouterOperation) async throws -> String {
         guard !commands.isEmpty else { return "" }
-        let owner = router.id
-        let transport = try await session()
+        try requireCurrent(operation)
+        let owner = operation.routerID
+        let transport = try await session(operation: operation)
 
         store(progress: ProgressInfo(label: title, done: 0,
                                      total: commands.count + (saveConfig ? 1 : 0)), owner: owner)
@@ -704,21 +1031,25 @@ final class RouterSession: ObservableObject {
 
         var outputs: [String] = []
         for (index, command) in commands.enumerated() {
-            log(.cmd, command)
-            let output = try await watch(transport, budget: 150) {
+            try requireCurrent(operation)
+            log(.cmd, CLI.redactSecrets(command))
+            let output = try await watch(transport, budget: 150, owner: owner) {
                 try transport.run(command, timeout: 120)
             }
+            try requireCurrent(operation)
             if CLI.failed(output) {
-                throw TransportError("Роутер отверг команду: \(command)", hint: output)
+                throw TransportError("Роутер отверг команду: \(CLI.redactSecrets(command))",
+                                     hint: CLI.redactSecrets(output))
             }
-            if !output.isEmpty { outputs.append(output) }
+            if !output.isEmpty { outputs.append(CLI.redactSecrets(output)) }
             bump(progress: index + 1, owner: owner)
         }
 
         if saveConfig {
-            let output = try await watch(transport, budget: 200) {
+            let output = try await watch(transport, budget: 200, owner: owner) {
                 try transport.run("system configuration save", timeout: 180)
             }
+            try requireCurrent(operation)
             if CLI.failed(output) {
                 throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
             }
@@ -730,17 +1061,37 @@ final class RouterSession: ObservableObject {
     }
 
     func readConfigText() async throws -> String {
-        let transport = try await session()
-        return try await watch(transport, budget: 200) {
+        try await readConfigText(operation: beginOperation())
+    }
+
+    func readConfigText(owner: UUID) async throws -> String {
+        try await readConfigText(operation: try beginOperation(owner: owner))
+    }
+
+    func readConfigText(operation: RouterOperation) async throws -> String {
+        let transport = try await session(operation: operation)
+        let text = try await watch(transport, budget: 200, owner: operation.routerID) {
             try transport.fetchText("show running-config", timeout: 180)
         }
+        try requireCurrent(operation)
+        return text
     }
 
     func readStartupConfig() async throws -> String {
-        let transport = try await session()
-        return try await watch(transport, budget: 200) {
+        try await readStartupConfig(operation: beginOperation())
+    }
+
+    func readStartupConfig(owner: UUID) async throws -> String {
+        try await readStartupConfig(operation: try beginOperation(owner: owner))
+    }
+
+    func readStartupConfig(operation: RouterOperation) async throws -> String {
+        let transport = try await session(operation: operation)
+        let text = try await watch(transport, budget: 200, owner: operation.routerID) {
             try transport.fetchText("show startup-config", timeout: 180)
         }
+        try requireCurrent(operation)
+        return text
     }
 
     // MARK: - Загрузка списков доменов
@@ -750,7 +1101,9 @@ final class RouterSession: ObservableObject {
         let owner = router.id
         store(activity: "Загружаю «\(spec.title)»…", owner: owner)
         defer { clearActivity(owner: owner) }
-        return try await background { try SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh) }
+        return try await background(owner: owner) {
+            try SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh)
+        }
     }
 
     // MARK: - Инструменты
@@ -771,29 +1124,31 @@ final class RouterSession: ObservableObject {
     }
 
     /// Блокирующая работа уходит с главного потока, интерфейс остаётся живым.
-    func background<T>(_ body: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async {
+    private func background<T>(owner: UUID, _ body: @escaping () throws -> T) async throws -> T {
+        let targetQueue = slots[owner]?.queue ?? Self.orphanedOperationQueue
+        return try await withCheckedThrowingContinuation { continuation in
+            targetQueue.async {
                 do { continuation.resume(returning: try body()) }
                 catch { continuation.resume(throwing: error) }
             }
         }
     }
 
-    func background<T>(_ body: @escaping () -> T) async -> T {
-        await withCheckedContinuation { continuation in
-            queue.async { continuation.resume(returning: body()) }
+    private func background<T>(owner: UUID, _ body: @escaping () -> T) async -> T {
+        let targetQueue = slots[owner]?.queue ?? Self.orphanedOperationQueue
+        return await withCheckedContinuation { continuation in
+            targetQueue.async { continuation.resume(returning: body()) }
         }
     }
 
     nonisolated func describe(_ error: Error) -> String {
         if let transportError = error as? TransportError {
             if let hint = transportError.hint, !hint.isEmpty {
-                return transportError.message + "\n" + hint
+                return CLI.redactSecrets(transportError.message + "\n" + hint)
             }
-            return transportError.message
+            return CLI.redactSecrets(transportError.message)
         }
-        return error.localizedDescription
+        return CLI.redactSecrets(error.localizedDescription)
     }
 }
 
@@ -817,11 +1172,12 @@ enum Backups {
     static func saveRunningConfig(host: String, text: String, keep: Int) -> URL? {
         let safeHost = safeHost(host)
         let url = AppPaths.backups
-            .appendingPathComponent("\(safeHost)_\(Format.stamp())_running-config.txt")
+            .appendingPathComponent("\(safeHost)_\(Format.stamp())_running-config")
+            .appendingPathExtension(SecureBackup.pathExtension)
 
-        do { try text.write(to: url, atomically: true, encoding: .utf8) }
+        do { try SecureBackup.write(text, to: url) }
         catch {
-            log(.warn, "Не удалось сохранить резервную копию: \(error.localizedDescription)")
+            log(.error, "Не удалось зашифровать резервную копию: \(error.localizedDescription)")
             return nil
         }
 
@@ -832,11 +1188,51 @@ enum Backups {
     static func list() -> [URL] {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: AppPaths.backups, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        return files.filter { $0.pathExtension == "txt" }.sorted { left, right in
+        return files.filter {
+            $0.pathExtension == SecureBackup.pathExtension || $0.pathExtension == "txt"
+        }.sorted { left, right in
             let leftDate = (try? left.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let rightDate = (try? right.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return leftDate > rightDate
         }
+    }
+
+    static func read(_ url: URL) throws -> String { try SecureBackup.read(url) }
+
+    /// Старые версии оставляли running-config открытым текстом. Миграция
+    /// сначала пишет и перечитывает зашифрованный контейнер, и только после
+    /// успешной сверки удаляет исходный `.txt`; при любой ошибке старый файл
+    /// остаётся на месте.
+    @discardableResult
+    static func migrateLegacyBackups() -> (migrated: Int, failures: [String]) {
+        let running = list().filter { $0.pathExtension == "txt" && !host(of: $0).isEmpty }
+        let wireGuard = ((try? FileManager.default.contentsOfDirectory(
+            at: AppPaths.wireguard, includingPropertiesForKeys: nil)) ?? []).filter {
+                $0.pathExtension == "txt" && $0.deletingPathExtension().lastPathComponent
+                    .hasSuffix("_startup-config")
+            }
+        let legacy = running + wireGuard
+        var migrated = 0
+        var failures: [String] = []
+
+        for source in legacy {
+            do {
+                let text = try SecureBackup.read(source)
+                let target = source.deletingPathExtension()
+                    .appendingPathExtension(SecureBackup.pathExtension)
+                if !FileManager.default.fileExists(atPath: target.path) {
+                    try SecureBackup.write(text, to: target)
+                }
+                guard try SecureBackup.read(target) == text else {
+                    throw SecureBackupError.invalidContainer
+                }
+                try FileManager.default.removeItem(at: source)
+                migrated += 1
+            } catch {
+                failures.append("\(source.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        return (migrated, failures)
     }
 
     private static func prune(prefix: String, keep: Int) {

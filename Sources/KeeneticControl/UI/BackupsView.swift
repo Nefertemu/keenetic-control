@@ -15,12 +15,22 @@ struct BackupsView: View {
         var id: URL { url }
     }
 
+    /// Результат сверки привязан и к снимку, и к роутеру, с которого была
+    /// прочитана текущая конфигурация. Иначе при смене роутера между сверкой
+    /// и нажатием «вернуть» команды из A могли бы уйти в B.
+    private struct ComparisonResult: Identifiable {
+        let operation: RouterOperation
+        let snapshot: URL
+        let difference: Restore.Difference
+        var id: UUID { difference.id }
+    }
+
     @State private var files: [Snapshot] = []
     @State private var selection: URL?
     @State private var preview = ""
     @State private var loadingPreview = false
     @State private var onlyThisRouter = true
-    @State private var difference: Restore.Difference?
+    @State private var comparison: ComparisonResult?
     @State private var comparing = false
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
@@ -37,20 +47,40 @@ struct BackupsView: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 16) {
-            list
-                .frame(width: 340)
-            detail
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 16) {
+                list
+                    .frame(width: 340)
+                detail
+            }
+            .frame(minWidth: 720)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    list
+                        .frame(minHeight: 300, maxHeight: 380)
+                    detail
+                        .frame(minHeight: 420)
+                }
+            }
         }
         .padding(20)
         .onAppear(perform: reload)
-        .sheet(item: Binding(get: { difference.map(DiffBox.init) },
-                             set: { difference = $0?.value })) { box in
-            RestorePreview(difference: box.value, snapshot: selected?.url.lastPathComponent ?? "") {
-                difference = nil
-                plan = Restore.plan(box.value, chunkSize: Store.shared.settings.chunkSize,
+        .sheet(item: $comparison) { result in
+            RestorePreview(difference: result.difference, snapshot: result.snapshot.lastPathComponent) {
+                comparison = nil
+                guard session.isCurrent(result.operation),
+                      session.activeRouterID == result.operation.routerID else {
+                    alert = AlertPayload(
+                        title: "Роутер переключён",
+                        message: "Сверка относилась к другому роутеру. Выбери снимок и повтори её.",
+                        isError: false)
+                    return
+                }
+                plan = Restore.plan(result.difference, chunkSize: Store.shared.settings.chunkSize,
                                     title: "Возврат к копии")
-            } onCancel: { difference = nil }
+                    .forRouter(session.router)
+            } onCancel: { comparison = nil }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, applyTitle: "Вернуть как было") { dryRun in
@@ -66,6 +96,11 @@ struct BackupsView: View {
             // роутеру — под фильтром «только этот» он просто исчезал бы.
             if onlyThisRouter, let selection,
                !visible.contains(where: { $0.url == selection }) { clearSelection() }
+            if let comparison,
+               comparison.operation.routerID != session.activeRouterID
+                   || !session.isCurrent(comparison.operation) {
+                self.comparison = nil
+            }
         }
     }
 
@@ -163,33 +198,17 @@ struct BackupsView: View {
 
     private var detail: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "doc.plaintext",
-                           title: selected.map { $0.date.map(Format.humanDate) ?? $0.url.lastPathComponent }
-                             ?? "Содержимое копии",
-                           subtitle: selected.map { "running-config · \($0.host) · \($0.url.lastPathComponent)" }
-                             ?? "Выбери файл слева")
-                Spacer()
-                if selected != nil {
-                    Button {
-                        Task { await compare() }
-                    } label: {
-                        HStack(spacing: 6) {
-                            if comparing { ProgressView().controlSize(.small) }
-                            Text(comparing ? "Сверяю…" : "Сверить с роутером")
-                        }
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(comparing || session.progress != nil)
-                    .help("Показать, чем текущая конфигурация отличается от снимка, "
-                          + "и собрать план возврата")
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    detailHeader
+                    Spacer()
+                    detailActions
                 }
-                if !preview.isEmpty {
-                    Button("Копировать") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(preview, forType: .string)
-                    }
-                    .buttonStyle(SubtleButtonStyle())
+                .frame(minWidth: 560)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    detailHeader
+                    detailActions
                 }
             }
 
@@ -217,6 +236,41 @@ struct BackupsView: View {
         .card()
     }
 
+    private var detailHeader: some View {
+        CardHeader(icon: "doc.plaintext",
+                   title: selected.map { $0.date.map(Format.humanDate) ?? $0.url.lastPathComponent }
+                     ?? "Содержимое копии",
+                   subtitle: selected.map { "running-config · \($0.host) · \($0.url.lastPathComponent)" }
+                     ?? "Выбери файл слева")
+    }
+
+    @ViewBuilder
+    private var detailActions: some View {
+        HStack(spacing: 8) {
+            if selected != nil {
+                Button {
+                    Task { await compare() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if comparing { ProgressView().controlSize(.small) }
+                        Text(comparing ? "Сверяю…" : "Сверить с роутером")
+                    }
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(comparing || session.progress != nil)
+                .help("Показать, чем текущая конфигурация отличается от снимка, "
+                      + "и собрать план возврата")
+            }
+            if !preview.isEmpty {
+                Button("Копировать") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(preview, forType: .string)
+                }
+                .buttonStyle(SubtleButtonStyle())
+            }
+        }
+    }
+
     private func reload() {
         files = Backups.list().map { url in
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
@@ -241,7 +295,7 @@ struct BackupsView: View {
         loadingPreview = true
         Task {
             let text = await Task.detached {
-                (try? String(contentsOf: url, encoding: .utf8)) ?? "Файл не читается."
+                (try? Backups.read(url)) ?? "Файл не читается или не удалось расшифровать копию."
             }.value
             guard selection == url else { return }
             preview = text
@@ -252,14 +306,23 @@ struct BackupsView: View {
     /// Сверка снимка с тем, что на роутере сейчас.
     private func compare() async {
         guard let url = selection else { return }
+        let operation = session.beginOperation()
         comparing = true
         defer { comparing = false }
         do {
             let backup = try await Task.detached {
-                try String(contentsOf: url, encoding: .utf8)
+                try Backups.read(url)
             }.value
-            let current = try await session.readConfigText()
+            let current = try await session.readConfigText(operation: operation)
             let found = Restore.compare(backup: backup, current: current)
+            guard session.isCurrent(operation),
+                  session.activeRouterID == operation.routerID else {
+                alert = AlertPayload(
+                    title: "Роутер переключён",
+                    message: "Сверка относилась к другому роутеру и была отменена. Выбери снимок и повтори её.",
+                    isError: false)
+                return
+            }
             if found.isEmpty {
                 alert = AlertPayload(
                     title: "Расхождений нет",
@@ -268,7 +331,7 @@ struct BackupsView: View {
                     isError: false)
                 return
             }
-            difference = found
+            comparison = ComparisonResult(operation: operation, snapshot: url, difference: found)
         } catch {
             alert = AlertPayload(title: "Не удалось сверить", message: session.describe(error))
         }
@@ -285,23 +348,24 @@ struct BackupsView: View {
     }
 
     private func snapshot() async {
+        let operation = session.beginOperation()
+        let profile = session.router
         do {
-            let text = try await session.readConfigText()
-            let url = Backups.saveRunningConfig(host: session.router.host, text: text,
+            let text = try await session.readConfigText(operation: operation)
+            let url = Backups.saveRunningConfig(host: profile.host, text: text,
                                                 keep: Store.shared.settings.keepBackups)
-            log(.ok, "Снимок конфигурации: \(url?.lastPathComponent ?? "не сохранён")")
+            guard let url else {
+                throw TransportError(
+                    "Защищённая копия не создана.",
+                    hint: "Проверь доступ приложения к связке ключей и свободное место на диске.")
+            }
+            log(.ok, "Защищённая копия конфигурации: \(url.lastPathComponent)")
             reload()
-            if let url { select(url) }
+            if session.isCurrent(operation) { select(url) }
         } catch {
             alert = AlertPayload(title: "Не удалось снять копию", message: session.describe(error))
         }
     }
-}
-
-struct DiffBox: Identifiable {
-    let id = UUID()
-    let value: Restore.Difference
-    init(_ value: Restore.Difference) { self.value = value }
 }
 
 /// Что именно вернётся, до того как собран план команд.
@@ -321,8 +385,7 @@ struct RestorePreview: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 2),
-                              spacing: 12) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
                         MetricTile(value: String(difference.missingDomainCount),
                                    label: "Вернуть доменов", icon: "arrow.uturn.backward",
                                    tint: Palette.success)
@@ -372,23 +435,48 @@ struct RestorePreview: View {
 
             Divider()
 
-            HStack {
-                Button("Отмена", action: onCancel)
-                    .buttonStyle(SubtleButtonStyle())
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-                Text(difference.summary.joined(separator: " · "))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Button("Собрать план") { onBuild() }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .keyboardShortcut(.defaultAction)
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    cancelButton
+                    Spacer()
+                    summaryText
+                    buildButton
+                }
+                .frame(minWidth: 500)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    summaryText
+                    HStack {
+                        cancelButton
+                        Spacer()
+                        buildButton
+                    }
+                }
             }
             .padding(16)
         }
-        .frame(width: 760, height: 620)
+        .frame(minWidth: 520, idealWidth: 760, maxWidth: 760,
+               minHeight: 480, idealHeight: 620, maxHeight: 620)
         .background(Palette.surface)
+    }
+
+    private var cancelButton: some View {
+        Button("Отмена", action: onCancel)
+            .buttonStyle(SubtleButtonStyle())
+            .keyboardShortcut(.cancelAction)
+    }
+
+    private var buildButton: some View {
+        Button("Собрать план") { onBuild() }
+            .buttonStyle(PrimaryButtonStyle())
+            .keyboardShortcut(.defaultAction)
+    }
+
+    private var summaryText: some View {
+        Text(difference.summary.joined(separator: " · "))
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
     }
 
     @ViewBuilder

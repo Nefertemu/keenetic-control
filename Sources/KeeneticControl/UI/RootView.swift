@@ -92,6 +92,17 @@ struct RootView: View {
             AppDelegate.session = session
             AutoUpdater.shared.attach(session: session)
             if let router = store.selectedRouter { await session.switchTo(router) }
+
+            let migration = await Task.detached(priority: .utility) {
+                Backups.migrateLegacyBackups()
+            }.value
+            if migration.migrated > 0 {
+                log(.ok, "Старые резервные копии зашифрованы: \(migration.migrated).")
+            }
+            if !migration.failures.isEmpty {
+                log(.warn, "Не удалось зашифровать старые копии: "
+                    + migration.failures.joined(separator: "; "))
+            }
         }
     }
 
@@ -148,30 +159,9 @@ struct RootView: View {
                     .lineLimit(1)
 
                 Spacer(minLength: 2)
-
-                Menu {
-                    ForEach(store.routers) { router in
-                        Button {
-                            store.selectedRouterID = router.id
-                            Task { await session.switchTo(router) }
-                        } label: {
-                            // Связь при переключении не рвётся — показываем,
-                            // к кому уже подключены.
-                            Text(routerMenuTitle(router))
-                        }
-                    }
-                    Divider()
-                    Button("Управление роутерами…") { section = .routers }
-                } label: {
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("Сменить роутер")
             }
+
+            if store.routers.count > 1 { routerTabs }
 
             // Адрес занимает всю ширину карточки: рядом с иконкой ему тесно,
             // и он резался посередине.
@@ -191,7 +181,7 @@ struct RootView: View {
                 Spacer(minLength: 0)
 
                 Button {
-                    Task { await toggleConnection() }
+                    Task { await toggleConnection(session.router) }
                 } label: {
                     Image(systemName: session.status.isOnline ? "eject.circle" : "bolt.circle")
                         .font(.system(size: 16))
@@ -207,14 +197,78 @@ struct RootView: View {
         .inset(cornerRadius: 11)
     }
 
-    /// Подпись роутера в меню выбора: где мы сейчас, кто ещё на связи
-    /// и кто занят длинной операцией — она продолжается и после переключения.
-    private func routerMenuTitle(_ router: RouterProfile) -> String {
-        var suffix: [String] = []
-        if session.isBusy(router.id) { suffix.append("занят") }
-        else if session.isConnected(router.id) { suffix.append("на связи") }
-        let tail = suffix.isEmpty ? "" : " — " + suffix.joined(separator: ", ")
-        return (router.id == session.router.id ? "● " : "") + router.name + tail
+    /// Вертикальные вкладки вместо скрытого меню со стрелкой. Каждая вкладка
+    /// получает всю ширину карточки — имена роутеров не обрезаются справа,
+    /// как это происходило у горизонтального списка.
+    private var routerTabs: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 5) {
+                ForEach(store.routers) { router in
+                    let active = router.id == session.router.id
+                    let routerStatus = session.connectionStatus(for: router.id)
+                    HStack(spacing: 4) {
+                        Button {
+                            store.selectedRouterID = router.id
+                            Task { await session.switchTo(router) }
+                        } label: {
+                            HStack(spacing: 7) {
+                                Circle()
+                                    .fill(routerStatus.tint)
+                                    .frame(width: 6, height: 6)
+                                Text(router.name)
+                                    .font(.system(size: 11, weight: active ? .semibold : .medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                            .foregroundStyle(active ? Palette.accent : .primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        routerConnectionButton(router, status: routerStatus)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(active ? Palette.accent.opacity(0.14) : Color.primary.opacity(0.06)))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(active ? Palette.accent.opacity(0.45) : Palette.stroke, lineWidth: 1))
+                    .help(router.endpoint)
+                }
+            }
+            .padding(.vertical, 1)
+        }
+        .frame(maxHeight: min(CGFloat(store.routers.count * 34), 180))
+    }
+
+    private func routerConnectionButton(_ router: RouterProfile,
+                                        status: ConnectionStatus) -> some View {
+        Group {
+            if status.isBusy {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 20, height: 20)
+            } else {
+                Button {
+                    Task { await toggleConnection(router) }
+                } label: {
+                    Image(systemName: status.isOnline ? "eject.circle" : "bolt.circle")
+                        .font(.system(size: 14, weight: .medium))
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(status.isOnline ? Color.secondary : Palette.accent)
+                .help(status.isOnline
+                      ? "Отключить \(router.name)"
+                      : "Подключить и прочитать \(router.name)")
+                .accessibilityLabel(status.isOnline
+                                    ? "Отключить \(router.name)"
+                                    : "Подключить и прочитать \(router.name)")
+            }
+        }
+        .frame(width: 22, height: 22)
     }
 
     private var footer: some View {
@@ -256,7 +310,7 @@ struct RootView: View {
             Group {
                 switch section {
                 case .overview:      OverviewView(alert: $alert, section: $section)
-                case .wireguard:     WireGuardView(alert: $alert)
+                case .wireguard:     WireGuardView(alert: $alert, section: $section)
                 case .pingCheck:     PingCheckView(alert: $alert)
                 case .fqdn:          FqdnView(alert: $alert)
                 case .dnsRoutes:     DnsRoutesView(alert: $alert)
@@ -347,23 +401,25 @@ struct RootView: View {
         }
     }
 
-    private func toggleConnection() async {
-        if session.status.isOnline {
-            await session.disconnect()
+    private func toggleConnection(_ profile: RouterProfile) async {
+        let status = session.connectionStatus(for: profile.id)
+        if status.isOnline {
+            await session.disconnect(profile.id)
             return
         }
         do {
-            try await session.connect()
-            try await session.refresh()
+            _ = try await session.connectAndRefresh(profile)
         } catch {
             alert = AlertPayload(title: "Не удалось подключиться",
-                                 message: session.describe(error))
+                                 message: "\(profile.name): \(session.describe(error))")
         }
     }
 
     private func refresh() async {
-        do { try await session.refresh() }
+        let operation = session.beginOperation()
+        do { try await session.refresh(operation: operation) }
         catch {
+            guard session.activeRouterID == operation.routerID else { return }
             alert = AlertPayload(title: "Не удалось прочитать конфигурацию",
                                  message: session.describe(error))
         }

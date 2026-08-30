@@ -1,20 +1,63 @@
 import Foundation
 
+struct PlannedDnsRoute: Hashable {
+    var group: String
+    var interface: String
+    var auto: Bool
+    var reject: Bool
+
+    var assignment: DnsRouteAssignment {
+        DnsRouteAssignment(interface: interface, auto: auto, reject: reject)
+    }
+}
+
 /// План изменений: сначала считаем всё на берегу, показываем — и только потом
 /// отправляем на роутер. Один движок на импорт списков и на маршруты.
-struct Plan {
+struct Plan: Identifiable {
+    /// Стабильный идентификатор важен для SwiftUI: план показывается в sheet,
+    /// и новый UUID при каждой перерисовке заставлял бы окно пересоздаваться.
+    let id = UUID()
+    /// Роутер, по состоянию которого был составлен план. Чистые планировщики
+    /// этого не знают; экран привязывает план перед показом пользователю.
+    /// Это не даёт случайно применить команды к другому роутеру после
+    /// переключения в боковой панели.
+    var routerID: UUID?
+    /// Снимок параметров соединения на момент составления плана. Один и тот
+    /// же UUID можно отредактировать и направить на другой адрес, поэтому
+    /// одного routerID недостаточно: старый план нельзя отправлять в новый
+    /// профиль с тем же идентификатором.
+    var routerConnectionKey: String?
     var title: String
     var commands: [String] = []
     var adds: [String: Set<String>] = [:]
     var removes: [String: Set<String>] = [:]
     var createdGroups: [FqdnGroup] = []
-    var routeTargets: [(group: String, interface: String)] = []
+    /// Маршруты, которые должны существовать после применения, включая
+    /// точные значения `auto`/`reject`.
+    var routeTargets: [PlannedDnsRoute] = []
     var unrouteTargets: [(group: String, interface: String)] = []
+    /// Для планов резервирования одного наличия маршрутов недостаточно:
+    /// последовательность строк определяет приоритет интерфейсов. Здесь
+    /// хранится ожидаемая полная цепочка каждого изменяемого списка.
+    var exactRouteChains: [String: [DnsRouteAssignment]] = [:]
     var notes: [String] = []
 
     var addCount: Int { adds.values.reduce(0) { $0 + $1.count } }
     var removeCount: Int { removes.values.reduce(0) { $0 + $1.count } }
     var isEmpty: Bool { commands.isEmpty }
+
+    func forRouter(_ routerID: UUID) -> Plan {
+        var bound = self
+        bound.routerID = routerID
+        return bound
+    }
+
+    func forRouter(_ router: RouterProfile) -> Plan {
+        var bound = self
+        bound.routerID = router.id
+        bound.routerConnectionKey = router.connectionKey
+        return bound
+    }
 
     mutating func addDomain(_ group: String, _ domain: String, command: String) {
         adds[group, default: []].insert(domain)
@@ -35,6 +78,90 @@ struct Plan {
         if !routeTargets.isEmpty { parts.append("назначить \(Format.routes(routeTargets.count))") }
         if !unrouteTargets.isEmpty { parts.append("снять \(Format.routes(unrouteTargets.count))") }
         return parts
+    }
+}
+
+/// Проверка управляемой части конфигурации вынесена из сетевой сессии, чтобы
+/// одинаково строго проверять как реальный роутер, так и тестовые снимки.
+enum PlanVerifier {
+    static func problems(plan: Plan, groups: [String: FqdnGroup], limit: Int) -> [String] {
+        var problems: [String] = []
+
+        for (ident, domains) in plan.adds {
+            let current = groups[ident]?.includes ?? []
+            let missing = domains.subtracting(current)
+            if !missing.isEmpty {
+                let example = missing.sorted().prefix(3).joined(separator: ", ")
+                problems.append("\(ident): не добавлено \(missing.count) (\(example)…)")
+            }
+        }
+        for (ident, domains) in plan.removes {
+            let remained = domains.intersection(groups[ident]?.includes ?? [])
+            if !remained.isEmpty { problems.append("\(ident): не удалено \(remained.count)") }
+        }
+
+        // Обычное назначение не заменяет остальные маршруты списка, поэтому
+        // здесь требуем только точное наличие интерфейса и флагов.
+        for target in plan.routeTargets where plan.exactRouteChains[target.group] == nil {
+            guard let group = groups[target.group] else {
+                problems.append("\(target.group): список не найден после применения")
+                continue
+            }
+            let actualForInterface = group.routeAssignments.filter {
+                $0.interface == target.interface
+            }
+            guard actualForInterface == [target.assignment] else {
+                if let actual = actualForInterface.first {
+                    problems.append("\(target.group): маршрут на \(target.interface) появился "
+                                    + (actual == target.assignment && actualForInterface.count > 1
+                                       ? "дублируется (строк: \(actualForInterface.count))"
+                                       : "с другими флагами — ожидалось \(describe(target.assignment)), "
+                                         + "получено \(describe(actual))"))
+                } else {
+                    problems.append("\(target.group): маршрут на \(target.interface) не появился")
+                }
+                continue
+            }
+        }
+
+        // Failover-план сначала снимает все старые маршруты выбранного списка,
+        // поэтому результат обязан совпасть полностью: и порядок, и флаги,
+        // и отсутствие лишних строк.
+        for (ident, expected) in plan.exactRouteChains.sorted(by: { $0.key < $1.key }) {
+            let group = groups[ident]
+            let actual = group?.routeAssignments ?? []
+            if let group, actual.count != group.routeLines.count {
+                problems.append("\(ident): часть строк маршрутов не распознана, "
+                                + "цепочка небезопасна для проверки")
+            }
+            if actual != expected {
+                problems.append("\(ident): цепочка маршрутов не совпала — ожидалось "
+                                + describe(expected) + ", получено " + describe(actual))
+            }
+        }
+
+        for target in plan.unrouteTargets {
+            if let group = groups[target.group], group.isRouted(to: target.interface) {
+                problems.append("\(target.group): маршрут на \(target.interface) остался")
+            }
+        }
+        for ident in Set(plan.adds.keys).union(plan.removes.keys) {
+            if let group = groups[ident], group.includes.count > limit {
+                problems.append("\(ident): превышен лимит \(group.includes.count)/\(limit)")
+            }
+        }
+        return problems
+    }
+
+    private static func describe(_ assignment: DnsRouteAssignment) -> String {
+        var flags: [String] = []
+        if assignment.auto { flags.append("auto") }
+        if assignment.reject { flags.append("reject") }
+        return assignment.interface + (flags.isEmpty ? "" : " [" + flags.joined(separator: ", ") + "]")
+    }
+
+    private static func describe(_ assignments: [DnsRouteAssignment]) -> String {
+        assignments.isEmpty ? "ничего" : assignments.map(describe).joined(separator: " → ")
     }
 }
 
@@ -233,18 +360,88 @@ enum Planner {
                            auto: Bool, reject: Bool) -> Plan {
         var plan = Plan(title: "Маршруты → \(interface)")
         var skipped = 0
+        let wanted = DnsRouteAssignment(interface: interface, auto: auto, reject: reject)
 
         for group in groups {
-            if group.isRouted(to: interface) { skipped += 1; continue }
+            let actualForInterface = group.routeAssignments.filter { $0.interface == interface }
+            if actualForInterface == [wanted] { skipped += 1; continue }
+
+            // Тот же интерфейс с другими auto/reject — это не готовый
+            // маршрут. Снимаем все его варианты и дубли, чтобы после
+            // применения осталась ровно одна однозначная строка.
+            for line in group.routeLines where DnsRouteAssignment.parse(line)?.interface == interface {
+                plan.commands.append("no " + line)
+            }
             var command = "dns-proxy route object-group \(group.ident) \(interface)"
             if auto { command += " auto" }
             if reject { command += " reject" }
             plan.commands.append(command)
-            plan.routeTargets.append((group.ident, interface))
+            plan.routeTargets.append(PlannedDnsRoute(
+                group: group.ident, interface: interface, auto: auto, reject: reject))
         }
 
         if skipped > 0 {
             plan.notes.append("Уже назначено на \(interface), пропущено: \(Format.lists(skipped))")
+        }
+        return plan
+    }
+
+    /// Назначает списки на несколько интерфейсов в заданном порядке.
+    ///
+    /// Для резервирования важен не только набор интерфейсов, но и порядок
+    /// строк в конфигурации Keenetic. Поэтому для каждого выбранного списка
+    /// сначала убираем его старые маршруты, затем добавляем ровно заданную
+    /// последовательность. Маршруты других списков и интерфейсов не трогаем.
+    static func planRoutes(groups: [FqdnGroup], interfaces: [String],
+                           auto: Bool, reject: Bool) -> Plan {
+        var ordered: [String] = []
+        for interface in interfaces where !interface.isEmpty && !ordered.contains(interface) {
+            // Имена приходят из running-config, но всё равно не даём
+            // пробелам и управляющим символам превратиться в CLI-команду.
+            guard interface.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+                  !interface.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  !interface.contains(where: { "!;|$<>\"'\\".contains($0) }) else { continue }
+            ordered.append(interface)
+        }
+
+        var plan = Plan(title: ordered.isEmpty
+                        ? "Маршруты"
+                        : "Маршруты → " + ordered.joined(separator: " → "))
+        guard !ordered.isEmpty else { return plan }
+
+        var reordered = 0
+        for group in groups {
+            let oldRoutes = group.routedInterfaces
+            if !group.routeLines.isEmpty {
+                for line in group.routeLines {
+                    plan.commands.append("no " + line)
+                }
+                for interface in oldRoutes where !ordered.contains(interface) {
+                    plan.unrouteTargets.append((group.ident, interface))
+                }
+                reordered += 1
+            }
+
+            for interface in ordered {
+                var command = "dns-proxy route object-group \(group.ident) \(interface)"
+                if auto { command += " auto" }
+                if reject { command += " reject" }
+                plan.commands.append(command)
+                plan.routeTargets.append(PlannedDnsRoute(
+                    group: group.ident, interface: interface, auto: auto, reject: reject))
+            }
+            plan.exactRouteChains[group.ident] = ordered.map {
+                DnsRouteAssignment(interface: $0, auto: auto, reject: reject)
+            }
+        }
+
+        if reordered > 0 {
+            plan.notes.append("У выбранных списков заменяются старые маршруты и задаётся порядок: "
+                              + ordered.joined(separator: " → ") + ".")
+        }
+        if !groups.isEmpty {
+            plan.notes.append("Маршруты назначаются для \(Format.lists(groups.count)) "
+                              + "на каждый интерфейс в последовательности резервирования.")
         }
         return plan
     }
@@ -304,13 +501,13 @@ enum Planner {
 
         var createdLists = 0
         // Домен, лежащий в любом списке роутера, повторно не добавляем.
-        let anywhere = current.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
+        var anywhere = current.values.reduce(into: Set<String>()) { $0.formUnion($1.includes) }
 
         for name in referenceByName.keys.sorted() {
             let source = referenceByName[name] ?? []
-            let sourceDomains = source.reduce(into: [String]()) { result, group in
-                result.append(contentsOf: group.includes.sorted())
-            }
+            let sourceDomains = source.reduce(into: Set<String>()) { result, group in
+                result.formUnion(group.includes)
+            }.sorted()
 
             var targets = currentByName[name] ?? []
             let missing = sourceDomains.filter { !anywhere.contains($0) }
@@ -336,6 +533,10 @@ enum Planner {
                 plan.addDomain(chosen.ident, domain,
                                command: "object-group fqdn \(chosen.ident) include \(domain)")
                 plannedCounts[chosen.ident, default: 0] += 1
+                // Следующая группа эталона тоже может содержать этот домен.
+                // После планирования считаем его уже присутствующим, иначе
+                // получим две одинаковые команды или два разных списка.
+                anywhere.insert(domain)
             }
         }
 
@@ -363,6 +564,13 @@ enum Planner {
     /// Сначала все удаления, потом создание списков и добавления.
     static func merge(title: String, plans: [Plan]) -> Plan {
         var merged = Plan(title: title)
+        let owners = Set(plans.compactMap(\.routerID))
+        if owners.count == 1 { merged.routerID = owners.first }
+        let connectionKeys = Set(plans.compactMap(\.routerConnectionKey))
+        if owners.count == 1, connectionKeys.count == 1,
+           plans.allSatisfy({ $0.routerConnectionKey != nil }) {
+            merged.routerConnectionKey = connectionKeys.first
+        }
         var removals: [String] = []
         var additions: [String] = []
 
@@ -376,6 +584,9 @@ enum Planner {
             merged.createdGroups.append(contentsOf: plan.createdGroups)
             merged.routeTargets.append(contentsOf: plan.routeTargets)
             merged.unrouteTargets.append(contentsOf: plan.unrouteTargets)
+            for (group, chain) in plan.exactRouteChains {
+                merged.exactRouteChains[group] = chain
+            }
             merged.notes.append(contentsOf: plan.notes)
         }
 
@@ -385,5 +596,51 @@ enum Planner {
             merged.commands.append(command)
         }
         return merged
+    }
+}
+
+/// Планировщик небольших списков, которые удобнее ввести прямо в приложении
+/// (например, тестовый список `test`), чем заводить отдельным URL-источником.
+/// Такой список живёт на роутере как обычный object-group и дальше виден во
+/// вкладке «Маршруты списков» вместе со всеми загруженными источниками.
+enum ManualFqdnPlanner {
+    static func plan(ident rawIdent: String, description rawDescription: String,
+                     entriesText: String) throws -> Plan {
+        let ident = rawIdent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ident.range(of: "^[A-Za-z][A-Za-z0-9_-]{0,31}$", options: .regularExpression) != nil else {
+            throw TransportError("Имя списка должно начинаться с латинской буквы и содержать "
+                                 + "только латиницу, цифры, дефис или подчёркивание (до 32 символов).")
+        }
+
+        let description = rawDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !description.isEmpty else {
+            throw TransportError("Укажи описание списка.")
+        }
+        guard !description.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw TransportError("Описание списка не может содержать переводы строк или служебные символы.")
+        }
+
+        let parsed = Domains.parseList(entriesText)
+        guard !parsed.domains.isEmpty else {
+            throw TransportError("В списке нет ни одного корректного домена или IP-адреса.")
+        }
+        guard parsed.skipped.isEmpty else {
+            let examples = parsed.skipped.prefix(3).joined(separator: ", ")
+            throw TransportError("Не удалось распознать \(parsed.skipped.count) строк: \(examples)",
+                                 hint: "Исправь их или убери из списка — ничего не будет пропущено молча.")
+        }
+
+        var plan = Plan(title: "Создание списка «\(ident)»")
+        var group = FqdnGroup(ident: ident, descriptionText: description)
+        group.includes = Set(parsed.domains)
+        plan.createdGroups = [group]
+        plan.commands.append("object-group fqdn \(ident)")
+        plan.commands.append("object-group fqdn \(ident) description \(CLI.quote(description))")
+        for domain in parsed.domains {
+            plan.addDomain(ident, domain,
+                           command: "object-group fqdn \(ident) include \(domain)")
+        }
+        plan.notes.append("Список создаётся без маршрута. Назначь его во вкладке «Маршруты списков».")
+        return plan
     }
 }

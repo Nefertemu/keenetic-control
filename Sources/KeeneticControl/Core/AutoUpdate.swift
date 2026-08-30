@@ -72,6 +72,12 @@ final class AutoUpdater: ObservableObject {
         let store = Store.shared
         let chosen = store.settings.autoUpdateSources
         let sources = store.allSources.filter { chosen.isEmpty || chosen.contains($0.key) }
+        let conflicts = CustomSource.conflictingSourceTitles(store.allSources)
+        guard conflicts.isEmpty else {
+            lastMessage = "Сверка остановлена: источники спорят за один список."
+            log(.warn, lastMessage! + " " + conflicts.joined(separator: "; "))
+            return
+        }
         guard !sources.isEmpty else {
             lastMessage = "Не выбрано ни одного источника."
             return
@@ -86,15 +92,27 @@ final class AutoUpdater: ObservableObject {
             return
         }
 
-        let routerID = session.activeRouterID
-        let routerName = session.router.name
+        let operation = session.beginOperation()
+        let routerID = operation.routerID
+        let profile = session.router
+        let routerName = profile.name
         var plans: [Plan] = []
         var reserved = Set(state.groups.keys)
         var failures: [String] = []
 
         for spec in sources {
+            // Пока источник скачивался, человек мог выбрать другой роутер.
+            // Не продолжаем строить и тем более показывать устаревший план.
+            guard session.isCurrent(operation) else {
+                lastMessage = "Сверка отменена: выбран другой роутер."
+                return
+            }
             do {
                 let data = try await session.loadSource(spec, forceRefresh: true)
+                guard session.isCurrent(operation) else {
+                    lastMessage = "Сверка отменена: выбран другой роутер."
+                    return
+                }
                 plans.append(Planner.planImport(
                     groups: state.groups,
                     data: data,
@@ -106,11 +124,16 @@ final class AutoUpdater: ObservableObject {
             }
         }
 
+        guard session.isCurrent(operation) else {
+            lastMessage = "Сверка отменена: выбран другой роутер."
+            return
+        }
         lastCheck = Date()
         store.settings.lastAutoUpdate = lastCheck
 
         let merged = Planner.merge(title: "Обновление списков от \(Format.humanDate(Date()))",
                                    plans: plans)
+            .forRouter(profile)
 
         if !failures.isEmpty {
             log(.warn, "Сверка источников: не загрузились — " + failures.joined(separator: "; "))

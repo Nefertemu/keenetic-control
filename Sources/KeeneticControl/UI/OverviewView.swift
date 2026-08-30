@@ -14,9 +14,17 @@ struct OverviewView: View {
                 case .online:
                     if let state = session.state {
                         metrics(state)
-                        HStack(alignment: .top, spacing: 16) {
-                            interfaces(state)
-                            lists(state)
+                        ViewThatFits(in: .horizontal) {
+                            HStack(alignment: .top, spacing: 16) {
+                                interfaces(state)
+                                lists(state)
+                            }
+                            .frame(minWidth: 680)
+
+                            VStack(alignment: .leading, spacing: 16) {
+                                interfaces(state)
+                                lists(state)
+                            }
                         }
                     } else {
                         loading
@@ -80,22 +88,14 @@ struct OverviewView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(12)
                 .inset()
-            HStack {
-                if blocked {
-                    Button("Впиши пароль в настройках") { section = .routers }
-                        .buttonStyle(PrimaryButtonStyle())
-                    Button("Всё равно попробовать") {
-                        session.clearAuthBlock(session.router.id)
-                        Task { await connect() }
-                    }
-                    .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
-                    .help("Ещё одна неудачная попытка приближает отключение веб-панели "
-                          + "роутера для этого компьютера на 15 минут")
-                } else {
-                    Button("Повторить") { Task { await connect() } }
-                        .buttonStyle(PrimaryButtonStyle())
-                    Button("Настройки роутера") { section = .routers }
-                        .buttonStyle(SubtleButtonStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    failureActions
+                }
+                .frame(minWidth: 500, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    failureActions
                 }
             }
         }
@@ -106,14 +106,21 @@ struct OverviewView: View {
 
     private func metrics(_ state: RouterState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "wifi.router.fill", title: session.router.name,
-                           subtitle: "Прочитано \(Format.age(state.readAt)) · \(session.router.endpoint)")
-                Spacer()
-                StatusPill(text: session.status.title, tint: session.status.tint, icon: "bolt.fill")
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    metricsHeader(state)
+                    Spacer()
+                    StatusPill(text: session.status.title, tint: session.status.tint, icon: "bolt.fill")
+                }
+                .frame(minWidth: 560)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    metricsHeader(state)
+                    StatusPill(text: session.status.title, tint: session.status.tint, icon: "bolt.fill")
+                }
             }
 
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4), spacing: 12) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
                 MetricTile(value: String(state.groups.count), label: "Списков FQDN",
                            icon: "list.bullet.rectangle")
                 MetricTile(value: String(state.totalDomains), label: "Доменов в списках",
@@ -129,6 +136,11 @@ struct OverviewView: View {
             }
         }
         .card()
+    }
+
+    private func metricsHeader(_ state: RouterState) -> some View {
+        CardHeader(icon: "wifi.router.fill", title: session.router.name,
+                   subtitle: "Прочитано \(Format.age(state.readAt)) · \(session.router.endpoint)")
     }
 
     private func interfaces(_ state: RouterState) -> some View {
@@ -206,12 +218,20 @@ struct OverviewView: View {
 
     private func lists(_ state: RouterState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "list.bullet.rectangle", title: "Списки FQDN",
-                           subtitle: "\(Format.domains(state.totalDomains)) в \(Format.inLists(state.groups.count))")
-                Spacer()
-                Button("Все списки") { section = .dnsRoutes }
-                    .buttonStyle(SubtleButtonStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    listsHeader(state)
+                    Spacer()
+                    Button("Все списки") { section = .dnsRoutes }
+                        .buttonStyle(SubtleButtonStyle())
+                }
+                .frame(minWidth: 480)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    listsHeader(state)
+                    Button("Все списки") { section = .dnsRoutes }
+                        .buttonStyle(SubtleButtonStyle())
+                }
             }
 
             if state.groups.isEmpty {
@@ -240,6 +260,31 @@ struct OverviewView: View {
             }
         }
         .card()
+    }
+
+    private func listsHeader(_ state: RouterState) -> some View {
+        CardHeader(icon: "list.bullet.rectangle", title: "Списки FQDN",
+                   subtitle: "\(Format.domains(state.totalDomains)) в \(Format.inLists(state.groups.count))")
+    }
+
+    @ViewBuilder
+    private var failureActions: some View {
+        if session.authBlock(session.router.id) != nil {
+            Button("Впиши пароль в настройках") { section = .routers }
+                .buttonStyle(PrimaryButtonStyle())
+            Button("Всё равно попробовать") {
+                session.clearAuthBlock(session.router.id)
+                Task { await connect() }
+            }
+            .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
+            .help("Ещё одна неудачная попытка приближает отключение веб-панели "
+                  + "роутера для этого компьютера на 15 минут")
+        } else {
+            Button("Повторить") { Task { await connect() } }
+                .buttonStyle(PrimaryButtonStyle())
+            Button("Настройки роутера") { section = .routers }
+                .buttonStyle(SubtleButtonStyle())
+        }
     }
 
     /// Строка списка. Маршруты стоят под именем и занимают всю ширину
@@ -297,10 +342,14 @@ struct OverviewView: View {
     }
 
     private func connect() async {
+        let operation = session.beginOperation()
         do {
             try await session.connect()
-            try await session.refresh()
+            guard session.isCurrent(operation),
+                  session.activeRouterID == operation.routerID else { return }
+            try await session.refresh(operation: operation)
         } catch {
+            guard session.activeRouterID == operation.routerID else { return }
             alert = AlertPayload(title: "Не удалось подключиться", message: session.describe(error))
         }
     }

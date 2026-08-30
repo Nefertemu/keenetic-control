@@ -94,13 +94,20 @@ struct PingCheckProfile: Identifiable, Hashable {
         if profile.mode.usesURI {
             let uri = profile.uri.trimmingCharacters(in: .whitespaces)
             guard !uri.isEmpty else { throw TransportError("Для режима URI укажи адрес.") }
-            guard uri.hasPrefix("http://") || uri.hasPrefix("https://") else {
+            guard let components = URLComponents(string: uri),
+                  let scheme = components.scheme?.lowercased(),
+                  ["http", "https"].contains(scheme),
+                  components.host != nil,
+                  components.user == nil, components.password == nil else {
                 throw TransportError("Адрес должен начинаться с http:// или https://")
             }
+            try validateCLIValue(uri, label: "Адрес")
         } else {
-            guard !profile.host.trimmingCharacters(in: .whitespaces).isEmpty else {
+            let host = profile.host.trimmingCharacters(in: .whitespaces)
+            guard !host.isEmpty else {
                 throw TransportError("Укажи узел, который будет проверяться.")
             }
+            try validateCLIValue(host, label: "Узел")
         }
 
         if profile.mode.usesPort {
@@ -121,6 +128,22 @@ struct PingCheckProfile: Identifiable, Hashable {
         try inRange("Успехов до подъёма", profile.minSuccess, Limits.success)
         try inRange("Тайм-аут ответа", profile.timeout, Limits.timeout)
         try inRange("Интервал проверки", profile.updateInterval, Limits.updateInterval)
+    }
+
+    /// Значения попадают прямо в интерактивную CLI-команду. Перевод строки
+    /// превращался в дополнительную команду в SSH, а разделители команд —
+    /// в неожиданные аргументы даже без shell. URL-пунктуация вроде /, ?, &
+    /// разрешена, но управляющие символы и кавычки — нет.
+    private static func validateCLIValue(_ value: String, label: String) throws {
+        guard value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else {
+            throw TransportError("\(label) не должен содержать пробелы или переводы строк.")
+        }
+        let forbidden = CharacterSet(charactersIn: "\r\n;|$<>\"'\\")
+        guard value.rangeOfCharacter(from: forbidden) == nil else {
+            throw TransportError("\(label) содержит недопустимый служебный символ.")
+        }
     }
 }
 
@@ -238,10 +261,10 @@ extension PingCheckParser {
         commands.append("\(head) mode \(profile.mode.rawValue)")
 
         if profile.mode.usesURI {
-            commands.append("\(head) uri \(profile.uri)")
+            commands.append("\(head) uri \(profile.uri.trimmingCharacters(in: .whitespaces))")
             if let old = existing, !old.host.isEmpty { commands.append("\(head) no host") }
         } else {
-            commands.append("\(head) host \(profile.host)")
+            commands.append("\(head) host \(profile.host.trimmingCharacters(in: .whitespaces))")
             if let old = existing, !old.uri.isEmpty { commands.append("\(head) no uri") }
         }
 

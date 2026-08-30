@@ -94,8 +94,14 @@ struct WireGuardConfig {
         guard !config.interfaceValues.isEmpty else {
             throw TransportError("В файле нет секции [Interface].")
         }
-        guard !config.peers.isEmpty else {
-            throw TransportError("В файле нет ни одной секции [Peer].")
+        guard config.peers.count == 1 else {
+            if config.peers.isEmpty {
+                throw TransportError("В файле нет ни одной секции [Peer].")
+            }
+            throw TransportError(
+                "В файле \(config.peers.count) пиров, а безопасное обновление поддерживает ровно один.",
+                hint: "Не загружай такой файл частично: выбери отдельный .conf с одним [Peer] "
+                    + "или настрой интерфейс вручную в веб-панели.")
         }
         guard !config.privateKey.isEmpty else {
             throw TransportError("В [Interface] отсутствует PrivateKey.")
@@ -103,10 +109,11 @@ struct WireGuardConfig {
         guard !config.publicKey.isEmpty else {
             throw TransportError("В [Peer] отсутствует PublicKey.")
         }
-        if config.peers.count > 1 {
-            log(.warn, "В конфиге \(config.peers.count) пиров — безопасное обновление работает с первым.")
+        guard !config.allowedIPs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw TransportError(
+                "В [Peer] отсутствует AllowedIPs.",
+                hint: "Без маршрутов безопасное обновление могло бы отключить туннель после удаления старого пира.")
         }
-
         return config
     }
 }
@@ -122,6 +129,21 @@ enum WireGuardPlanner {
     static func stages(interface: String, config: WireGuardConfig) throws -> [Stage] {
         guard interface.range(of: "^Wireguard\\d+$", options: .regularExpression) != nil else {
             throw TransportError("Некорректное имя интерфейса: \(interface)")
+        }
+        guard config.peers.count == 1 else {
+            throw TransportError(
+                "Безопасное обновление WireGuard работает только с конфигом с одним [Peer].")
+        }
+        guard !config.allowedIPs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw TransportError("В конфиге WireGuard нет AllowedIPs.")
+        }
+        try validateKey(config.privateKey, label: "PrivateKey")
+        try validateKey(config.publicKey, label: "PublicKey")
+        if !config.presharedKey.isEmpty {
+            try validateKey(config.presharedKey, label: "PresharedKey")
+        }
+        if !config.endpoint.isEmpty {
+            try validateEndpoint(config.endpoint)
         }
         let key = CLI.quote(config.publicKey)
         var stages: [Stage] = []
@@ -212,6 +234,50 @@ enum WireGuardPlanner {
         return stages
     }
 
+    /// Ключи в конфиге должны оставаться одним CLI-аргументом. CLI.quote
+    /// экранирует кавычки, но перевод строки всё равно разделил бы команды
+    /// в SSH-терминале, поэтому отбрасываем любые неожиданные символы заранее.
+    private static func validateKey(_ value: String, label: String) throws {
+        guard !value.isEmpty else {
+            throw TransportError("\(label) содержит недопустимые символы.")
+        }
+        for byte in value.utf8 {
+            let asciiAlphaNumeric = (48...57).contains(byte)
+                || (65...90).contains(byte) || (97...122).contains(byte)
+            let extra = byte == 43 || byte == 47 || byte == 61 || byte == 95 || byte == 45
+            guard asciiAlphaNumeric || extra else {
+                throw TransportError("\(label) содержит недопустимые символы.")
+            }
+        }
+    }
+
+    private static func isDecimal(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        for scalar in value.unicodeScalars where !(48...57).contains(scalar.value) {
+            return false
+        }
+        return true
+    }
+
+    private static func hasControl(_ value: String) -> Bool {
+        value.unicodeScalars.contains { scalar in
+            scalar.value < 0x20 || scalar.value == 0x7F
+        }
+    }
+
+    private static func hasForbiddenEndpointCharacter(_ value: String) -> Bool {
+        value.contains { ";|$<>\"'\\!".contains($0) }
+    }
+
+    private static func validateEndpoint(_ value: String) throws {
+        guard value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              !hasControl(value),
+              !hasForbiddenEndpointCharacter(value)
+        else {
+            throw TransportError("Endpoint содержит недопустимые служебные символы.")
+        }
+    }
+
     /// Команды удаления старых пиров — выполняются только после проверки нового.
     static func removeOldPeers(interface: String, oldKeys: [String], newKey: String) -> [String] {
         oldKeys.filter { $0 != newKey }
@@ -220,13 +286,36 @@ enum WireGuardPlanner {
 
     static func bringUp(interface: String) -> [String] { ["interface \(interface) up"] }
 
+    /// Переименовать туннель в UI Keenetic — это его `description`, а не имя
+    /// `WireguardN` (идентификатор менять на лету прошивка не позволяет).
+    static func planRename(interface: String, current: String, desired: String) throws -> Plan {
+        guard interface.range(of: "^Wireguard\\d+$", options: .regularExpression) != nil else {
+            throw TransportError("Некорректное имя интерфейса: \(interface)")
+        }
+        let clean = desired.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw TransportError("Имя интерфейса не может содержать переводы строк или служебные символы.")
+        }
+        var plan = Plan(title: "Переименование \(interface)")
+        guard clean != current else { return plan }
+        if clean.isEmpty {
+            plan.commands = ["interface \(interface) no description"]
+            plan.notes.append("У интерфейса будет убрана подпись; техническое имя \(interface) останется.")
+        } else {
+            plan.commands = ["interface \(interface) description \(CLI.quote(clean))"]
+            plan.notes.append("Техническое имя \(interface) не меняется — изменяется только подпись в приложении и веб-панели.")
+        }
+        return plan
+    }
+
     private static func ascCommand(interface: String, config: WireGuardConfig) throws -> String {
         guard config.isAmnezia else { return "interface \(interface) no wireguard asc" }
 
         func number(_ name: String) throws -> String {
             let value = (config.interfaceValues[name.lowercased()] ?? "").trimmingCharacters(in: .whitespaces)
             guard !value.isEmpty else { throw TransportError("В AmneziaWG отсутствует параметр \(name).") }
-            guard Int(value) != nil else { throw TransportError("Некорректный \(name): \(value)") }
+            guard Int(value) != nil, isDecimal(value)
+            else { throw TransportError("Некорректный \(name): \(value)") }
             return value
         }
 
@@ -237,7 +326,7 @@ enum WireGuardPlanner {
             let value = (config.interfaceValues[name.lowercased()] ?? "")
                 .trimmingCharacters(in: .whitespaces)
                 .replacingOccurrences(of: " ", with: "")
-            guard !value.isEmpty else { throw TransportError("В AmneziaWG отсутствует параметр \(name).") }
+            guard isDecimal(value) else { throw TransportError("Некорректный \(name): \(value)") }
             headers.append(value)
         }
 
@@ -245,13 +334,23 @@ enum WireGuardPlanner {
 
         guard config.isAmnezia2 else { return command }
 
-        let s3 = (config.interfaceValues["s3"] ?? "0").trimmingCharacters(in: .whitespaces)
-        let s4 = (config.interfaceValues["s4"] ?? "0").trimmingCharacters(in: .whitespaces)
-        command += " \(s3.isEmpty ? "0" : s3) \(s4.isEmpty ? "0" : s4)"
+        func optionalNumber(_ name: String) throws -> String {
+            let value = (config.interfaceValues[name.lowercased()] ?? "")
+                .trimmingCharacters(in: .whitespaces)
+            guard value.isEmpty || isDecimal(value) else {
+                throw TransportError("Некорректный \(name): \(value)")
+            }
+            return value.isEmpty ? "0" : value
+        }
+
+        command += " \(try optionalNumber("S3")) \(try optionalNumber("S4"))"
 
         for name in ["I1", "I2", "I3", "I4", "I5"] {
             var value = (config.interfaceValues[name.lowercased()] ?? "").trimmingCharacters(in: .whitespaces)
             if value == "0" { value = "" }
+            guard !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+                throw TransportError("Параметр \(name) содержит перевод строки или служебный символ.")
+            }
             command += " " + CLI.quote(value)
         }
         return command
@@ -259,8 +358,9 @@ enum WireGuardPlanner {
 
     private static func splitPrefix(_ value: String) -> (String, String)? {
         let parts = value.split(separator: "/", maxSplits: 1)
-        if parts.count == 2, Int(parts[1]) != nil, IPTools.isIPv6(String(parts[0])) {
-            return (String(parts[0]), String(parts[1]))
+        if parts.count == 2, let prefix = Int(parts[1]), (0...128).contains(prefix),
+           IPTools.isIPv6(String(parts[0])) {
+            return (String(parts[0]), String(prefix))
         }
         if IPTools.isIPv6(value) { return (value, "128") }
         return nil

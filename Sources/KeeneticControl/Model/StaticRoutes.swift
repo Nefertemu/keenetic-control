@@ -13,6 +13,9 @@ struct StaticRoute: Identifiable, Hashable {
     var destination: String = ""
     /// Интерфейс или адрес шлюза.
     var via: String = ""
+    /// Приоритет маршрута. Его нельзя терять при импорте/откате: от метрики
+    /// зависит, какой из одинаковых маршрутов выберет роутер.
+    var metric: Int?
     var auto: Bool = true
     var reject: Bool = false
     var comment: String = ""
@@ -22,12 +25,14 @@ struct StaticRoute: Identifiable, Hashable {
     var id: String { rawLine.isEmpty ? command : rawLine }
 
     var searchText: String {
-        [destination, via, comment, family.title].joined(separator: " ").lowercased()
+        [destination, via, metric.map(String.init) ?? "", comment, family.title]
+            .joined(separator: " ").lowercased()
     }
 
     /// Команда добавления в терминах Keenetic CLI.
     var command: String {
         var text = "\(family.keyword) \(destinationCLI) \(via)"
+        if let metric { text += " metric \(metric)" }
         if auto { text += " auto" }
         if reject { text += " reject" }
         if !comment.isEmpty {
@@ -55,13 +60,20 @@ struct StaticRoute: Identifiable, Hashable {
         return IPTools.isIPv6(value) ? "\(value)/128" : value
     }
 
-    static func validate(family: Family, destination: String, via: String) throws {
+    static func validate(family: Family, destination: String, via: String,
+                         metric: Int? = nil, comment: String = "") throws {
         let destination = destination.trimmingCharacters(in: .whitespaces)
         let via = via.trimmingCharacters(in: .whitespaces)
 
         guard !destination.isEmpty else { throw TransportError("Укажи сеть или узел назначения.") }
         guard !via.isEmpty else { throw TransportError("Укажи интерфейс или шлюз.") }
-        guard !via.contains("!"), !via.contains("\n") else { throw TransportError("Некорректный интерфейс или шлюз.") }
+        guard isSingleCLIToken(via) else {
+            throw TransportError("Интерфейс или шлюз должен быть одним словом без служебных символов.")
+        }
+        guard !containsControl(comment) else {
+            throw TransportError("Комментарий не может содержать перевод строки или служебные символы.")
+        }
+        if let metric, metric < 0 { throw TransportError("Метрика не может быть отрицательной.") }
         if destination.lowercased() == "default" { return }
 
         if family == .ipv4 {
@@ -83,6 +95,17 @@ struct StaticRoute: Identifiable, Hashable {
                 throw TransportError("Некорректный IPv6: \(destination)")
             }
         }
+    }
+
+    private static func isSingleCLIToken(_ value: String) -> Bool {
+        guard value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              !containsControl(value)
+        else { return false }
+        return !value.contains(where: { "!;\"'\\".contains($0) })
+    }
+
+    private static func containsControl(_ value: String) -> Bool {
+        value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
     }
 }
 
@@ -142,6 +165,8 @@ enum StaticRouteParser {
 
         // Необязательная метрика.
         if tokens.count >= 2, tokens[tokens.count - 2].lowercased() == "metric" {
+            guard let value = Int(tokens[tokens.count - 1]), value >= 0 else { return nil }
+            route.metric = value
             tokens.removeLast(2)
         }
 
@@ -162,6 +187,11 @@ enum StaticRouteParser {
 
         route.via = tokens.joined(separator: " ")
         guard !route.via.isEmpty else { return nil }
+        guard (try? StaticRoute.validate(family: route.family,
+                                         destination: route.destination,
+                                         via: route.via,
+                                         metric: route.metric,
+                                         comment: route.comment)) != nil else { return nil }
         return route
     }
 
@@ -233,7 +263,13 @@ enum StaticRouteParser {
                 index += 2
                 continue
             }
-            if token == "metric" || token == "if" { index += 2; continue }
+            if token == "metric", index + 1 < tokens.count {
+                guard let metric = Int(tokens[index + 1]), metric >= 0 else { return nil }
+                route.metric = metric
+                index += 2
+                continue
+            }
+            if token == "if" { index += 2; continue }
             if token == "-p" { index += 1; continue }
             if route.via.isEmpty { route.via = tokens[index] }
             index += 1
@@ -244,6 +280,9 @@ enum StaticRouteParser {
         }
 
         guard !route.via.isEmpty else { return nil }
+        guard (try? StaticRoute.validate(family: route.family, destination: route.destination,
+                                         via: route.via, metric: route.metric,
+                                         comment: route.comment)) != nil else { return nil }
         return route
     }
 
@@ -279,6 +318,7 @@ enum StaticRouteParser {
             }
 
             var line = "route -p add \(address) mask \(mask) \(route.via)"
+            if let metric = route.metric { line += " metric \(metric)" }
             if !route.comment.isEmpty { line += "  rem \(route.comment)" }
             lines.append(line)
         }

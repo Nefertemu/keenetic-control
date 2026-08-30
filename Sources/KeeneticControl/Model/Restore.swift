@@ -9,7 +9,10 @@ import Foundation
 enum Restore {
 
     /// Чем текущая конфигурация отличается от снимка.
-    struct Difference {
+    struct Difference: Identifiable {
+        /// Сверка показывается в sheet. Идентификатор должен переживать
+        /// перерисовку, иначе SwiftUI воспринимает тот же результат как новый.
+        let id = UUID()
         /// Домены, появившиеся после снимка, — их надо убрать.
         var extraDomains: [String: Set<String>] = [:]
         /// Домены, пропавшие после снимка, — их надо вернуть.

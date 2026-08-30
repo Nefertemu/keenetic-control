@@ -110,32 +110,67 @@ struct CompareView: View {
 
     private func picker(_ comparison: Comparison) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "arrow.left.arrow.right", title: "Сравнение роутеров",
-                           subtitle: "Что есть у эталонного, но отсутствует на активном")
-                Spacer()
-                Picker("", selection: Binding(
-                    get: { reference?.id ?? candidates.first?.id },
-                    set: { referenceID = $0 })) {
-                    ForEach(candidates) { Text($0.name).tag(Optional($0.id)) }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    comparisonHeader
+                    Spacer()
+                    referencePicker
                 }
-                .labelsHidden()
-                .frame(width: 190)
+                .frame(minWidth: 560)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    comparisonHeader
+                    referencePicker
+                }
             }
 
-            HStack(spacing: 10) {
-                side(name: comparison.reference.name, role: "эталон",
-                     lists: comparison.theirs.groups.count,
-                     domains: comparison.theirs.totalDomains, tint: Palette.accent)
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                side(name: session.router.name, role: "активный",
-                     lists: comparison.ours.groups.count,
-                     domains: comparison.ours.totalDomains, tint: Palette.success)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    referenceSide(comparison)
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    activeSide(comparison)
+                }
+                .frame(minWidth: 520)
+
+                VStack(spacing: 8) {
+                    referenceSide(comparison)
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    activeSide(comparison)
+                }
             }
         }
         .card()
+    }
+
+    private var comparisonHeader: some View {
+        CardHeader(icon: "arrow.left.arrow.right", title: "Сравнение роутеров",
+                   subtitle: "Что есть у эталонного, но отсутствует на активном")
+    }
+
+    private var referencePicker: some View {
+        Picker("", selection: Binding(
+            get: { reference?.id ?? candidates.first?.id },
+            set: { referenceID = $0 })) {
+            ForEach(candidates) { Text($0.name).tag(Optional($0.id)) }
+        }
+        .labelsHidden()
+        .frame(minWidth: 160, idealWidth: 190, maxWidth: 230)
+    }
+
+    private func referenceSide(_ comparison: Comparison) -> some View {
+        side(name: comparison.reference.name, role: "эталон",
+             lists: comparison.theirs.groups.count,
+             domains: comparison.theirs.totalDomains, tint: Palette.accent)
+    }
+
+    private func activeSide(_ comparison: Comparison) -> some View {
+        side(name: session.router.name, role: "активный",
+             lists: comparison.ours.groups.count,
+             domains: comparison.ours.totalDomains, tint: Palette.success)
     }
 
     private func side(name: String, role: String, lists: Int, domains: Int, tint: Color) -> some View {
@@ -154,7 +189,7 @@ struct CompareView: View {
 
     private func summary(_ comparison: Comparison) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
                 MetricTile(value: String(comparison.missingHere.count),
                            label: "Нет на активном", icon: "arrow.down.circle",
                            tint: comparison.missingHere.isEmpty ? Palette.success : Palette.warning)
@@ -171,28 +206,61 @@ struct CompareView: View {
                         .font(.system(size: 12))
                 }
             } else {
-                HStack(spacing: 10) {
-                    Button("Перенести недостающее сюда") { buildPlan(comparison) }
-                        .buttonStyle(PrimaryButtonStyle())
-                        .disabled(session.progress != nil)
-                    Text("Домены добавятся в списки с тем же описанием. "
-                         + "Ничего не удаляется.")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) {
+                        transferButton(comparison)
+                        transferExplanation
+                    }
+                    .frame(minWidth: 520)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        transferButton(comparison)
+                        transferExplanation
+                    }
                 }
             }
         }
         .card()
     }
 
+    private func transferButton(_ comparison: Comparison) -> some View {
+        Button("Перенести недостающее сюда") { buildPlan(comparison) }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(session.progress != nil)
+    }
+
+    private var transferExplanation: some View {
+        Text("Домены добавятся в списки с тем же описанием. Ничего не удаляется.")
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
     private func details(_ comparison: Comparison) -> some View {
-        HStack(alignment: .top, spacing: 16) {
-            domainList(title: "Нет на «\(session.router.name)»",
-                       icon: "arrow.down.circle", tint: Palette.warning,
-                       domains: comparison.missingHere)
-            domainList(title: "Только на «\(session.router.name)»",
-                       icon: "arrow.up.circle", tint: Palette.accent,
-                       domains: comparison.extraHere)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 16) {
+                missingList(comparison)
+                extraList(comparison)
+            }
+            .frame(minWidth: 640)
+
+            VStack(alignment: .leading, spacing: 16) {
+                missingList(comparison)
+                extraList(comparison)
+            }
         }
+    }
+
+    private func missingList(_ comparison: Comparison) -> some View {
+        domainList(title: "Нет на «\(session.router.name)»",
+                   icon: "arrow.down.circle", tint: Palette.warning,
+                   domains: comparison.missingHere)
+    }
+
+    private func extraList(_ comparison: Comparison) -> some View {
+        domainList(title: "Только на «\(session.router.name)»",
+                   icon: "arrow.up.circle", tint: Palette.accent,
+                   domains: comparison.extraHere)
     }
 
     private func domainList(title: String, icon: String, tint: Color, domains: [String]) -> some View {
@@ -243,7 +311,7 @@ struct CompareView: View {
                                  isError: false)
             return
         }
-        plan = built
+        plan = built.forRouter(session.router)
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {

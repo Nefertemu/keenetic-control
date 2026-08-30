@@ -20,24 +20,45 @@ enum WireGuardService {
     static func safeUpdate(session: RouterSession,
                            interface: String,
                            config: WireGuardConfig) async throws -> WireGuardUpdateResult {
+        guard config.peers.count == 1 else {
+            throw TransportError(
+                "Безопасное обновление WireGuard работает только с конфигом с одним [Peer].")
+        }
         var result = WireGuardUpdateResult(interface: interface)
         // Обновление длинное: если за это время переключат роутер, подпись
         // о ходе работы должна остаться у своего.
-        let owner = session.activeRouterID
+        let operation = session.beginOperation()
+        let owner = operation.routerID
+        let router = session.router
 
         // --- Снимок «до» -------------------------------------------------
-        session.setActivity("Снимаю резервную копию перед обновлением…", owner: owner)
-        let configBefore = try await session.readConfigText()
-        result.backupURL = Backups.saveRunningConfig(
-            host: session.router.host, text: configBefore,
-            keep: Store.shared.settings.keepBackups)
+        let configBefore: String
+        do {
+            session.setActivity("Снимаю резервную копию перед обновлением…", owner: owner)
+            defer { session.setActivity(nil, owner: owner) }
+            configBefore = try await session.readConfigText(operation: operation)
+            guard let protectedBackup = Backups.saveRunningConfig(
+                host: router.host, text: configBefore,
+                keep: Store.shared.settings.keepBackups) else {
+                throw TransportError(
+                    "Обновление отменено: защищённая резервная копия не создана.",
+                    hint: "Проверь доступ приложения к связке ключей и свободное место на диске.")
+            }
+            result.backupURL = protectedBackup
 
-        if let startup = try? await session.readStartupConfig() {
-            let url = AppPaths.wireguard.appendingPathComponent(
-                "\(interface)_\(Format.stamp())_startup-config.txt")
-            try? startup.write(to: url, atomically: true, encoding: .utf8)
+            if let startup = try? await session.readStartupConfig(operation: operation) {
+                let url = AppPaths.wireguard.appendingPathComponent(
+                    "\(interface)_\(Format.stamp())_startup-config")
+                    .appendingPathExtension(SecureBackup.pathExtension)
+                do {
+                    try SecureBackup.write(startup, to: url)
+                } catch {
+                    throw TransportError(
+                        "Обновление отменено: startup-config не удалось зашифровать.",
+                        hint: error.localizedDescription)
+                }
+            }
         }
-        session.setActivity(nil, owner: owner)
 
         let stateBefore = WireGuardState.parse(config: configBefore, interface: interface)
         result.routesBefore = routeCount(configBefore)
@@ -47,7 +68,7 @@ enum WireGuardService {
                 "На интерфейсе \(interface) больше двух пиров — автоматическое обновление остановлено.",
                 hint: "Разберись с лишними пирами в веб-панели и попробуй снова.")
         }
-        guard WireGuardVault.hasBaseline(router: session.router, interface: interface) else {
+        guard WireGuardVault.hasBaseline(router: router, interface: interface) else {
             throw TransportError(
                 "Не задана rollback-база для \(interface).",
                 hint: "Загрузи ТЕКУЩИЙ рабочий .conf и нажми «Сделать rollback-базой» — "
@@ -63,10 +84,10 @@ enum WireGuardService {
             // --- Фаза 1: гасим интерфейс и готовим нового пира без AllowedIPs.
             try await session.runCommands(
                 stages[0].commands + stages[1].commands,
-                title: "WireGuard: подготовка пира", saveConfig: false)
+                title: "WireGuard: подготовка пира", saveConfig: false, operation: operation)
 
             let afterStage = WireGuardState.parse(
-                config: try await session.readConfigText(), interface: interface)
+                config: try await session.readConfigText(operation: operation), interface: interface)
 
             for oldKey in stateBefore.peerKeys where oldKey != newKey {
                 guard afterStage.peerKeys.contains(oldKey) else {
@@ -81,17 +102,19 @@ enum WireGuardService {
 
             // --- Фаза 2: адреса, обфускация, приватный ключ, AllowedIPs.
             let rest = stages.dropFirst(2).flatMap(\.commands)
-            try await session.runCommands(rest, title: "WireGuard: применение конфига", saveConfig: false)
+            try await session.runCommands(rest, title: "WireGuard: применение конфига",
+                                          saveConfig: false, operation: operation)
 
             // --- Фаза 3: старый пир прочь — только теперь.
             let removals = WireGuardPlanner.removeOldPeers(
                 interface: interface, oldKeys: stateBefore.peerKeys, newKey: newKey)
             if !removals.isEmpty {
-                try await session.runCommands(removals, title: "WireGuard: удаление старого пира", saveConfig: false)
+                try await session.runCommands(removals, title: "WireGuard: удаление старого пира",
+                                              saveConfig: false, operation: operation)
             }
 
             // --- Финальная проверка набора пиров.
-            let configAfterPeers = try await session.readConfigText()
+            let configAfterPeers = try await session.readConfigText(operation: operation)
             let peersAfter = WireGuardState.parse(config: configAfterPeers, interface: interface).peerKeys
             guard peersAfter == [newKey] else {
                 throw TransportError(
@@ -101,21 +124,10 @@ enum WireGuardService {
             // --- Поднимаем интерфейс.
             try await session.runCommands(
                 WireGuardPlanner.bringUp(interface: interface),
-                title: "WireGuard: включение", saveConfig: false)
+                title: "WireGuard: включение", saveConfig: false, operation: operation)
 
-        } catch {
-            log(.error, "Обновление \(interface) не прошло: \(session.describe(error))")
-            result.rolledBack = await rollbackQuietly(session: session, interface: interface)
-            if result.rolledBack {
-                throw TransportError(
-                    "Обновление не удалось — конфигурация откачена на rollback-базу.",
-                    hint: session.describe(error))
-            }
-            throw error
-        }
-
-        // --- Снимок «после» ----------------------------------------------
-        let configAfter = try await session.readConfigText()
+            // --- Снимок «после» ----------------------------------------------
+        let configAfter = try await session.readConfigText(operation: operation)
         result.routesAfter = routeCount(configAfter)
 
         if result.routesAfter < result.routesBefore {
@@ -130,52 +142,81 @@ enum WireGuardService {
         }
 
         // --- Сохраняем и обновляем rollback-базу.
-        try await saveRouterConfig(session: session)
+        try await saveRouterConfig(session: session, operation: operation)
 
-        WireGuardVault.saveBaseline(config.sourceText, router: session.router, interface: interface)
+        WireGuardVault.saveBaseline(config.sourceText, router: router, interface: interface)
         log(.ok, "WireGuard \(interface) обновлён. Новый конфиг стал rollback-базой.")
 
-        _ = try? await session.refresh()
+        _ = try? await session.refresh(operation: operation)
+        } catch {
+            log(.error, "Обновление \(interface) не прошло: \(session.describe(error))")
+            result.rolledBack = await rollbackQuietly(session: session, interface: interface,
+                                                       operation: operation, router: router)
+            if result.rolledBack {
+                throw TransportError(
+                    "Обновление не удалось — конфигурация откачена на rollback-базу.",
+                    hint: session.describe(error))
+            }
+            throw error
+        }
         return result
     }
 
     /// Ручной откат на сохранённую rollback-базу.
     static func rollback(session: RouterSession, interface: String) async throws {
-        guard let baseline = WireGuardVault.baseline(router: session.router, interface: interface) else {
+        let operation = session.beginOperation()
+        let router = session.router
+        try await rollback(session: session, interface: interface, operation: operation, router: router)
+    }
+
+    /// Откат всегда возвращает состояние тому же роутеру, на котором началась
+    /// операция. Это особенно важно после частичного обновления: переключение
+    /// интерфейса в UI не должно послать rollback на другой роутер.
+    private static func rollback(session: RouterSession, interface: String,
+                                 operation: RouterOperation,
+                                 router: RouterProfile) async throws {
+        guard let baseline = WireGuardVault.baseline(router: router, interface: interface) else {
             throw TransportError("Для \(interface) не сохранена rollback-база.")
         }
 
         log(.warn, "WireGuard \(interface): откат на сохранённую rollback-базу.")
 
-        let configBefore = try await session.readConfigText()
-        Backups.saveRunningConfig(host: session.router.host, text: configBefore,
-                                  keep: Store.shared.settings.keepBackups)
+        let configBefore = try await session.readConfigText(operation: operation)
+        guard Backups.saveRunningConfig(host: router.host, text: configBefore,
+                                        keep: Store.shared.settings.keepBackups) != nil else {
+            throw TransportError(
+                "Откат остановлен: защищённая резервная копия текущего состояния не создана.",
+                hint: "Проверь доступ приложения к связке ключей и свободное место на диске.")
+        }
 
         let stateBefore = WireGuardState.parse(config: configBefore, interface: interface)
         let stages = try WireGuardPlanner.stages(interface: interface, config: baseline)
 
         try await session.runCommands(stages.flatMap(\.commands),
-                                      title: "WireGuard: откат", saveConfig: false)
+                                      title: "WireGuard: откат", saveConfig: false, operation: operation)
 
         let removals = WireGuardPlanner.removeOldPeers(
             interface: interface, oldKeys: stateBefore.peerKeys, newKey: baseline.publicKey)
         if !removals.isEmpty {
-            try await session.runCommands(removals, title: "WireGuard: чистка пиров", saveConfig: false)
+            try await session.runCommands(removals, title: "WireGuard: чистка пиров",
+                                          saveConfig: false, operation: operation)
         }
 
         try await session.runCommands(WireGuardPlanner.bringUp(interface: interface),
-                                      title: "WireGuard: включение", saveConfig: false)
-        try await saveRouterConfig(session: session)
+                                      title: "WireGuard: включение", saveConfig: false, operation: operation)
+        try await saveRouterConfig(session: session, operation: operation)
 
         log(.ok, "WireGuard \(interface): откат завершён.")
-        _ = try? await session.refresh()
+        _ = try? await session.refresh(operation: operation)
     }
 
     // MARK: - Вспомогательное
 
-    private static func rollbackQuietly(session: RouterSession, interface: String) async -> Bool {
+    private static func rollbackQuietly(session: RouterSession, interface: String,
+                                        operation: RouterOperation,
+                                        router: RouterProfile) async -> Bool {
         do {
-            try await rollback(session: session, interface: interface)
+            try await rollback(session: session, interface: interface, operation: operation, router: router)
             return true
         } catch {
             log(.error, "Автоматический откат тоже не удался: \(session.describe(error))")
@@ -184,9 +225,11 @@ enum WireGuardService {
         }
     }
 
-    private static func saveRouterConfig(session: RouterSession) async throws {
+    private static func saveRouterConfig(session: RouterSession,
+                                         operation: RouterOperation) async throws {
         try await session.runCommands(["system configuration save"],
-                                      title: "Сохранение конфигурации", saveConfig: false)
+                                      title: "Сохранение конфигурации",
+                                      saveConfig: false, operation: operation)
     }
 
     /// Сколько всего маршрутов знает роутер — грубая, но надёжная проверка.

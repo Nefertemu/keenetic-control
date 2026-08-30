@@ -5,7 +5,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$PWD"
 APP_NAME="Keenetic Control"
-BUNDLE="$ROOT/dist/$APP_NAME.app"
+OUTPUT_BUNDLE="$ROOT/dist/$APP_NAME.app"
+# Рабочий бандл собираем вне Documents/File Provider: тот может мгновенно
+# прицепить FinderInfo к .app прямо во время codesign и сорвать подпись.
+SIGN_ROOT="$(mktemp -d /tmp/keenetic-control-sign.XXXXXX)"
+BUNDLE="$SIGN_ROOT/$APP_NAME.app"
+trap 'rm -rf "$SIGN_ROOT"' EXIT
 BINARY="KeeneticControl"
 VERSION="1.0"
 
@@ -80,7 +85,13 @@ fi
 
 # Расширенные атрибуты (метки Finder, карантин) переезжают вместе с
 # файлами и ломают подпись: codesign отказывается работать с «detritus».
+# В каталогах под управлением File Provider обычный `xattr -c` иногда
+# оставляет FinderInfo и служебную метку самого провайдера, поэтому эти
+# атрибуты снимаем явно и рекурсивно.
 xattr -cr "$BUNDLE" 2>/dev/null || true
+for attribute in com.apple.FinderInfo com.apple.ResourceFork 'com.apple.fileprovider.fpfs#P'; do
+    xattr -dr "$attribute" "$BUNDLE" 2>/dev/null || true
+done
 
 echo "==> Подпись"
 if [ -n "$IDENTITY" ]; then
@@ -93,8 +104,54 @@ else
     echo "    связка ключей будет заново спрашивать доступ после каждой сборки"
     codesign --force --deep --sign - "$BUNDLE"
 fi
-codesign --verify --verbose=1 "$BUNDLE" 2>&1 | sed 's/^/    /'
-codesign -d -r- "$BUNDLE" 2>&1 | grep -i "^designated" | sed 's/^/    /'
+
+# File Provider может успеть вернуть FinderInfo/provenance уже во время
+# codesign. Эти атрибуты не являются частью приложения и ломают строгую
+# проверку подписи, поэтому снимаем их ещё раз с готового бандла.
+xattr -cr "$BUNDLE" 2>/dev/null || true
+for attribute in com.apple.FinderInfo com.apple.ResourceFork 'com.apple.fileprovider.fpfs#P' com.apple.provenance; do
+    xattr -dr "$attribute" "$BUNDLE" 2>/dev/null || true
+done
+
+codesign --verify --deep --strict --verbose=1 "$BUNDLE" 2>&1 | sed 's/^/    /'
+
+# Переносим уже подписанный бандл в рабочую папку. ditto не переносит
+# карантин/ресурсные форки; оставшиеся метаданные File Provider снимаем перед
+# финальной строгой проверкой.
+mkdir -p "$ROOT/dist"
+rm -rf "$OUTPUT_BUNDLE"
+ditto --noqtn --norsrc "$BUNDLE" "$OUTPUT_BUNDLE"
+xattr -cr "$OUTPUT_BUNDLE" 2>/dev/null || true
+for attribute in com.apple.FinderInfo com.apple.ResourceFork 'com.apple.fileprovider.fpfs#P' com.apple.provenance; do
+    xattr -dr "$attribute" "$OUTPUT_BUNDLE" 2>/dev/null || true
+    xattr -d "$attribute" "$OUTPUT_BUNDLE" 2>/dev/null || true
+done
+
+# Documents may be backed by File Provider. It can re-attach FinderInfo and
+# its own marker in the tiny window between xattr cleanup and codesign's scan.
+# Retry the cleanup/verification pair instead of reporting a false failure on
+# an otherwise valid signed bundle.
+verified=0
+last_verify=""
+for attempt in $(seq 1 20); do
+    xattr -cr "$OUTPUT_BUNDLE" 2>/dev/null || true
+    for attribute in com.apple.FinderInfo com.apple.ResourceFork 'com.apple.fileprovider.fpfs#P' com.apple.provenance; do
+        xattr -dr "$attribute" "$OUTPUT_BUNDLE" 2>/dev/null || true
+        xattr -d "$attribute" "$OUTPUT_BUNDLE" 2>/dev/null || true
+    done
+    if last_verify="$(codesign --verify --deep --strict --verbose=1 "$OUTPUT_BUNDLE" 2>&1)"; then
+        printf '%s\n' "$last_verify" | sed 's/^/    /'
+        verified=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$verified" -ne 1 ]; then
+    printf '%s\n' "$last_verify" | sed 's/^/    /'
+    echo "Не удалось подтвердить подпись готового бандла после очистки xattr." >&2
+    exit 1
+fi
+codesign -d -r- "$OUTPUT_BUNDLE" 2>&1 | grep -i "^designated" | sed 's/^/    /'
 
 echo
-echo "Готово: $BUNDLE"
+echo "Готово: $OUTPUT_BUNDLE"

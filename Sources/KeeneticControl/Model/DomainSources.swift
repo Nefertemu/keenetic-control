@@ -165,21 +165,59 @@ struct SourceData {
 }
 
 enum SourceLoader {
+    /// Результат загрузки подсетей хранит происхождение отдельно от доменного
+    /// списка. Если хотя бы одна часть взята из кэша, возраст всего SourceData
+    /// должен отражать самую старую его часть, а не выглядеть только что скачанным.
+    private struct SubnetData {
+        var v4: [String]
+        var v6: [String]
+        var fromCache: Bool
+        var fetchedAt: Date?
+
+        static let empty = SubnetData(v4: [], v6: [], fromCache: false, fetchedAt: nil)
+    }
+
+    /// Старый кэш был просто склейкой удачно скачавшихся URL и не позволял
+    /// отличить полный набор от частичного. Заголовок живёт в том же атомарно
+    /// записываемом файле, поэтому данные и доказательство полноты не расходятся.
+    private struct SubnetCacheManifest: Codable {
+        let version: Int
+        let components: [String]
+        let entryCount: Int
+    }
+
+    private static let subnetCachePrefix = "# keenetic-control-complete-subnets "
+
     /// Скачивает список (с зеркалами), при неудаче честно берёт локальную копию.
     static func load(_ spec: SourceSpec, ttlMinutes: Int, forceRefresh: Bool) throws -> SourceData {
-        let (v4, v6) = loadSubnets(spec, ttlMinutes: ttlMinutes, forceRefresh: forceRefresh)
+        // Подсети — не зеркала, а независимые обязательные компоненты (обычно
+        // IPv4 и IPv6). Загружаем их до доменов: частичный набор не должен
+        // дойти до Planner и удалить записи через removeStale.
+        let subnets = try loadSubnets(spec, ttlMinutes: ttlMinutes, forceRefresh: forceRefresh)
 
         func finish(_ parsed: Domains.ParseResult, fromCache: Bool, at moment: Date?) -> SourceData {
             var seen = Set(parsed.domains)
             var merged = parsed.domains
-            for entry in v4 + v6 where !seen.contains(entry) {
+            for entry in subnets.v4 + subnets.v6 where !seen.contains(entry) {
                 seen.insert(entry)
                 merged.append(entry)
             }
+            let oldestPart: Date?
+            if spec.subnetURLs.isEmpty {
+                oldestPart = moment
+            } else if let moment, let subnetMoment = subnets.fetchedAt {
+                oldestPart = min(moment, subnetMoment)
+            } else {
+                // Если возраст хотя бы одного обязательного компонента
+                // неизвестен, весь объединённый результат тоже не «свежий».
+                oldestPart = nil
+            }
             return SourceData(
-                spec: spec, entries: merged, fromCache: fromCache, fetchedAt: moment,
+                spec: spec, entries: merged,
+                fromCache: fromCache || subnets.fromCache,
+                fetchedAt: oldestPart,
                 skipped: parsed.skipped, duplicates: parsed.duplicates,
-                subnetsV4: v4, subnetsV6: v6)
+                subnetsV4: subnets.v4, subnetsV6: subnets.v6)
         }
 
         let cacheFile = spec.cacheFile
@@ -223,37 +261,108 @@ enum SourceLoader {
             hint: errors.joined(separator: "\n"))
     }
 
-    private static func loadSubnets(_ spec: SourceSpec, ttlMinutes: Int, forceRefresh: Bool) -> ([String], [String]) {
-        guard !spec.subnetURLs.isEmpty else { return ([], []) }
-        let cacheFile = spec.subnetCacheFile
+    private static func loadSubnets(_ spec: SourceSpec, ttlMinutes: Int,
+                                    forceRefresh: Bool) throws -> SubnetData {
+        guard !spec.subnetURLs.isEmpty else { return .empty }
 
-        if !forceRefresh, ttlMinutes > 0,
-           let date = (try? FileManager.default.attributesOfItem(atPath: cacheFile.path)[.modificationDate]) as? Date,
-           Date().timeIntervalSince(date) / 60 < Double(ttlMinutes),
-           let text = try? String(contentsOf: cacheFile, encoding: .utf8) {
-            let parsed = Domains.parseSubnets(text)
-            if !parsed.v4.isEmpty || !parsed.v6.isEmpty { return (parsed.v4, parsed.v6) }
+        let cached = readCompleteSubnetCache(spec)
+        if !forceRefresh, ttlMinutes > 0, let cached, let date = cached.fetchedAt,
+           Date().timeIntervalSince(date) / 60 < Double(ttlMinutes) {
+            return cached
         }
 
-        var collected: [String] = []
+        var errors: [String] = []
+        var v4: [String] = []
+        var v6: [String] = []
+        var seen = Set<String>()
+
+        // В отличие от domainURLs это НЕ зеркала: каждый URL добавляет свою
+        // часть набора. Успех одного не маскирует отказ следующего.
         for url in spec.rawSubnetURLs {
-            if let text = try? fetch(url) { collected.append(text) }
-        }
-
-        if !collected.isEmpty {
-            let parsed = Domains.parseSubnets(collected.joined(separator: "\n"))
-            if !parsed.v4.isEmpty || !parsed.v6.isEmpty {
-                try? (parsed.v4 + parsed.v6).joined(separator: "\n")
-                    .write(to: cacheFile, atomically: true, encoding: .utf8)
-                return (parsed.v4, parsed.v6)
+            do {
+                let text = try fetch(url)
+                let parsed = Domains.parseSubnets(text)
+                guard !parsed.v4.isEmpty || !parsed.v6.isEmpty else {
+                    errors.append("\(url): не распознано ни одной подсети")
+                    continue
+                }
+                for subnet in parsed.v4 where seen.insert(subnet).inserted { v4.append(subnet) }
+                for subnet in parsed.v6 where seen.insert(subnet).inserted { v6.append(subnet) }
+            } catch {
+                errors.append("\(url): \(error.localizedDescription)")
             }
         }
 
-        if let text = try? String(contentsOf: cacheFile, encoding: .utf8) {
-            let parsed = Domains.parseSubnets(text)
-            return (parsed.v4, parsed.v6)
+        if errors.isEmpty, (!v4.isEmpty || !v6.isEmpty) {
+            let fresh = SubnetData(v4: v4, v6: v6, fromCache: false, fetchedAt: Date())
+            writeCompleteSubnetCache(fresh, spec: spec)
+            return fresh
         }
-        return ([], [])
+
+        // Любая неудачная часть запрещает использовать свежую склейку. Полный
+        // старый кэш безопаснее: removeStale увидит целый набор, а не случайный
+        // IPv4 без IPv6 (или наоборот).
+        if let cached {
+            let details = errors.joined(separator: "; ")
+            log(.warn, "\(spec.title): не загрузились все файлы подсетей; "
+                + "беру полную локальную копию. \(details)")
+            return cached
+        }
+
+        let details = errors.isEmpty
+            ? "Источники не вернули ни одной распознаваемой подсети."
+            : errors.joined(separator: "\n")
+        throw TransportError(
+            "Не удалось полностью загрузить подсети для «\(spec.title)».",
+            hint: details + "\nПолной локальной копии нет. Частичный результат отброшен, "
+                + "чтобы обновление не удалило отсутствующую часть списка.")
+    }
+
+    /// Принимаем только кэш, который был создан после успешной загрузки всех
+    /// текущих URL. Старый безымянный txt мог быть частичным, поэтому один раз
+    /// будет заменён после следующей полной загрузки.
+    private static func readCompleteSubnetCache(_ spec: SourceSpec) -> SubnetData? {
+        let cacheFile = spec.subnetCacheFile
+        guard let text = try? String(contentsOf: cacheFile, encoding: .utf8),
+              let firstLine = text.split(separator: "\n", maxSplits: 1,
+                                         omittingEmptySubsequences: false).first,
+              firstLine.hasPrefix(subnetCachePrefix)
+        else { return nil }
+
+        let encoded = String(firstLine.dropFirst(subnetCachePrefix.count))
+        guard let metadata = Data(base64Encoded: encoded),
+              let manifest = try? JSONDecoder().decode(SubnetCacheManifest.self, from: metadata),
+              manifest.version == 1,
+              manifest.components == spec.rawSubnetURLs else { return nil }
+
+        let parsed = Domains.parseSubnets(text)
+        let count = parsed.v4.count + parsed.v6.count
+        guard count > 0, count == manifest.entryCount else { return nil }
+
+        let date = (try? FileManager.default.attributesOfItem(
+            atPath: cacheFile.path)[.modificationDate]) as? Date
+        return SubnetData(v4: parsed.v4, v6: parsed.v6,
+                          fromCache: true, fetchedAt: date)
+    }
+
+    private static func writeCompleteSubnetCache(_ data: SubnetData, spec: SourceSpec) {
+        let entries = data.v4 + data.v6
+        let manifest = SubnetCacheManifest(
+            version: 1, components: spec.rawSubnetURLs, entryCount: entries.count)
+        guard let metadata = try? JSONEncoder().encode(manifest) else { return }
+
+        let header = subnetCachePrefix + metadata.base64EncodedString()
+        let text = ([header] + entries).joined(separator: "\n") + "\n"
+        do {
+            // Один атомарный файл: после сбоя нельзя получить новую отметку
+            // полноты рядом со старым или недописанным содержимым.
+            try text.write(to: spec.subnetCacheFile, atomically: true, encoding: .utf8)
+        } catch {
+            // Свежий набор уже целый и пригоден для текущего запуска. Ошибка
+            // кэша не должна превращать успешную загрузку в сетевую ошибку.
+            log(.warn, "\(spec.title): не удалось сохранить полный кэш подсетей: "
+                + error.localizedDescription)
+        }
     }
 
     /// Синхронная загрузка: вызывается только с фоновой очереди.
@@ -273,36 +382,57 @@ enum SourceLoader {
         guard let url = URL(string: urlString) else {
             throw TransportError("Некорректный адрес: \(urlString)")
         }
+        // Валидация редактора не защищает старые profiles.json: файл мог
+        // быть создан предыдущей версией или вручную. Не даём такому адресу
+        // выбрать произвольную схему, встроить секреты или уйти без host.
+        guard let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil,
+              url.user == nil,
+              url.password == nil else {
+            throw TransportError(
+                "Источник допускает только http:// или https:// без логина и пароля: \(urlString)")
+        }
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 40)
         request.setValue("KeeneticControl/1.0", forHTTPHeaderField: "User-Agent")
         request.setValue("text/plain", forHTTPHeaderField: "Accept")
 
         let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
         var result: Result<String, Error>?
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            defer { semaphore.signal() }
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            let value: Result<String, Error>
             if let error {
-                result = .failure(error)
-                return
+                value = .failure(error)
+            } else if let http = response as? HTTPURLResponse,
+                      !(200..<300).contains(http.statusCode) {
+                value = .failure(TransportError("HTTP \(http.statusCode)"))
+            } else if let data {
+                var text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+                value = .success(text)
+            } else {
+                value = .failure(TransportError("Пустой ответ"))
             }
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                result = .failure(TransportError("HTTP \(http.statusCode)"))
-                return
-            }
-            guard let data else {
-                result = .failure(TransportError("Пустой ответ"))
-                return
-            }
-            var text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-            if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
-            result = .success(text)
-        }.resume()
 
-        semaphore.wait()
+            lock.lock()
+            result = value
+            lock.unlock()
+            semaphore.signal()
+        }
+        task.resume()
 
-        switch result {
+        guard semaphore.wait(timeout: .now() + 45) == .success else {
+            task.cancel()
+            throw TransportError("Источник не ответил за 45 с: \(urlString)")
+        }
+
+        lock.lock()
+        let finished = result
+        lock.unlock()
+        switch finished {
         case .success(let text): return text
         case .failure(let error): throw error
         case nil: throw TransportError("Загрузка не завершилась")

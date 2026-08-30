@@ -27,20 +27,32 @@ struct RoutersView: View {
         }
         .sheet(item: $editing) { profile in
             RouterEditor(profile: profile) { updated, password in
+                let activeBeforeSave = session.activeRouterID
                 editing = nil
                 if store.routers.contains(where: { $0.id == updated.id }) {
                     store.update(updated)
                 } else {
                     store.add(updated)
                 }
+                // Профиль не обязательно активен: старый роутер мог
+                // продолжать длинную операцию в фоне после переключения.
+                // Инвалидируем его слот сразу, до возможного запроса связки
+                // ключей, чтобы команды не ушли по прежнему адресу.
+                session.profileDidChange(updated)
                 Task {
                     if let password {
                         await Task.detached { updated.password = password }.value
-                        // Учётные данные поменялись — прежний отказ больше
-                        // ничего не значит, пробовать снова можно.
-                        session.clearAuthBlock(updated.id)
+                        // Учётные данные поменялись — открытая сессия держит
+                        // старый пароль, поэтому следующая операция должна
+                        // подключиться заново.
+                        session.credentialsDidChange(updated.id)
                     }
-                    await session.switchTo(updated)
+                    // Не перебивать выбор пользователя, если за время
+                    // системного запроса связки ключей он уже переключился
+                    // на другой роутер.
+                    if session.activeRouterID == activeBeforeSave {
+                        await session.switchTo(updated)
+                    }
                     refreshPasswordFlags()
                 }
             } onCancel: { editing = nil }
@@ -72,12 +84,18 @@ struct RoutersView: View {
 
     private var routers: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                CardHeader(icon: "wifi.router", title: "Роутеры",
-                           subtitle: "Пароли лежат в связке ключей macOS, а не в файлах приложения")
-                Spacer()
-                Button("Добавить роутер") { editing = RouterProfile() }
-                    .buttonStyle(PrimaryButtonStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    routersHeader
+                    Spacer()
+                    addRouterButton
+                }
+                .frame(minWidth: 560)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    routersHeader
+                    addRouterButton
+                }
             }
 
             VStack(spacing: 0) {
@@ -93,6 +111,16 @@ struct RoutersView: View {
         .card()
         .onAppear(perform: refreshPasswordFlags)
         .onChange(of: store.routers) { _, _ in refreshPasswordFlags() }
+    }
+
+    private var routersHeader: some View {
+        CardHeader(icon: "wifi.router", title: "Роутеры",
+                   subtitle: "Пароли лежат в связке ключей macOS, а не в файлах приложения")
+    }
+
+    private var addRouterButton: some View {
+        Button("Добавить роутер") { editing = RouterProfile() }
+            .buttonStyle(PrimaryButtonStyle())
     }
 
     private func refreshPasswordFlags() {
@@ -111,24 +139,64 @@ struct RoutersView: View {
         let known = havePassword
         let hasPassword = fromEnvironment || (known?.contains(router.id) ?? false)
 
-        return HStack(spacing: 11) {
-            Image(systemName: isCurrent ? "wifi.router.fill" : "wifi.router")
-                .font(.system(size: 15))
-                .foregroundStyle(isCurrent ? Palette.accent : .secondary)
-                .frame(width: 22)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 7) {
-                    Text(router.name).font(.system(size: 13, weight: .semibold))
-                    if isCurrent { StatusPill(text: "активный", tint: Palette.accent) }
-                }
-                Text(router.subtitle)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 11) {
+                routerIcon(isCurrent: isCurrent)
+                routerIdentity(router, isCurrent: isCurrent)
+                Spacer(minLength: 8)
+                routerBadges(router, fromEnvironment: fromEnvironment,
+                             known: known, hasPassword: hasPassword)
+                routerActions(router)
             }
+            .frame(minWidth: 660)
 
-            Spacer(minLength: 8)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 9) {
+                    routerIcon(isCurrent: isCurrent)
+                    routerIdentity(router, isCurrent: isCurrent)
+                    Spacer(minLength: 4)
+                    routerActions(router)
+                }
+                HStack(spacing: 7) {
+                    routerBadges(router, fromEnvironment: fromEnvironment,
+                                 known: known, hasPassword: hasPassword)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(.vertical, 9)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            store.selectedRouterID = router.id
+            Task { await session.switchTo(router) }
+        }
+    }
 
+    private func routerIcon(isCurrent: Bool) -> some View {
+        Image(systemName: isCurrent ? "wifi.router.fill" : "wifi.router")
+            .font(.system(size: 15))
+            .foregroundStyle(isCurrent ? Palette.accent : .secondary)
+            .frame(width: 22)
+    }
+
+    private func routerIdentity(_ router: RouterProfile, isCurrent: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 7) {
+                Text(router.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                if isCurrent { StatusPill(text: "активный", tint: Palette.accent) }
+            }
+            Text(router.subtitle)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    @ViewBuilder
+    private func routerBadges(_ router: RouterProfile, fromEnvironment: Bool,
+                              known: Set<UUID>?, hasPassword: Bool) -> some View {
+        Group {
             StatusPill(text: router.transport.shortTitle, tint: .secondary, icon: router.transport.icon)
             if fromEnvironment {
                 StatusPill(text: "пароль из окружения", tint: Palette.success)
@@ -139,7 +207,11 @@ struct RoutersView: View {
                 StatusPill(text: hasPassword ? "пароль сохранён" : "нет пароля",
                            tint: hasPassword ? Palette.success : Palette.warning)
             }
+        }
+    }
 
+    private func routerActions(_ router: RouterProfile) -> some View {
+        HStack(spacing: 8) {
             Button("Изменить") { editing = router }
                 .buttonStyle(SubtleButtonStyle())
 
@@ -152,12 +224,6 @@ struct RoutersView: View {
             .foregroundStyle(Palette.danger)
             .disabled(store.routers.count <= 1)
         }
-        .padding(.vertical, 9)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            store.selectedRouterID = router.id
-            Task { await session.switchTo(router) }
-        }
     }
 
     // MARK: - Настройки
@@ -167,7 +233,7 @@ struct RoutersView: View {
             CardHeader(icon: "slider.horizontal.3", title: "Параметры работы",
                        subtitle: "Значения по умолчанию совпадают с консольным скриптом")
 
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 16), count: 2), spacing: 14) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 16)], spacing: 14) {
                 numberField("Доменов в одной части списка", value: $store.settings.chunkSize,
                             range: 10...1000,
                             hint: "Прошивка не любит очень длинные object-group.")
@@ -235,20 +301,18 @@ struct RoutersView: View {
 
     private var autoUpdate: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                CardHeader(icon: "arrow.triangle.2.circlepath", title: "Сверка источников",
-                           subtitle: "Приложение само проверяет, не разошлись ли списки")
-                Spacer()
-                Button {
-                    Task { await updater.check(manual: true) }
-                } label: {
-                    HStack(spacing: 6) {
-                        if updater.checking { ProgressView().controlSize(.small) }
-                        Text(updater.checking ? "Проверяю…" : "Проверить сейчас")
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    autoUpdateHeader
+                    Spacer()
+                    checkNowButton
                 }
-                .buttonStyle(SubtleButtonStyle())
-                .disabled(updater.checking)
+                .frame(minWidth: 560)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    autoUpdateHeader
+                    checkNowButton
+                }
             }
 
             Toggle(isOn: Binding(get: { store.settings.autoUpdateEnabled },
@@ -263,7 +327,8 @@ struct RoutersView: View {
                 }
             }
 
-            HStack(alignment: .top, spacing: 20) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 20)],
+                      alignment: .leading, spacing: 14) {
                 numberField("Раз в сколько часов", value: Binding(
                     get: { store.settings.autoUpdateHours },
                     set: { store.settings.autoUpdateHours = $0; updater.reschedule() }),
@@ -281,7 +346,6 @@ struct RoutersView: View {
                             .font(.system(size: 10)).foregroundStyle(.tertiary)
                     }
                 }
-                Spacer()
             }
 
             Toggle(isOn: $store.settings.autoUpdateNotify) {
@@ -299,7 +363,7 @@ struct RoutersView: View {
                      : "Отмечено: \(store.settings.autoUpdateSources.count)")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
 
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 2),
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)],
                           alignment: .leading, spacing: 6) {
                     ForEach(store.allSources) { spec in
                         let picked = store.settings.autoUpdateSources.contains(spec.key)
@@ -320,6 +384,24 @@ struct RoutersView: View {
         .card()
     }
 
+    private var autoUpdateHeader: some View {
+        CardHeader(icon: "arrow.triangle.2.circlepath", title: "Сверка источников",
+                   subtitle: "Приложение само проверяет, не разошлись ли списки")
+    }
+
+    private var checkNowButton: some View {
+        Button {
+            Task { await updater.check(manual: true) }
+        } label: {
+            HStack(spacing: 6) {
+                if updater.checking { ProgressView().controlSize(.small) }
+                Text(updater.checking ? "Проверяю…" : "Проверить сейчас")
+            }
+        }
+        .buttonStyle(SubtleButtonStyle())
+        .disabled(updater.checking)
+    }
+
     // MARK: - Данные на диске
 
     private var storage: some View {
@@ -336,19 +418,35 @@ struct RoutersView: View {
             .padding(12)
             .inset()
 
-            HStack(spacing: 8) {
-                Button("Открыть папку данных") { NSWorkspace.shared.open(AppPaths.support) }
-                    .buttonStyle(SubtleButtonStyle())
-                Button("Очистить кэш источников") {
-                    let files = (try? FileManager.default.contentsOfDirectory(
-                        at: AppPaths.cache, includingPropertiesForKeys: nil)) ?? []
-                    for file in files { try? FileManager.default.removeItem(at: file) }
-                    log(.ok, "Кэш источников очищен (\(files.count) файлов).")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    openDataButton
+                    clearCacheButton
                 }
-                .buttonStyle(SubtleButtonStyle())
+                .frame(minWidth: 390)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    openDataButton
+                    clearCacheButton
+                }
             }
         }
         .card()
+    }
+
+    private var openDataButton: some View {
+        Button("Открыть папку данных") { NSWorkspace.shared.open(AppPaths.support) }
+            .buttonStyle(SubtleButtonStyle())
+    }
+
+    private var clearCacheButton: some View {
+        Button("Очистить кэш источников") {
+            let files = (try? FileManager.default.contentsOfDirectory(
+                at: AppPaths.cache, includingPropertiesForKeys: nil)) ?? []
+            for file in files { try? FileManager.default.removeItem(at: file) }
+            log(.ok, "Кэш источников очищен (\(files.count) файлов).")
+        }
+        .buttonStyle(SubtleButtonStyle())
     }
 }
 
@@ -361,7 +459,18 @@ struct RouterEditor: View {
 
     @State private var password = ""
     @State private var passwordLoaded = false
+    /// Нельзя отличить «поле ещё не успело прочитаться» от «человек очистил
+    /// пароль» по одной пустой строке. Этот флаг позволяет и сохранить
+    /// существующий пароль без лишнего запроса, и честно удалить его.
+    @State private var passwordTouched = false
     @State private var showPassword = false
+
+    private var passwordBinding: Binding<String> {
+        Binding(get: { password }, set: {
+            password = $0
+            passwordTouched = true
+        })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -419,9 +528,9 @@ struct RouterEditor: View {
                     HStack(spacing: 6) {
                         Group {
                             if showPassword {
-                                TextField("", text: $password)
+                                TextField("", text: passwordBinding)
                             } else {
-                                SecureField("", text: $password)
+                                SecureField("", text: passwordBinding)
                             }
                         }
                         .textFieldStyle(.roundedBorder)
@@ -448,7 +557,10 @@ struct RouterEditor: View {
                     cleaned.host = cleaned.host.trimmingCharacters(in: .whitespaces)
                     cleaned.user = cleaned.user.trimmingCharacters(in: .whitespaces)
                     if cleaned.name.isEmpty { cleaned.name = cleaned.host }
-                    onSave(cleaned, password.isEmpty ? nil : password)
+                    // nil — пароль не меняли; пустая строка — удалить его из
+                    // связки ключей. Раньше очистить поле и сохранить было
+                    // невозможно: старый пароль оставался незаметно.
+                    onSave(cleaned, passwordTouched ? password : nil)
                 }
                 .buttonStyle(PrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)
@@ -457,7 +569,7 @@ struct RouterEditor: View {
             }
         }
         .padding(22)
-        .frame(width: 560)
+        .frame(minWidth: 440, idealWidth: 560, maxWidth: 560)
         .background(Palette.surface)
         .task {
             guard !passwordLoaded else { return }
@@ -465,7 +577,7 @@ struct RouterEditor: View {
             // SecItemCopyMatching умеет показать системный запрос доступа и
             // ждать ответа сколько угодно — на главном потоке окно бы замерло.
             let stored = await Task.detached { Keychain.load(account: account) }.value
-            password = stored ?? ""
+            if !passwordTouched { password = stored ?? "" }
             passwordLoaded = true
         }
     }

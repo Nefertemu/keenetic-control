@@ -46,7 +46,7 @@ struct StaticRoutesView: View {
                 showAdd = false
                 var built = Plan(title: "Добавление маршрута")
                 built.commands = [route.command]
-                plan = built
+                plan = built.forRouter(session.router)
             } onCancel: { showAdd = false }
         }
         .sheet(isPresented: $showImport) {
@@ -56,7 +56,7 @@ struct StaticRoutesView: View {
                 var built = Plan(title: "Импорт \(Format.routes(accepted.count))")
                 built.commands = accepted.map(\.command)
                 built.notes = ["Маршруты добавляются как есть. Существующие такие же строки роутер просто перезапишет."]
-                plan = built
+                plan = built.forRouter(session.router)
             } onCancel: { showImport = false }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
@@ -74,43 +74,107 @@ struct StaticRoutesView: View {
 
     private var toolbar: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                CardHeader(icon: "point.topleft.down.to.point.bottomright.curvepath",
-                           title: "Статические маршруты",
-                           subtitle: "\(Format.routes(session.state?.staticRoutes.count ?? 0)) в конфигурации роутера")
-                Spacer()
-                StatusPill(text: "выбрано: \(selectedRoutes.count)",
-                           tint: selectedRoutes.isEmpty ? .secondary : Palette.accent)
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    routesHeader
+                    Spacer()
+                    selectionPill
+                }
+                .frame(minWidth: 520)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    routesHeader
+                    selectionPill
+                }
             }
 
-            HStack(spacing: 10) {
-                TextField("Поиск по сети, интерфейсу или комментарию", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 150, maxWidth: 320)
-
-                Button("Добавить…") { showAdd = true }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(session.state == nil || session.progress != nil)
-
-                Button("Удалить выбранные") { buildDeletePlan() }
-                    .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
-                    .disabled(selectedRoutes.isEmpty || session.progress != nil)
-
-                Spacer()
-
-                Button("Импорт из BAT/TXT…") { importFile() }
-                    .buttonStyle(SubtleButtonStyle())
-
-                Menu(selectedRoutes.isEmpty ? "Экспорт" : "Экспорт выбранных") {
-                    Button("В BAT для Windows…") { export(bat: true) }
-                    Button("В команды Keenetic…") { export(bat: false) }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    routeSearchField
+                    primaryRouteActions
+                    Spacer()
+                    transferActions
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled((session.state?.staticRoutes.isEmpty ?? true))
+                .frame(minWidth: 760)
+
+                VStack(alignment: .leading, spacing: 9) {
+                    routeSearchField
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 10) {
+                            primaryRouteActions
+                            Spacer(minLength: 0)
+                            transferActions
+                        }
+                        .frame(minWidth: 560)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            primaryRouteActions
+                            transferActions
+                        }
+                    }
+                }
             }
         }
         .card()
+    }
+
+    private var routesHeader: some View {
+        CardHeader(icon: "point.topleft.down.to.point.bottomright.curvepath",
+                   title: "Статические маршруты",
+                   subtitle: "\(Format.routes(session.state?.staticRoutes.count ?? 0)) в конфигурации роутера")
+    }
+
+    private var selectionPill: some View {
+        StatusPill(text: "выбрано: \(selectedRoutes.count)",
+                   tint: selectedRoutes.isEmpty ? .secondary : Palette.accent)
+    }
+
+    private var routeSearchField: some View {
+        TextField("Поиск по сети, интерфейсу или комментарию", text: $query)
+            .textFieldStyle(.roundedBorder)
+            .frame(minWidth: 180, idealWidth: 300, maxWidth: 360)
+    }
+
+    private var primaryRouteActions: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                addRouteButton
+                deleteRoutesButton
+            }
+            .frame(minWidth: 300, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 6) {
+                addRouteButton
+                deleteRoutesButton
+            }
+        }
+    }
+
+    private var addRouteButton: some View {
+        Button("Добавить…") { showAdd = true }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(session.state == nil || session.progress != nil)
+    }
+
+    private var deleteRoutesButton: some View {
+        Button("Удалить выбранные") { buildDeletePlan() }
+            .buttonStyle(SubtleButtonStyle(tint: Palette.danger))
+            .disabled(selectedRoutes.isEmpty || session.progress != nil)
+    }
+
+    private var transferActions: some View {
+        HStack(spacing: 10) {
+            Button("Импорт из BAT/TXT…") { importFile() }
+                .buttonStyle(SubtleButtonStyle())
+
+            Menu(selectedRoutes.isEmpty ? "Экспорт" : "Экспорт выбранных") {
+                Button("В BAT для Windows…") { export(bat: true) }
+                Button("В команды Keenetic…") { export(bat: false) }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled((session.state?.staticRoutes.isEmpty ?? true))
+        }
     }
 
     // MARK: - Таблица
@@ -126,44 +190,46 @@ struct StaticRoutesView: View {
                             ? "Добавь первый маршрут или импортируй список из BAT-файла."
                             : "По запросу «\(query)» ничего не нашлось.")
             } else {
-                HStack(spacing: 10) {
-                    let visibleIDs = Set(routes.map(\.id))
-                    let allPicked = !routes.isEmpty && visibleIDs.isSubset(of: selection)
-                    Button {
-                        selection = allPicked ? selection.subtracting(visibleIDs)
-                                              : selection.union(visibleIDs)
-                    } label: {
-                        Image(systemName: allPicked ? "checkmark.square.fill" : "square")
-                            .font(.system(size: 13))
-                            .foregroundStyle(Palette.accent)
-                    }
-                    .buttonStyle(.plain)
-                    .frame(width: 18)
-
-                    Text("Назначение").frame(width: 210, alignment: .leading)
-                    Text("Через").frame(width: 170, alignment: .leading)
-                    Text("Флаги").frame(width: 120, alignment: .leading)
-                    Text("Комментарий").frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-
-                Divider()
-
-                ScrollView {
+                ScrollView([.horizontal, .vertical]) {
                     LazyVStack(spacing: 0) {
+                        routeHeader
+                        Divider()
                         ForEach(routes) { route in
                             row(route)
                             Divider()
                         }
                     }
                     .padding(.horizontal, 12)
+                    .frame(minWidth: 760, alignment: .leading)
                 }
             }
         }
         .card(padding: 0)
+    }
+
+    private var routeHeader: some View {
+        HStack(spacing: 10) {
+            let visibleIDs = Set(routes.map(\.id))
+            let allPicked = !routes.isEmpty && visibleIDs.isSubset(of: selection)
+            Button {
+                selection = allPicked ? selection.subtracting(visibleIDs)
+                                      : selection.union(visibleIDs)
+            } label: {
+                Image(systemName: allPicked ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Palette.accent)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 18)
+
+            Text("Назначение").frame(width: 210, alignment: .leading)
+            Text("Через").frame(width: 170, alignment: .leading)
+            Text("Флаги").frame(width: 120, alignment: .leading)
+            Text("Комментарий").frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(size: 10, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 9)
     }
 
     private func row(_ route: StaticRoute) -> some View {
@@ -232,7 +298,7 @@ struct StaticRoutesView: View {
             Button("Удалить", role: .destructive) {
                 var built = Plan(title: "Удаление маршрута")
                 built.commands = [route.deleteCommand]
-                plan = built
+                plan = built.forRouter(session.router)
             }
         }
     }
@@ -244,7 +310,7 @@ struct StaticRoutesView: View {
         guard !victims.isEmpty else { return }
         var built = Plan(title: "Удаление \(Format.routes(victims.count))")
         built.commands = victims.map(\.deleteCommand)
-        plan = built
+        plan = built.forRouter(session.router)
     }
 
     private func importFile() {
@@ -336,6 +402,7 @@ struct RouteEditor: View {
     @State private var family: StaticRoute.Family = .ipv4
     @State private var destination = ""
     @State private var via = ""
+    @State private var metric = ""
     @State private var auto = true
     @State private var reject = false
     @State private var comment = ""
@@ -379,9 +446,15 @@ struct RouteEditor: View {
                 }
             }
 
-            HStack(spacing: 16) {
-                Toggle("auto", isOn: $auto)
-                Toggle("reject", isOn: $reject)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 16) {
+                    routeFlags
+                }
+                .frame(minWidth: 330, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    routeFlags
+                }
             }
             .toggleStyle(.checkbox)
 
@@ -398,28 +471,66 @@ struct RouteEditor: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            HStack {
-                Button("Отмена", action: onCancel)
-                    .buttonStyle(SubtleButtonStyle())
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-                Button("Добавить") { submit() }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .keyboardShortcut(.defaultAction)
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    editorCancelButton
+                    Spacer()
+                    editorAddButton
+                }
+                .frame(minWidth: 320)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    editorAddButton
+                    editorCancelButton
+                }
             }
         }
         .padding(22)
-        .frame(width: 520)
+        .frame(minWidth: 420, idealWidth: 520, maxWidth: 520)
         .background(Palette.surface)
+    }
+
+    @ViewBuilder
+    private var routeFlags: some View {
+        Toggle("auto", isOn: $auto)
+        Toggle("reject", isOn: $reject)
+        TextField("метрика", text: $metric)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12, design: .monospaced))
+            .frame(width: 100)
+            .help("Необязательно. Меньшая метрика — более приоритетный маршрут.")
+    }
+
+    private var editorCancelButton: some View {
+        Button("Отмена", action: onCancel)
+            .buttonStyle(SubtleButtonStyle())
+            .keyboardShortcut(.cancelAction)
+    }
+
+    private var editorAddButton: some View {
+        Button("Добавить") { submit() }
+            .buttonStyle(PrimaryButtonStyle())
+            .keyboardShortcut(.defaultAction)
     }
 
     private func submit() {
         do {
-            try StaticRoute.validate(family: family, destination: destination, via: via)
+            let trimmedMetric = metric.trimmingCharacters(in: .whitespaces)
+            let metricValue: Int?
+            if trimmedMetric.isEmpty {
+                metricValue = nil
+            } else if let value = Int(trimmedMetric), value >= 0 {
+                metricValue = value
+            } else {
+                throw TransportError("Метрика должна быть целым числом не меньше нуля.")
+            }
+            try StaticRoute.validate(family: family, destination: destination, via: via,
+                                     metric: metricValue, comment: comment)
             onAdd(StaticRoute(
                 family: family,
                 destination: destination.trimmingCharacters(in: .whitespaces),
                 via: via.trimmingCharacters(in: .whitespaces),
+                metric: metricValue,
                 auto: auto, reject: reject,
                 comment: comment.trimmingCharacters(in: .whitespaces)))
         } catch {
@@ -499,26 +610,57 @@ struct ImportPreview: View {
 
             Divider()
 
-            HStack {
-                Button("Отмена", action: onCancel)
-                    .buttonStyle(SubtleButtonStyle())
-                    .keyboardShortcut(.cancelAction)
-                // Файлы бывают на сотни строк — отмечать вручную мучение.
-                Button(excluded.isEmpty ? "Снять все" : "Выбрать все") {
-                    excluded = excluded.isEmpty ? Set(routes.map(\.id)) : []
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    importCancelButton
+                    importToggleAllButton
+                    Spacer()
+                    importCount
+                    importPlanButton
                 }
-                .buttonStyle(SubtleButtonStyle())
-                Spacer()
-                Text("К добавлению: \(accepted.count)")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-                Button("Составить план") { onAccept(accepted) }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(accepted.isEmpty)
-                    .keyboardShortcut(.defaultAction)
+                .frame(minWidth: 470)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        importCancelButton
+                        importToggleAllButton
+                    }
+                    HStack {
+                        importCount
+                        Spacer()
+                        importPlanButton
+                    }
+                }
             }
             .padding(16)
         }
-        .frame(width: 720, height: 560)
+        .frame(minWidth: 500, idealWidth: 720, maxWidth: 720,
+               minHeight: 440, idealHeight: 560, maxHeight: 560)
         .background(Palette.surface)
+    }
+
+    private var importCancelButton: some View {
+        Button("Отмена", action: onCancel)
+            .buttonStyle(SubtleButtonStyle())
+            .keyboardShortcut(.cancelAction)
+    }
+
+    private var importToggleAllButton: some View {
+        Button(excluded.isEmpty ? "Снять все" : "Выбрать все") {
+            excluded = excluded.isEmpty ? Set(routes.map(\.id)) : []
+        }
+        .buttonStyle(SubtleButtonStyle())
+    }
+
+    private var importCount: some View {
+        Text("К добавлению: \(accepted.count)")
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+    }
+
+    private var importPlanButton: some View {
+        Button("Составить план") { onAccept(accepted) }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(accepted.isEmpty)
+            .keyboardShortcut(.defaultAction)
     }
 }

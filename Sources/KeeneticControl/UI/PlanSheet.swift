@@ -10,6 +10,7 @@ struct PlanSheet: View {
     var onCancel: () -> Void
 
     @State private var showAllCommands = false
+    @State private var saveError: String?
 
     private var visibleCommands: [String] {
         showAllCommands ? plan.commands : Array(plan.commands.prefix(60))
@@ -33,8 +34,15 @@ struct PlanSheet: View {
             Divider()
             footer
         }
-        .frame(width: 760, height: 620)
+        .frame(minWidth: 520, idealWidth: 760, maxWidth: 760,
+               minHeight: 480, idealHeight: 620, maxHeight: 620)
         .background(Palette.surface)
+        .alert("Не удалось сохранить план", isPresented: Binding(
+            get: { saveError != nil }, set: { if !$0 { saveError = nil } })) {
+                Button("Понятно", role: .cancel) { saveError = nil }
+            } message: {
+                Text(saveError ?? "")
+            }
     }
 
     private var header: some View {
@@ -59,7 +67,7 @@ struct PlanSheet: View {
     }
 
     private var summaryTiles: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
             if plan.addCount > 0 {
                 MetricTile(value: String(plan.addCount), label: "Добавить доменов",
                            icon: "plus.circle", tint: Palette.success)
@@ -102,12 +110,18 @@ struct PlanSheet: View {
 
     private var commands: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                CardHeader(icon: "terminal", title: "Команды Keenetic CLI",
-                           subtitle: "Ровно то, что уйдёт на роутер")
-                Spacer()
-                Button("Сохранить в файл…") { saveCommands() }
-                    .buttonStyle(SubtleButtonStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    commandsHeader
+                    Spacer()
+                    saveCommandsButton
+                }
+                .frame(minWidth: 500)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    commandsHeader
+                    saveCommandsButton
+                }
             }
 
             VStack(alignment: .leading, spacing: 2) {
@@ -142,24 +156,56 @@ struct PlanSheet: View {
         .card()
     }
 
+    private var commandsHeader: some View {
+        CardHeader(icon: "terminal", title: "Команды Keenetic CLI",
+                   subtitle: "Ровно то, что уйдёт на роутер")
+    }
+
+    private var saveCommandsButton: some View {
+        Button("Сохранить в файл…") { saveCommands() }
+            .buttonStyle(SubtleButtonStyle())
+    }
+
     private var footer: some View {
-        HStack(spacing: 10) {
-            Button("Отмена", action: onCancel)
-                .buttonStyle(SubtleButtonStyle())
-                .keyboardShortcut(.cancelAction)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                cancelButton
+                Spacer()
+                previewButton
+                applyButton
+            }
+            .frame(minWidth: 500)
 
-            Spacer()
-
-            Button("Только предпросмотр") { onApply(true) }
-                .buttonStyle(SubtleButtonStyle())
-                .help("Ничего не отправлять на роутер — просто записать план в журнал")
-
-            Button(applyTitle) { onApply(false) }
-                .buttonStyle(PrimaryButtonStyle())
-                .keyboardShortcut(.defaultAction)
-                .disabled(plan.isEmpty)
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 10) {
+                    cancelButton
+                    Spacer(minLength: 0)
+                    previewButton
+                }
+                applyButton
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
         }
         .padding(16)
+    }
+
+    private var cancelButton: some View {
+        Button("Отмена", action: onCancel)
+            .buttonStyle(SubtleButtonStyle())
+            .keyboardShortcut(.cancelAction)
+    }
+
+    private var previewButton: some View {
+        Button("Только предпросмотр") { onApply(true) }
+            .buttonStyle(SubtleButtonStyle())
+            .help("Ничего не отправлять на роутер — просто записать план в журнал")
+    }
+
+    private var applyButton: some View {
+        Button(applyTitle) { onApply(false) }
+            .buttonStyle(PrimaryButtonStyle())
+            .keyboardShortcut(.defaultAction)
+            .disabled(plan.isEmpty)
     }
 
     private func saveCommands() {
@@ -167,9 +213,14 @@ struct PlanSheet: View {
         panel.nameFieldStringValue = "keenetic-plan_\(Format.stamp()).txt"
         panel.allowedContentTypes = [.plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        try? (plan.commands.joined(separator: "\n") + "\n")
-            .write(to: url, atomically: true, encoding: .utf8)
-        log(.ok, "План сохранён: \(url.path)")
+        do {
+            try (plan.commands.joined(separator: "\n") + "\n")
+                .write(to: url, atomically: true, encoding: .utf8)
+            log(.ok, "План сохранён: \(url.path)")
+        } catch {
+            saveError = error.localizedDescription
+            log(.error, "Не удалось сохранить план: \(error.localizedDescription)")
+        }
     }
 }
 
@@ -230,7 +281,7 @@ struct OutcomeSheet: View {
             }
         }
         .padding(22)
-        .frame(width: 560)
+        .frame(minWidth: 420, idealWidth: 560, maxWidth: 560)
         .background(Palette.surface)
     }
 }

@@ -151,6 +151,13 @@ struct FqdnGroup: Identifiable, Hashable {
     var id: String { ident }
     var count: Int { includes.count }
 
+    /// Маршруты в том порядке, в котором они лежат в running-config.
+    /// Для резервирования порядок является частью конфигурации: одинаковый
+    /// набор интерфейсов в другой последовательности — уже другой результат.
+    var routeAssignments: [DnsRouteAssignment] {
+        routeLines.compactMap(DnsRouteAssignment.parse)
+    }
+
     /// На какие интерфейсы уже направлен этот список.
     var routedInterfaces: [String] {
         var result: [String] = []
@@ -172,6 +179,28 @@ struct FqdnGroup: Identifiable, Hashable {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             return regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) != nil
         }
+    }
+}
+
+/// Нормализованная часть `dns-proxy route object-group`: целевой интерфейс
+/// и два флага, которыми управляет приложение. Сырой текст специально не
+/// участвует в сравнении — плоская и вложенная формы running-config означают
+/// одно и то же.
+struct DnsRouteAssignment: Hashable {
+    var interface: String
+    var auto: Bool
+    var reject: Bool
+
+    static func parse(_ line: String) -> DnsRouteAssignment? {
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard tokens.count >= 5,
+              tokens[0] == "dns-proxy",
+              tokens[1] == "route",
+              tokens[2] == "object-group" else { return nil }
+        let flags = Set(tokens.dropFirst(5).map { $0.lowercased() })
+        return DnsRouteAssignment(interface: tokens[4],
+                                  auto: flags.contains("auto"),
+                                  reject: flags.contains("reject"))
     }
 }
 
