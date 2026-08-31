@@ -17,6 +17,10 @@ struct TransportError: LocalizedError {
 /// Общий знаменатель для SSH и HTTP RCI: выполнить команду Keenetic CLI.
 protocol KeeneticTransport: AnyObject {
     var kind: TransportKind { get }
+    /// Сторож долгих операций может оборвать сокет/pty, пока ссылка на
+    /// транспорт ещё лежит в слоте. Перед повторным запросом проверяем это,
+    /// чтобы не возвращать пользователю «сессия не подключена» бесконечно.
+    var isAlive: Bool { get }
     func connect() throws
     func run(_ command: String, timeout: TimeInterval) throws -> String
     func runBatch(_ commands: [String], timeout: TimeInterval) throws -> String

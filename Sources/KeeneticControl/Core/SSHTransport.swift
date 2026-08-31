@@ -5,9 +5,14 @@ import Foundation
 /// без pty он не отдаёт ни приглашения, ни запроса пароля.
 final class SSHTransport: KeeneticTransport {
     let kind: TransportKind = .ssh
+    var isAlive: Bool { isOpen }
 
     private let profile: RouterProfile
     private let password: String?
+    /// Точечные live-проверки поднимают отдельный короткий SSH-сеанс. Они не
+    /// должны засорять журнал сообщениями «SSH: подключено» каждые несколько
+    /// секунд — основное соединение уже показывает пользователю свой статус.
+    private let logsConnection: Bool
 
     /// Дескриптор живёт под замком: `abort()` закрывает его из другого потока,
     /// чтобы разбудить зависший poll() и не держать очередь операций.
@@ -28,9 +33,10 @@ final class SSHTransport: KeeneticTransport {
     private static let more = try! NSRegularExpression(
         pattern: "--More--|press (?:space|any key)[^\\r\\n]*continue", options: [.caseInsensitive])
 
-    init(profile: RouterProfile, password: String?) {
+    init(profile: RouterProfile, password: String?, logsConnection: Bool = true) {
         self.profile = profile
         self.password = password
+        self.logsConnection = logsConnection
     }
 
     deinit { close() }
@@ -60,7 +66,7 @@ final class SSHTransport: KeeneticTransport {
             case .matched(let index, let before, let after):
                 switch index {
                 case 0:
-                    log(.ok, "SSH: подключено к \(profile.host)")
+                    if logsConnection { log(.ok, "SSH: подключено к \(profile.host)") }
                     return
 
                 case 1:
@@ -127,6 +133,50 @@ final class SSHTransport: KeeneticTransport {
                     "Не дождался приглашения Keenetic CLI." + (tail.isEmpty ? "" : " Последний ответ: \(tail)"))
             }
         }
+    }
+
+    /// Получить один live-снимок Ping-Check в изолированном SSH-сеансе.
+    ///
+    /// Некоторые версии Keenetic закрывают интерактивный pty сразу после
+    /// `show ping-check`. Поэтому повторять команду в основном сеансе нельзя:
+    /// следующий цикл увидит «SSH-сессия не подключена» и начнёт бессмысленно
+    /// переподключаться. Одноразовый probe сохраняет основную сессию живой и
+    /// даёт настоящий ответ роутера, а не устаревшую догадку по интерфейсу.
+    static func fetchPingCheck(profile: RouterProfile) throws -> [String: PingCheckLiveInfo] {
+        let probe = SSHTransport(
+            profile: profile,
+            password: profile.resolvedPassword,
+            logsConnection: false)
+        defer { probe.close() }
+        try probe.connect()
+        let output = try probe.run("show ping-check", timeout: 20)
+        return PingCheckStatusParser.parseCLI(output)
+    }
+
+    /// Активный тест живёт в отдельной короткой SSH-сессии. Долгий ping или
+    /// traceroute не занимает основной канал приложения и его отмена не
+    /// ломает чтение конфигурации или параллельную работу с другим экраном.
+    static func ping(profile: RouterProfile, interface: String, target: String,
+                     count: Int = 3, method: InterfaceProbeMethod = .icmp,
+                     port: Int? = nil, sourceAddress: String? = nil) throws -> InterfacePingResult {
+        let command = try InterfacePingProbe.command(
+            interface: interface, target: target, count: count,
+            method: method, port: port, sourceAddress: sourceAddress)
+        let probe = SSHTransport(
+            profile: profile,
+            password: profile.resolvedPassword,
+            logsConnection: false)
+        defer { probe.close() }
+        try probe.connect()
+        let timeout = method == .icmp ? TimeInterval(count + 12) : 28
+        let startedAt = Date()
+        let output = try probe.run(command, timeout: timeout)
+        return InterfacePingProbe.parse(output, interface: interface, target: target,
+                                        method: method, port: port,
+                                        sourceAddress: sourceAddress,
+                                        elapsedMilliseconds: method == .tcp
+                                            ? Date().timeIntervalSince(startedAt) * 1000
+                                            : nil)
     }
 
     private func spawn() throws {

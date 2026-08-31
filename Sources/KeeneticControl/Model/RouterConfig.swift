@@ -77,6 +77,11 @@ struct KeeneticInterface: Identifiable, Hashable {
     var aliases: Set<String> = []
     /// Значение details["ping-check"]["status"], если роутер его прислал.
     var pingCheckStatus: String?
+    /// Профиль и счётчики из `show ping-check` (если прошивка их показывает).
+    var pingCheckProfile: String?
+    var pingCheckFailureCount: Int?
+    var pingCheckSuccessCount: Int?
+    var pingCheckResolvedAddresses: [String] = []
     /// Пиры WireGuard с их живой статистикой.
     var peers: [WireGuardPeerState] = []
 
@@ -115,8 +120,20 @@ struct KeeneticInterface: Identifiable, Hashable {
     /// интерфейс, а конфигурация — поэтому спрашиваем отдельно.
     func pingCheck(configured: Bool) -> PingCheckLiveState {
         guard configured else { return .notConfigured }
-        guard let status = pingCheckStatus, !status.isEmpty else { return .unknown }
-        return status == "running" ? .passing : .failing
+        guard let status = pingCheckStatus else { return .unknown }
+        let normalized = status.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+        switch normalized {
+        case "pass", "passed", "running", "ok", "up", "online", "ready":
+            return .passing
+        case "fail", "failed", "failure", "error", "down", "offline",
+             "stopped", "not ready", "notready":
+            return .failing
+        default:
+            return .unknown
+        }
     }
 
     /// Самое свежее рукопожатие среди пиров — по нему судят о туннеле.
@@ -337,6 +354,17 @@ enum RouterConfigParser {
                 if !item.isGlobal.isEmpty { existing.isGlobal = item.isGlobal }
                 if !item.defaultGW.isEmpty { existing.defaultGW = item.defaultGW }
                 if !item.securityLevel.isEmpty { existing.securityLevel = item.securityLevel }
+                if item.pingCheckStatus != nil { existing.pingCheckStatus = item.pingCheckStatus }
+                if item.pingCheckProfile != nil { existing.pingCheckProfile = item.pingCheckProfile }
+                if item.pingCheckFailureCount != nil {
+                    existing.pingCheckFailureCount = item.pingCheckFailureCount
+                }
+                if item.pingCheckSuccessCount != nil {
+                    existing.pingCheckSuccessCount = item.pingCheckSuccessCount
+                }
+                if !item.pingCheckResolvedAddresses.isEmpty {
+                    existing.pingCheckResolvedAddresses = item.pingCheckResolvedAddresses
+                }
                 existing.aliases.formUnion(item.aliases)
                 result[item.ident] = existing
             } else {
@@ -500,11 +528,40 @@ enum RouterConfigParser {
             if !incoming.defaultGW.isEmpty { item.defaultGW = incoming.defaultGW }
             if !incoming.securityLevel.isEmpty { item.securityLevel = incoming.securityLevel }
             if incoming.pingCheckStatus != nil { item.pingCheckStatus = incoming.pingCheckStatus }
+            if incoming.pingCheckProfile != nil { item.pingCheckProfile = incoming.pingCheckProfile }
+            if incoming.pingCheckFailureCount != nil {
+                item.pingCheckFailureCount = incoming.pingCheckFailureCount
+            }
+            if incoming.pingCheckSuccessCount != nil {
+                item.pingCheckSuccessCount = incoming.pingCheckSuccessCount
+            }
+            if !incoming.pingCheckResolvedAddresses.isEmpty {
+                item.pingCheckResolvedAddresses = incoming.pingCheckResolvedAddresses
+            }
             if !incoming.peers.isEmpty { item.peers = incoming.peers }
             item.aliases.formUnion(incoming.aliases)
             merged[ident] = item
         }
         return merged
+    }
+
+    /// Накладывает отдельный ответ `show ping-check` на уже разобранные
+    /// интерфейсы. Статус может прийти раньше или позже `show interface`, а
+    /// у некоторых прошивок интерфейс вообще есть только в этом ответе.
+    static func applyPingCheck(_ infos: [String: PingCheckLiveInfo],
+                               to interfaces: inout [String: KeeneticInterface]) {
+        for (ident, info) in infos {
+            var item = interfaces[ident] ?? KeeneticInterface(ident: ident)
+            if let status = info.status { item.pingCheckStatus = status }
+            if let profile = info.profile { item.pingCheckProfile = profile }
+            if let count = info.failureCount { item.pingCheckFailureCount = count }
+            if let count = info.successCount { item.pingCheckSuccessCount = count }
+            if !info.resolvedAddresses.isEmpty {
+                item.pingCheckResolvedAddresses = info.resolvedAddresses
+            }
+            item.aliases.insert(ident)
+            interfaces[ident] = item
+        }
     }
 
     /// Интерфейсы, на которые осмысленно вешать маршруты: VPN — первыми.

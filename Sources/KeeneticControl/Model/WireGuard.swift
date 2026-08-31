@@ -373,6 +373,7 @@ struct WireGuardState {
     var peerKeys: [String] = []
     var listenPort: String = ""
     var addresses: [String] = []
+    var mtu: Int?
     var isUp: Bool = false
     var descriptionText: String = ""
 
@@ -398,6 +399,9 @@ struct WireGuardState {
                 state.listenPort = String(trimmed.dropFirst("wireguard listen-port ".count))
             } else if trimmed.hasPrefix("ip address ") {
                 state.addresses.append(String(trimmed.dropFirst("ip address ".count)))
+            } else if trimmed.hasPrefix("ip mtu ") {
+                state.mtu = Int(trimmed.dropFirst("ip mtu ".count)
+                    .trimmingCharacters(in: .whitespaces))
             } else if trimmed.hasPrefix("description ") {
                 state.descriptionText = CLI.unquote(String(trimmed.dropFirst("description ".count)))
             } else if trimmed == "up" {

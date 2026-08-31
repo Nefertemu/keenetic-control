@@ -4,6 +4,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case overview
     case wireguard
     case pingCheck
+    case diagnostics
     case fqdn
     case dnsRoutes
     case staticRoutes
@@ -19,6 +20,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .overview:      return "Обзор"
         case .wireguard:     return "WireGuard"
         case .pingCheck:     return "Ping-Check"
+        case .diagnostics:   return "Диагностика"
         case .fqdn:          return "Списки FQDN"
         case .dnsRoutes:     return "Маршруты списков"
         case .staticRoutes:  return "Статические маршруты"
@@ -34,6 +36,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .overview:      return "square.grid.2x2"
         case .wireguard:     return "shield.lefthalf.filled"
         case .pingCheck:     return "waveform.path.ecg"
+        case .diagnostics:   return "stethoscope"
         case .fqdn:          return "list.bullet.rectangle"
         case .dnsRoutes:     return "arrow.triangle.branch"
         case .staticRoutes:  return "point.topleft.down.to.point.bottomright.curvepath"
@@ -47,7 +50,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var group: String {
         switch self {
         case .overview:                          return "Роутер"
-        case .wireguard, .pingCheck:             return "Туннели"
+        case .wireguard, .pingCheck, .diagnostics: return "Туннели"
         case .fqdn, .dnsRoutes, .staticRoutes, .compare:
                                                  return "Маршрутизация"
         case .backups, .journal, .routers:       return "Служебное"
@@ -229,7 +232,7 @@ struct RootView: View {
                         routerConnectionButton(router, status: routerStatus)
                     }
                     .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
+                    .frame(height: 32)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(active ? Palette.accent.opacity(0.14) : Color.primary.opacity(0.06)))
@@ -240,7 +243,11 @@ struct RootView: View {
             }
             .padding(.vertical, 1)
         }
-        .frame(maxHeight: min(CGFloat(store.routers.count * 34), 180))
+        // maxHeight позволял ScrollView ужаться до одной-двух строк при
+        // перерасчёте sidebar. Фиксируем фактическую высоту до пяти строк:
+        // три сохранённых роутера всегда видны целиком, дальше появляется
+        // вертикальная прокрутка.
+        .frame(height: CGFloat(min(store.routers.count, 5) * 37 - 3 + 2))
     }
 
     private func routerConnectionButton(_ router: RouterProfile,
@@ -312,6 +319,7 @@ struct RootView: View {
                 case .overview:      OverviewView(alert: $alert, section: $section)
                 case .wireguard:     WireGuardView(alert: $alert, section: $section)
                 case .pingCheck:     PingCheckView(alert: $alert)
+                case .diagnostics:   DiagnosticsView(alert: $alert)
                 case .fqdn:          FqdnView(alert: $alert)
                 case .dnsRoutes:     DnsRoutesView(alert: $alert)
                 case .staticRoutes:  StaticRoutesView(alert: $alert)
@@ -428,6 +436,6 @@ struct RootView: View {
 
 extension Bundle {
     static var appVersion: String {
-        (main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.0"
+        (main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.1.0"
     }
 }

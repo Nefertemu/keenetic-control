@@ -12,7 +12,7 @@ SIGN_ROOT="$(mktemp -d /tmp/keenetic-control-sign.XXXXXX)"
 BUNDLE="$SIGN_ROOT/$APP_NAME.app"
 trap 'rm -rf "$SIGN_ROOT"' EXIT
 BINARY="KeeneticControl"
-VERSION="1.0"
+VERSION="1.1.0"
 
 # Макросы SwiftUI живут в Xcode, а не в Command Line Tools.
 if [ -d "/Applications/Xcode.app/Contents/Developer" ] && \

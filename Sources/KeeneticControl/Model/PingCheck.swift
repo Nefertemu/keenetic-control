@@ -154,6 +154,272 @@ struct PingCheckBinding: Hashable {
     var restart: Bool
 }
 
+/// Живой результат Ping-Check. В старых прошивках он приходит текстом из
+/// `show ping-check`, в новых — JSON из `show/ping-check`. Поля намеренно
+/// необязательные: разные версии Keenetic показывают разный набор счётчиков.
+struct PingCheckLiveInfo: Hashable {
+    var profile: String?
+    var status: String?
+    var failureCount: Int?
+    var successCount: Int?
+    var resolvedAddresses: [String]
+
+    init(profile: String? = nil,
+         status: String? = nil,
+         failureCount: Int? = nil,
+         successCount: Int? = nil,
+         resolvedAddresses: [String] = []) {
+        self.profile = profile
+        self.status = status
+        self.failureCount = failureCount
+        self.successCount = successCount
+        self.resolvedAddresses = resolvedAddresses
+    }
+
+    var normalizedStatus: String? {
+        guard let status else { return nil }
+        let value = status.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+        return value.isEmpty ? nil : value
+    }
+
+    var state: PingCheckLiveState {
+        switch normalizedStatus {
+        case "pass", "passed", "running", "ok", "up", "online", "ready":
+            return .passing
+        case "fail", "failed", "failure", "error", "down", "offline",
+             "stopped", "not ready", "notready":
+            return .failing
+        default:
+            return .unknown
+        }
+    }
+}
+
+/// Разбор живого состояния профилей Ping-Check. Поле `interface` у RCI —
+/// словарь с именами интерфейсов, а SSH-вывод — последовательность строк.
+/// Держим оба варианта здесь, чтобы транспорт не знал о форме данных.
+enum PingCheckStatusParser {
+    static func parseCLI(_ text: String) -> [String: PingCheckLiveInfo] {
+        let normalized = CLI.stripNoise(CLI.normalizeNewlines(text))
+        var result: [String: PingCheckLiveInfo] = [:]
+        var profile: String?
+        var currentInterface: String?
+        var awaitingInterfaceName = false
+
+        let profilePattern = try! NSRegularExpression(
+            pattern: "^(?:ping-check\\s+)?profile\\s*:\\s*(.+?)\\s*$",
+            options: [.caseInsensitive])
+        let interfacePattern = try! NSRegularExpression(
+            pattern: "^(?:interface|ifname)\\s*:\\s*(.+?)\\s*$",
+            options: [.caseInsensitive])
+        // KeeneticOS 5.x prints an interface as a nested block:
+        // `interface:` followed by `name: Wireguard0`. Older versions put
+        // the name on the same line, so both forms are accepted.
+        let interfaceHeader = try! NSRegularExpression(
+            pattern: "^interface\\s*:\\s*$", options: [.caseInsensitive])
+        let interfaceNamePattern = try! NSRegularExpression(
+            pattern: "^name\\s*:\\s*(.+?)\\s*$", options: [.caseInsensitive])
+        let statusPattern = try! NSRegularExpression(
+            pattern: "^status\\s*:\\s*(.+?)\\s*$", options: [.caseInsensitive])
+        let failurePattern = try! NSRegularExpression(
+            pattern: "^(?:fail(?:ure)?[ -]?count|fail count)\\s*:\\s*(\\d+)",
+            options: [.caseInsensitive])
+        let successPattern = try! NSRegularExpression(
+            pattern: "^(?:success(?:ful)?[ -]?count|success count)\\s*:\\s*(\\d+)",
+            options: [.caseInsensitive])
+        let addressPattern = try! NSRegularExpression(
+            pattern: "^addresses?\\s*:\\s*(.+?)\\s*$", options: [.caseInsensitive])
+
+        func capture(_ regex: NSRegularExpression, _ line: String) -> String? {
+            guard let match = regex.firstMatch(in: line,
+                                               range: NSRange(line.startIndex..., in: line)),
+                  let range = Range(match.range(at: 1), in: line) else { return nil }
+            return CLI.unquote(String(line[range]).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        func update(_ body: (inout PingCheckLiveInfo) -> Void) {
+            guard let currentInterface else { return }
+            var info = result[currentInterface] ?? PingCheckLiveInfo(profile: profile)
+            if info.profile == nil { info.profile = profile }
+            body(&info)
+            result[currentInterface] = info
+        }
+
+        for raw in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw).trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+
+            if line.lowercased() == "pingcheck:" || line.lowercased() == "ping-check:" {
+                // Новый блок профиля начинается с profile:. Интерфейс не
+                // переносим между блоками, иначе статус мог бы приклеиться
+                // к следующему профилю без интерфейса.
+                profile = nil
+                currentInterface = nil
+                awaitingInterfaceName = false
+                continue
+            }
+            if let value = capture(profilePattern, line) {
+                profile = value
+                currentInterface = nil
+                awaitingInterfaceName = false
+                continue
+            }
+            if let value = capture(interfacePattern, line) {
+                currentInterface = value
+                result[value] = result[value] ?? PingCheckLiveInfo(profile: profile)
+                awaitingInterfaceName = false
+                continue
+            }
+            if interfaceHeader.firstMatch(in: line,
+                                          range: NSRange(line.startIndex..., in: line)) != nil {
+                currentInterface = nil
+                awaitingInterfaceName = true
+                continue
+            }
+            if awaitingInterfaceName, let value = capture(interfaceNamePattern, line) {
+                currentInterface = value
+                result[value] = result[value] ?? PingCheckLiveInfo(profile: profile)
+                awaitingInterfaceName = false
+                continue
+            }
+            if let value = capture(statusPattern, line) {
+                update { $0.status = value }
+                continue
+            }
+            if let value = capture(failurePattern, line), let count = Int(value) {
+                update { $0.failureCount = count }
+                continue
+            }
+            if let value = capture(successPattern, line), let count = Int(value) {
+                update { $0.successCount = count }
+                continue
+            }
+            if let value = capture(addressPattern, line), IPTools.isIP(value) {
+                update { $0.resolvedAddresses.append(value) }
+            }
+        }
+        return result
+    }
+
+    static func parseJSON(_ value: Any?) -> [String: PingCheckLiveInfo] {
+        var result: [String: PingCheckLiveInfo] = [:]
+
+        func string(_ value: Any?) -> String? {
+            switch value {
+            case let value as String: return value
+            case let value as NSNumber: return value.stringValue
+            default: return nil
+            }
+        }
+
+        func integer(_ value: Any?) -> Int? {
+            switch value {
+            case let value as NSNumber: return value.intValue
+            case let value as String: return Int(value.trimmingCharacters(in: .whitespaces))
+            default: return nil
+            }
+        }
+
+        func addresses(_ value: Any?) -> [String] {
+            if let array = value as? [Any] {
+                return array.flatMap(addresses)
+            }
+            if let map = value as? [String: Any] {
+                let lowered = map.reduce(into: [String: Any]()) { result, pair in
+                    if result[pair.key.lowercased()] == nil { result[pair.key.lowercased()] = pair.value }
+                }
+                let direct = ["address", "ip", "addr"].compactMap { string(lowered[$0]) }
+                    .filter(IPTools.isIP)
+                return direct + map.values.flatMap(addresses)
+            }
+            guard let value = string(value), IPTools.isIP(value) else { return [] }
+            return [value]
+        }
+
+        func info(from map: [String: Any], profile: String?) -> PingCheckLiveInfo? {
+            let lowered = map.reduce(into: [String: Any]()) { result, pair in
+                if result[pair.key.lowercased()] == nil { result[pair.key.lowercased()] = pair.value }
+            }
+            let status = string(lowered["status"])
+                ?? string((lowered["state"] as? [String: Any])?["status"])
+            let failure = integer(lowered["failcount"] ?? lowered["fail-count"]
+                                  ?? lowered["failurecount"] ?? lowered["failure-count"])
+            let success = integer(lowered["successcount"] ?? lowered["success-count"])
+            let cache = lowered["ipcache"] ?? lowered["ip-cache"] ?? lowered["cache"]
+            let resolved = addresses(cache)
+            guard status != nil || failure != nil || success != nil || !resolved.isEmpty else {
+                return nil
+            }
+            return PingCheckLiveInfo(profile: profile, status: status,
+                                     failureCount: failure, successCount: success,
+                                     resolvedAddresses: Array(Set(resolved)).sorted())
+        }
+
+        func merge(_ incoming: PingCheckLiveInfo, for interface: String) {
+            var existing = result[interface] ?? PingCheckLiveInfo()
+            if existing.profile == nil { existing.profile = incoming.profile }
+            if incoming.status != nil { existing.status = incoming.status }
+            if incoming.failureCount != nil { existing.failureCount = incoming.failureCount }
+            if incoming.successCount != nil { existing.successCount = incoming.successCount }
+            if !incoming.resolvedAddresses.isEmpty {
+                existing.resolvedAddresses = Array(Set(existing.resolvedAddresses
+                    + incoming.resolvedAddresses)).sorted()
+            }
+            result[interface] = existing
+        }
+
+        func walk(_ raw: Any?, profile: String? = nil, interface: String? = nil) {
+            if let array = raw as? [Any] {
+                for item in array { walk(item, profile: profile, interface: interface) }
+                return
+            }
+            guard let map = raw as? [String: Any] else { return }
+
+            let keys = map.reduce(into: [String: Any]()) { result, pair in
+                if result[pair.key.lowercased()] == nil { result[pair.key.lowercased()] = pair.value }
+            }
+            let currentProfile = string(keys["profile"]) ?? profile
+            if let currentInterface = string(keys["interface"]) {
+                if let parsed = info(from: map, profile: currentProfile) {
+                    merge(parsed, for: currentInterface)
+                }
+                walkChildren(map, profile: currentProfile, interface: currentInterface)
+                return
+            }
+
+            if let interfaces = keys["interface"] as? [String: Any] {
+                for (name, payload) in interfaces {
+                    if let payload = payload as? [String: Any],
+                       let parsed = info(from: payload, profile: currentProfile) {
+                        merge(parsed, for: name)
+                    }
+                    walk(payload, profile: currentProfile, interface: name)
+                }
+            }
+
+            if let interface, let parsed = info(from: map, profile: currentProfile) {
+                merge(parsed, for: interface)
+            }
+            walkChildren(map, profile: currentProfile, interface: interface)
+        }
+
+        func walkChildren(_ map: [String: Any], profile: String?, interface: String?) {
+            for (key, child) in map {
+                let lowered = key.lowercased()
+                guard lowered != "interface", lowered != "profile", lowered != "status",
+                      lowered != "state", lowered != "ipcache", lowered != "ip-cache" else { continue }
+                walk(child, profile: profile, interface: interface)
+            }
+        }
+
+        walk(value)
+        return result
+    }
+}
+
 enum PingCheckParser {
     /// Разбирает профили и их привязки из running-config.
     static func parse(config text: String) -> (profiles: [PingCheckProfile],

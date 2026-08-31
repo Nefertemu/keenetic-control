@@ -21,6 +21,14 @@ struct WireGuardView: View {
     @State private var pingRefreshing = false
     @State private var pingUpdatedAt: Date?
     @State private var pingError: String?
+    @State private var probeTarget = "1.1.1.1"
+    @State private var probeMethod: InterfaceProbeMethod = .icmp
+    @State private var probePort = "443"
+    @State private var probeResults: [String: InterfacePingResult] = [:]
+    @State private var probeRunning = false
+    @State private var probeUpdatedAt: Date?
+    @State private var probeError: String?
+    @ObservedObject private var healthStore = TunnelHealthStore.shared
 
     private var interfaces: [String] { session.state?.wireguardInterfaces ?? [] }
 
@@ -35,9 +43,15 @@ struct WireGuardView: View {
 
     private var liveMonitorID: String {
         let binding = session.state?.pingCheckBindings[interfaceIdent]?.profile ?? ""
-        // Перезапускаем сторожа после назначения/снятия профиля, но не на
-        // каждое обновление живой статистики (оно меняет readAt).
-        return "\(session.router.id.uuidString)|\(interfaceIdent)|\(session.status.isOnline)|\(binding)"
+        // Перезапускаем сторожа после смены роутера, интерфейса или профиля,
+        // но не при кратком переходе online → offline во время восстановления
+        // SSH: смена статуса иначе отменяет текущий запрос и тут же обрывает
+        // только что поднятую сессию.
+        return "\(session.router.id.uuidString)|\(interfaceIdent)|\(binding)"
+    }
+
+    private var interfaceProbeMonitorID: String {
+        "\(session.router.id.uuidString)|\(interfaces.joined(separator: ","))|\(probeMethod.rawValue)"
     }
 
     private var currentPingCheck: PingCheckLiveState {
@@ -48,6 +62,21 @@ struct WireGuardView: View {
         guard let name = session.state?.pingCheckBindings[interfaceIdent]?.profile,
               !name.isEmpty else { return nil }
         return session.state?.pingCheckProfiles.first { $0.name == name }
+    }
+
+    private var healthSamples: [TunnelHealthSample] {
+        guard !interfaceIdent.isEmpty else { return [] }
+        return healthStore.samples(routerID: session.router.id, interface: interfaceIdent)
+    }
+
+    private var healthOutages: [TunnelOutageInterval] {
+        guard !interfaceIdent.isEmpty else { return [] }
+        return healthStore.outages(routerID: session.router.id, interface: interfaceIdent)
+    }
+
+    private var healthAvailability: Double? {
+        guard !interfaceIdent.isEmpty else { return nil }
+        return healthStore.availability(routerID: session.router.id, interface: interfaceIdent)
     }
 
     private func pingTint(_ state: PingCheckLiveState) -> Color {
@@ -87,7 +116,17 @@ struct WireGuardView: View {
             .padding(20)
         }
         .onAppear(perform: pickDefault)
-        .onChange(of: session.state?.readAt) { _, _ in pickDefault() }
+        .onChange(of: session.state?.readAt) { _, _ in
+            // Live Ping-Check обновляет readAt каждые несколько секунд. Не
+            // сбрасываем из-за этого время последней проверки и её ошибку —
+            // иначе UI всё время выглядит так, будто ответа ещё не было.
+            if interfaceIdent.isEmpty || !interfaces.contains(interfaceIdent) {
+                pickDefault()
+            } else {
+                syncInterfaceName()
+                refreshBaseline()
+            }
+        }
         .onChange(of: interfaceIdent) { _, _ in
             refreshBaseline()
             syncInterfaceName()
@@ -100,12 +139,34 @@ struct WireGuardView: View {
             config = nil
             namePlan = nil
             interfaceName = ""
+            probeResults.removeAll()
+            probeUpdatedAt = nil
+            probeError = nil
             pickDefault()
+        }
+        .onChange(of: probeTarget) { _, _ in
+            probeResults.removeAll()
+            probeUpdatedAt = nil
+            probeError = nil
+        }
+        .onChange(of: probeMethod) { _, method in
+            probePort = method.usesPort ? String(method.defaultPort) : ""
+            probeResults.removeAll()
+            probeUpdatedAt = nil
+            probeError = nil
+        }
+        .onChange(of: probePort) { _, _ in
+            probeResults.removeAll()
+            probeUpdatedAt = nil
+            probeError = nil
         }
         // Ping-Check и статистика WireGuard живут в статусе интерфейса, а не
         // в running-config. Обновляем их отдельно, пока открыт этот экран.
         .task(id: liveMonitorID) {
             await monitorLiveInterface()
+        }
+        .task(id: interfaceProbeMonitorID) {
+            await monitorInterfacePings()
         }
         .confirmationDialog("Обновить «\(session.state?.shortLabel(for: interfaceIdent) ?? interfaceIdent)» новым конфигом?",
                             isPresented: $confirmUpdate, titleVisibility: .visible) {
@@ -155,8 +216,8 @@ struct WireGuardView: View {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) {
                     CardHeader(icon: "waveform.path.ecg",
-                               title: "Ping-Check в реальном времени",
-                               subtitle: "Состояние и WireGuard-статистика обновляются автоматически")
+                               title: "Встроенный Ping-Check",
+                               subtitle: "Решение роутера: рабочий интерфейс или нет; RTT измеряется выше")
                     Spacer(minLength: 8)
                     livePingStatus(check)
                 }
@@ -164,8 +225,8 @@ struct WireGuardView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     CardHeader(icon: "waveform.path.ecg",
-                               title: "Ping-Check в реальном времени",
-                               subtitle: "Автообновление каждые 4 секунды")
+                               title: "Встроенный Ping-Check",
+                               subtitle: "Статус роутера · автообновление каждые 4 секунды")
                     livePingStatus(check)
                 }
             }
@@ -208,10 +269,12 @@ struct WireGuardView: View {
                     if check == .notConfigured {
                         configurePingButton
                     }
+                    diagnosticsButton
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     pingUpdatedLabel
                     if check == .notConfigured { configurePingButton }
+                    diagnosticsButton
                 }
             }
 
@@ -257,6 +320,11 @@ struct WireGuardView: View {
             .buttonStyle(SubtleButtonStyle(tint: Palette.accent))
     }
 
+    private var diagnosticsButton: some View {
+        Button("Диагностика") { section = .diagnostics }
+            .buttonStyle(SubtleButtonStyle(tint: Palette.accent))
+    }
+
     // MARK: - Состояние интерфейса
 
     private var interfaceCard: some View {
@@ -277,7 +345,16 @@ struct WireGuardView: View {
 
             interfaceNameEditor
 
+            interfacePingCard
+
             livePingCard
+
+            if currentPingCheck != .notConfigured {
+                TunnelHealthCard(samples: healthSamples,
+                                 outages: healthOutages,
+                                 availability: healthAvailability,
+                                 interface: interfaceIdent)
+            }
 
             if let live = liveState {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
@@ -323,6 +400,203 @@ struct WireGuardView: View {
             }
         }
         .card()
+    }
+
+    // MARK: - Настоящий RTT через каждый туннель
+
+    private var interfacePingCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    CardHeader(icon: "timer",
+                               title: "Проверка через WireGuard-интерфейсы",
+                               subtitle: probeMethod.explanation)
+                    Spacer(minLength: 12)
+                    probeControls
+                }
+                .frame(minWidth: 720)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    CardHeader(icon: "timer",
+                               title: "Проверка через WireGuard-интерфейсы",
+                               subtitle: probeMethod.explanation)
+                    probeControls
+                }
+            }
+
+            Divider()
+
+            VStack(spacing: 0) {
+                ForEach(Array(interfaces.enumerated()), id: \.element) { index, ident in
+                    interfacePingRow(ident)
+                    if index < interfaces.count - 1 { Divider() }
+                }
+            }
+            .inset()
+
+            HStack(spacing: 7) {
+                if probeRunning {
+                    ProgressView().controlSize(.small)
+                    Text("Проверяю туннели по очереди…")
+                } else if let probeUpdatedAt {
+                    Text("Последний запуск: \(probeUpdatedAt.formatted(date: .omitted, time: .standard)) · автообновление каждые \(probeRefreshSeconds) с")
+                } else {
+                    Text("Ожидаю первый запуск…")
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(.tertiary)
+
+            if let probeError {
+                Text(probeError)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .inset()
+    }
+
+    private var probeControls: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Picker("Метод", selection: $probeMethod) {
+                    ForEach(InterfaceProbeMethod.allCases) { method in
+                        Text(method.title).tag(method)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 170)
+
+                TextField("Домен или IP", text: $probeTarget)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(minWidth: 130, idealWidth: 190, maxWidth: 240)
+                    .onSubmit { Task { await runInterfacePings() } }
+                if probeMethod.usesPort {
+                    TextField("Порт", text: $probePort)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(width: 66)
+                        .onSubmit { Task { await runInterfacePings() } }
+                }
+                Button {
+                    Task { await runInterfacePings() }
+                } label: {
+                    Label("Проверить все", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(SubtleButtonStyle(tint: Palette.accent))
+                .disabled(probeRunning || !session.status.isOnline)
+            }
+
+            if probeMethod != .icmp {
+                Text("Цель должна быть направлена через эти туннели — например, назначена им в «Маршрутах списков».")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func interfacePingRow(_ ident: String) -> some View {
+        let result = probeResults[ident]
+        let tint: Color = result.map { item in
+            if item.error != nil || item.received == 0 { return Palette.danger }
+            return item.lossPercent > 0 ? Palette.warning : Palette.success
+        } ?? .secondary
+
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) {
+                pingInterfaceIdentity(ident, tint: tint)
+                    .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                pingMetric(probeMethod == .tcp ? "TCP" : "Сейчас",
+                           value: formatLatest(result), tint: tint)
+                    .frame(width: 82, alignment: .leading)
+                pingMetric("Среднее", value: formatRTT(result?.averageRTT), tint: tint)
+                    .frame(width: 82, alignment: .leading)
+                pingMetric("Мин / макс", value: formatRange(result), tint: tint)
+                    .frame(width: 120, alignment: .leading)
+                pingMetric("Потери", value: formatLoss(result), tint: tint)
+                    .frame(width: 76, alignment: .leading)
+            }
+            .frame(minWidth: 650)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+
+            VStack(alignment: .leading, spacing: 8) {
+                pingInterfaceIdentity(ident, tint: tint)
+                HStack(spacing: 18) {
+                    pingMetric(probeMethod == .tcp ? "TCP" : "Сейчас",
+                               value: formatLatest(result), tint: tint)
+                    pingMetric("Среднее", value: formatRTT(result?.averageRTT), tint: tint)
+                    pingMetric("Мин / макс", value: formatRange(result), tint: tint)
+                    pingMetric("Потери", value: formatLoss(result), tint: tint)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+    }
+
+    private func pingInterfaceIdentity(_ ident: String, tint: Color) -> some View {
+        HStack(spacing: 8) {
+            Circle().fill(tint).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.state?.shortLabel(for: ident) ?? ident)
+                    .font(.system(size: 12, weight: .semibold))
+                HStack(spacing: 5) {
+                    Text(ident)
+                    if let source = probeResults[ident]?.source, source != ident {
+                        Text("→ \(source)")
+                    }
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                if let error = probeResults[ident]?.error {
+                    Text(error)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Palette.danger)
+                        .lineLimit(2)
+                }
+            }
+        }
+    }
+
+    private func pingMetric(_ title: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.system(size: 9)).foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(value == "—" ? Color.secondary : tint)
+                .lineLimit(1)
+        }
+    }
+
+    private func formatRTT(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return value < 10 ? String(format: "%.1f мс", value) : String(format: "%.0f мс", value)
+    }
+
+    private func formatLatest(_ result: InterfacePingResult?) -> String {
+        guard let result else { return "—" }
+        if result.method == .tcp {
+            guard result.isReachable else { return "нет" }
+            return result.latestRTT.map(formatRTT) ?? "доступен"
+        }
+        return formatRTT(result.latestRTT)
+    }
+
+    private func formatRange(_ result: InterfacePingResult?) -> String {
+        guard let minimum = result?.minimumRTT, let maximum = result?.maximumRTT else { return "—" }
+        return "\(String(format: "%.0f", minimum)) / \(String(format: "%.0f", maximum)) мс"
+    }
+
+    private func formatLoss(_ result: InterfacePingResult?) -> String {
+        guard let result else { return "—" }
+        return String(format: "%.0f%%", result.lossPercent)
     }
 
     private var interfaceHeader: some View {
@@ -605,6 +879,73 @@ struct WireGuardView: View {
 
     // MARK: - Логика
 
+    private func monitorInterfacePings() async {
+        guard !interfaces.isEmpty else { return }
+        while !Task.isCancelled {
+            if session.status.isOnline, session.state != nil {
+                await runInterfacePings()
+            }
+            do {
+                try await Task.sleep(nanoseconds: UInt64(probeRefreshSeconds) * 1_000_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func runInterfacePings() async {
+        guard !probeRunning, session.status.isOnline else { return }
+        let cleanTarget: String
+        do {
+            cleanTarget = try InterfacePingProbe.validate(
+                interface: interfaces.first ?? "Wireguard0", target: probeTarget).1
+        } catch {
+            probeError = session.describe(error)
+            return
+        }
+
+        let checkedPort: Int?
+        if probeMethod.usesPort {
+            guard let value = Int(probePort), (1...65535).contains(value) else {
+                probeError = "Порт должен быть числом от 1 до 65535."
+                return
+            }
+            checkedPort = value
+        } else {
+            checkedPort = nil
+        }
+
+        let owner = session.router.id
+        let targets = interfaces
+        probeRunning = true
+        probeError = nil
+        defer { probeRunning = false }
+
+        for ident in targets {
+            guard !Task.isCancelled, owner == session.router.id else { return }
+            do {
+                let result = try await session.ping(interface: ident, target: cleanTarget, count: 3,
+                                                    method: probeMethod, port: checkedPort)
+                guard !Task.isCancelled, owner == session.router.id,
+                      cleanTarget == probeTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+                else { return }
+                probeResults[ident] = result
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, owner == session.router.id else { return }
+                probeResults[ident] = InterfacePingResult(
+                    interface: ident, target: cleanTarget,
+                    method: probeMethod, port: checkedPort, source: nil,
+                    transmitted: 0, received: 0, rtt: [], checkedAt: Date(),
+                    error: session.describe(error))
+            }
+        }
+        probeUpdatedAt = Date()
+    }
+
+    private var probeRefreshSeconds: Int { probeMethod == .icmp ? 20 : 60 }
+
     private func monitorLiveInterface() async {
         let ident = interfaceIdent
         guard !ident.isEmpty else { return }
@@ -642,6 +983,21 @@ struct WireGuardView: View {
             } else {
                 pingUpdatedAt = Date()
                 pingError = nil
+                if let result {
+                    let configured = session.state?.hasPingCheck(target) == true
+                    healthStore.record(routerID: session.router.id,
+                                       interface: target,
+                                       ping: result.pingCheck(configured: configured),
+                                       interfaceUp: result.isUp,
+                                       // Не каждая прошивка отдаёт возраст
+                                       // рукопожатия в `show interface`. Его
+                                       // отсутствие не должно превращать
+                                       // успешный Ping-Check в «нестабильно»;
+                                       // известный просроченный handshake всё
+                                       // равно даст false.
+                                       handshakeFresh: result.freshestHandshake.map { $0 <= 180 } ?? true,
+                                       pingStatus: result.pingCheckStatus)
+                }
             }
         } catch is CancellationError {
             return

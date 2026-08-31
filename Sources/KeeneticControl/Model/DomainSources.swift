@@ -395,7 +395,7 @@ enum SourceLoader {
         }
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 40)
-        request.setValue("KeeneticControl/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("KeeneticControl/1.1.0", forHTTPHeaderField: "User-Agent")
         request.setValue("text/plain", forHTTPHeaderField: "Accept")
 
         let semaphore = DispatchSemaphore(value: 0)

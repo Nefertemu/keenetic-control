@@ -55,6 +55,7 @@ interface Wireguard0
         allow-ips 0.0.0.0 0.0.0.0
         !
     ip address 10.7.0.2 255.255.255.0
+    ip mtu 1420
     up
 !
 interface ISP
@@ -174,6 +175,100 @@ check("неизвестное не показывается как состоя�
       !(liveIfaces["Wireguard2"]?.pingCheck(configured: true).isKnown ?? true))
 check("а известное показывается",
       liveIfaces["Wireguard0"]?.pingCheck(configured: true).isKnown ?? false)
+
+print("\n== Живой Ping-Check (show ping-check / RCI) ==")
+let pingCLI = """
+pingcheck:
+    profile: vpn
+    host: 1.1.1.1
+    mode: icmp
+    interface: Wireguard0
+    fail count: 0
+    status: pass
+pingcheck:
+    profile: backup
+    interface: Wireguard1
+    fail count: 3
+    success count: 1
+    status: fail
+"""
+let parsedPingCLI = PingCheckStatusParser.parseCLI(pingCLI)
+check("CLI pass привязан к интерфейсу",
+      parsedPingCLI["Wireguard0"]?.state == .passing)
+check("CLI счётчик отказов",
+      String(parsedPingCLI["Wireguard1"]?.failureCount ?? -1), "3")
+check("CLI счётчик успехов",
+      String(parsedPingCLI["Wireguard1"]?.successCount ?? -1), "1")
+check("CLI fail привязан к интерфейсу",
+      parsedPingCLI["Wireguard1"]?.state == .failing)
+
+let pingCLINested = """
+pingcheck:
+    profile: vpn
+            interface:
+                     name: Wireguard0
+                successcount: 1613
+                    failcount: 0
+                       status: pass
+                  ipcache:
+                         host: 1.1.1.1
+                    addresses: 1.1.1.1
+"""
+let parsedPingCLINested = PingCheckStatusParser.parseCLI(pingCLINested)
+check("CLI вложенный interface.name разбирается",
+      parsedPingCLINested["Wireguard0"]?.state == .passing)
+check("CLI вложенный interface сохраняет счётчик",
+      String(parsedPingCLINested["Wireguard0"]?.successCount ?? -1), "1613")
+check("CLI addresses сохраняется",
+      parsedPingCLINested["Wireguard0"]?.resolvedAddresses == ["1.1.1.1"])
+
+let pingJSON: [String: Any] = [
+    "pingcheck": [[
+        "profile": "vpn",
+        "interface": [
+            "Wireguard0": [
+                "status": "pass",
+                "failcount": 0,
+                "successcount": 4,
+                "ipcache": [["host": "one.one.one.one", "address": "1.1.1.1"]],
+            ] as [String: Any],
+        ] as [String: Any],
+    ] as [String: Any]],
+]
+let parsedPingJSON = PingCheckStatusParser.parseJSON(pingJSON)
+check("RCI pass разбирается",
+      parsedPingJSON["Wireguard0"]?.state == .passing)
+check("RCI ipcache даёт адрес",
+      parsedPingJSON["Wireguard0"]?.resolvedAddresses == ["1.1.1.1"])
+check("RCI successcount разбирается",
+      String(parsedPingJSON["Wireguard0"]?.successCount ?? -1), "4")
+
+var pingMerged = interfaces
+RouterConfigParser.applyPingCheck(parsedPingJSON, to: &pingMerged)
+check("живой статус накладывается на интерфейс",
+      pingMerged["Wireguard0"]?.pingCheckStatus ?? "nil", "pass")
+check("живой профиль накладывается на интерфейс",
+      pingMerged["Wireguard0"]?.pingCheckProfile ?? "nil", "vpn")
+
+var diagnosticState = RouterState()
+diagnosticState.configText = sampleConfig + "\nip name-server 1.1.1.1 8.8.8.8\n"
+diagnosticState.groups = groups
+diagnosticState.interfaces = liveIfaces
+if var wireguard = diagnosticState.interfaces["Wireguard0"] {
+    wireguard.pingCheckResolvedAddresses = ["1.1.1.1"]
+    diagnosticState.interfaces["Wireguard0"] = wireguard
+}
+diagnosticState.pingCheckProfiles = [PingCheckProfile(name: "vpn", host: "1.1.1.1")]
+diagnosticState.pingCheckBindings = ["Wireguard0": PingCheckBinding(profile: "vpn", restart: false)]
+diagnosticState.staticRoutes = StaticRouteParser.parse(config: sampleConfig)
+let diagnostics = RouterDiagnosticsBuilder.build(state: diagnosticState,
+                                                 interface: "Wireguard0",
+                                                 target: "example.com")
+check("DNS-серверы читаются", diagnosticState.nameServers,
+      ["1.1.1.1", "8.8.8.8"])
+check("диагностика DNS видит резолвинг", diagnostics.dns.severity == .pass)
+check("диагностика маршрута видит FQDN и static", diagnostics.route.severity == .pass)
+check("диагностика MTU видит безопасное значение", diagnostics.mtu.severity == .pass)
 
 // Роутер прислал details, но без ping-check — тоже «не знаем».
 let noCheck = RouterConfigParser.parseInterfaceStatus(json: [
@@ -417,6 +512,7 @@ let live = WireGuardState.parse(config: sampleConfig, interface: "Wireguard0")
 check("пир прочитан", live.peerKeys == ["aBcDeFgH1234567890abcdefghijklmnopqrstuv="])
 check("порт прочитан", live.listenPort, "51820")
 check("интерфейс поднят", live.isUp)
+check("MTU интерфейса прочитан", String(live.mtu ?? -1), "1420")
 check("список wg-интерфейсов", WireGuardState.interfaceNames(config: sampleConfig) == ["Wireguard0"])
 let renamePlan = try? WireGuardPlanner.planRename(interface: "Wireguard0",
                                                   current: "старое имя",
@@ -627,8 +723,97 @@ check("ответ RCI распознаётся как конфигурация",
       RCITransport.looksLikeConfig(normalized))
 check("HTML веб-панели отбивается",
       !RCITransport.looksLikeConfig(String(repeating: "<html><body>nope</body></html>", count: 20)))
+do {
+    let closedRCI = try RCITransport(
+        profile: RouterProfile(name: "closed", host: "127.0.0.1", port: 80,
+                               user: "admin", webURL: "http://127.0.0.1/",
+                               transport: .http),
+        password: nil)
+    closedRCI.close()
+    do {
+        try closedRCI.connect()
+        check("закрытая RCI-сессия не используется повторно", false)
+    } catch {
+        check("закрытая RCI-сессия не используется повторно", true)
+    }
+} catch {
+    check("тестовая RCI-сессия создаётся", false)
+}
 
 print("\n== Ping-Check ==")
+let activePingText = """
+sending ICMP ECHO request to 1.1.1.1...
+PING 1.1.1.1 (1.1.1.1) from nwg0: 56 (84) bytes of data.
+64 bytes from 1.1.1.1: icmp_req=1, ttl=57, time=12.35 ms.
+64 bytes from 1.1.1.1: icmp_req=2, ttl=57, time=10,25 ms.
+64 bytes from 1.1.1.1: icmp_req=3, ttl=57, time<1 ms.
+--- 1.1.1.1 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss,
+0 duplicate(s), time 3001.40 ms.
+"""
+let activePing = InterfacePingProbe.parse(activePingText,
+                                          interface: "Wireguard0", target: "1.1.1.1")
+check("активный ping извлекает три RTT", String(activePing.rtt.count), "3")
+check("активный ping понимает десятичную запятую",
+      String(format: "%.2f", activePing.rtt[1]), "10.25")
+check("активный ping извлекает системный интерфейс", activePing.source ?? "nil", "nwg0")
+check("активный ping считает нулевые потери",
+      String(format: "%.0f", activePing.lossPercent), "0")
+check("команда ping закреплена за интерфейсом",
+      (try? InterfacePingProbe.command(interface: "Wireguard0", target: "1.1.1.1", count: 3)) ?? "nil",
+      "tools ping 1.1.1.1 count 3 source-interface Wireguard0")
+check("IPv6 использует ping6",
+      (try? InterfacePingProbe.command(interface: "Wireguard0", target: "2606:4700:4700::1111", count: 2)) ?? "nil",
+      "tools ping6 2606:4700:4700::1111 count 2 source-interface Wireguard0")
+check("CLI-инъекция в цели ping отбивается",
+      (try? InterfacePingProbe.command(interface: "Wireguard0", target: "1.1.1.1; reboot")) == nil)
+check("TCP-проверка привязана к адресу туннеля",
+      (try? InterfacePingProbe.command(interface: "Wireguard3", target: "1.1.1.1",
+                                       method: .tcp, port: 443,
+                                       sourceAddress: "172.16.6.2 255.255.255.255")) ?? "nil",
+      "tools iperf3 1.1.1.1 ipv4 tcp port 443 time 1 source-address 172.16.6.2")
+check("TCP без адреса туннеля не запускается",
+      (try? InterfacePingProbe.command(interface: "Wireguard3", target: "1.1.1.1",
+                                       method: .tcp, port: 443)) == nil)
+let tcpConnect = InterfacePingProbe.parse("""
+starting iperf3 client to server whoer.net...
+iperf3: error - received an unknown control message (ensure other side is iperf3 and not iperf)
+""", interface: "Wireguard3", target: "whoer.net",
+    method: .tcp, port: 443, sourceAddress: "172.16.6.2")
+check("TCP-соединение с чужим протоколом считается доступным", tcpConnect.isReachable)
+check("успешный TCP-connect не показывает ошибку", tcpConnect.error == nil)
+check("успешный TCP-connect считает один ответ", String(tcpConnect.received), "1")
+let measuredTCP = InterfacePingProbe.parse("""
+iperf3: error - received an unknown control message (ensure other side is iperf3 and not iperf)
+""", interface: "Wireguard3", target: "whoer.net",
+    method: .tcp, port: 443, sourceAddress: "172.16.6.2",
+    elapsedMilliseconds: 42.5)
+check("TCP-connect показывает измеренную задержку",
+      String(format: "%.1f", measuredTCP.latestRTT ?? -1), "42.5")
+let blockedTCP = InterfacePingProbe.parse("""
+iperf3: error - unable to connect to server: Host is unreachable
+""", interface: "Wireguard3", target: "1.1.1.1",
+    method: .tcp, port: 443, sourceAddress: "172.16.6.2")
+check("TCP без ответа конечного узла показывает ошибку", blockedTCP.error != nil)
+let udpTrace = InterfacePingProbe.parse("""
+starting traceroute to one.one.one.one...
+traceroute to one.one.one.one (1.1.1.1), 16 hops maximum, 52 byte packets.
+ 1  172.16.6.1 (172.16.6.1)  53.101 ms
+ 2  one.one.one.one (1.1.1.1)  58.420 ms
+""", interface: "Wireguard3", target: "one.one.one.one",
+    method: .udp, port: 53, sourceAddress: "172.16.6.2")
+check("UDP-трассировка берёт RTT конечного узла",
+      String(format: "%.2f", udpTrace.latestRTT ?? -1), "58.42")
+check("UDP-трассировка не считает промежуточный хоп",
+      String(udpTrace.rtt.count), "1")
+let lostPing = InterfacePingProbe.parse("""
+PING 1.1.1.1 (1.1.1.1) from nwg1: 56 (84) bytes of data.
+3 packets transmitted, 0 packets received, 100% packet loss,
+""", interface: "Wireguard1", target: "1.1.1.1")
+check("100% потерь распознаются без ложной ошибки", lostPing.error == nil)
+check("недоступный интерфейс имеет 100% потерь",
+      String(format: "%.0f", lostPing.lossPercent), "100")
+
 // Фрагмент настоящей конфигурации роутера.
 let pingConfig = """
 ping-check profile vpn\r

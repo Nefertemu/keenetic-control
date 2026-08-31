@@ -5,14 +5,26 @@ import Foundation
 /// и умеет отдавать структурированный JSON вместо разбора текста терминала.
 final class RCITransport: KeeneticTransport {
     let kind: TransportKind = .http
+    var isAlive: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return authorized && !closed
+    }
 
     private let profile: RouterProfile
     private let password: String?
     private let session: URLSession
+    /// `URLSession` после invalidateAndCancel() использовать повторно нельзя:
+    /// Foundation не возвращает ошибку, а бросает Objective-C exception и
+    /// валит всё приложение. Переключение роутера может закрыть транспорт с
+    /// другого потока ровно между проверкой состояния и dataTask(with:),
+    /// поэтому создание задач и закрытие сериализуем одним замком.
+    private let stateLock = NSLock()
     /// Роутер может увести с http на https. Дальше работаем по конечному
     /// адресу: иначе POST после 302 потеряет тело и авторизация не пройдёт.
     private var baseURL: URL
     private var authorized = false
+    private var closed = false
     /// Новые прошивки объявляют схему x-ndw4 и перестают принимать старую,
     /// даже когда пароль верный. Отличаем это от настоящей ошибки пароля.
     private var advertisesModernAuth = false
@@ -62,7 +74,7 @@ final class RCITransport: KeeneticTransport {
         let modernEndpoint = RCITransport.endpoint(in: offered) ?? "auth"
 
         if probe.statusCode == 200 {
-            authorized = true
+            try markAuthorized()
             return
         }
         guard probe.statusCode == 401 else {
@@ -93,7 +105,7 @@ final class RCITransport: KeeneticTransport {
         if advertisesModernAuth, !RCITransport.skipsModernAuth(host: baseURL.host ?? profile.host) {
             do {
                 try runModernAuth(login: profile.user, password: password, endpoint: modernEndpoint)
-                authorized = true
+                try markAuthorized()
                 log(.ok, "RCI: вход по схеме x-ndw4 (\(realm)).")
                 return
             } catch let failure as NDW4.Failure where failure.serverUntrusted {
@@ -133,7 +145,7 @@ final class RCITransport: KeeneticTransport {
                 isAuthFailure: true)
         }
         _ = body
-        authorized = true
+        try markAuthorized()
     }
 
     /// Один шаг схемы x-ndw4: JSON туда, статус и заголовок x-ndm-data обратно.
@@ -188,6 +200,101 @@ final class RCITransport: KeeneticTransport {
                 + "проверка связи показана не будет.")
         }
         return fallback
+    }
+
+    /// Состояние Ping-Check живёт отдельным RCI-методом. `show/interface`
+    /// показывает интерфейс и пиры, но не обязан включать счётчики проверки.
+    /// На старых прошивках встречается вариант без дефиса, поэтому оставляем
+    /// его безопасным запасным путём.
+    static func pingCheckStatusJSON(_ transport: RCITransport) -> Any? {
+        let attempts = [
+            "rci/show/ping-check",
+            "rci/show/pingcheck",
+        ]
+        for path in attempts {
+            if let result = try? transport.json(method: "GET", path: path) {
+                return result
+            }
+        }
+        return nil
+    }
+
+    /// RCI запускает сетевые тесты как продолженную операцию: POST начинает
+    /// ping/traceroute, а GET того же endpoint раз в секунду отдаёт следующие
+    /// строки. Поле `continued` — маркер присутствия, не обязательно Bool.
+    func ping(interface: String, target: String, count: Int = 3,
+              method: InterfaceProbeMethod = .icmp, port: Int? = nil,
+              sourceAddress: String? = nil) throws -> InterfacePingResult {
+        let values = try InterfacePingProbe.validate(interface: interface, target: target)
+        guard (1...10).contains(count) else {
+            throw TransportError("Количество ping-запросов должно быть от 1 до 10.")
+        }
+
+        let path: String
+        let body: [String: Any]
+        if method == .icmp {
+            path = IPTools.isIPv6(values.1) ? "rci/tools/ping6" : "rci/tools/ping"
+            body = ["host": values.1, "count": count, "source": values.0]
+        } else {
+            // Заодно валидируем адрес и порт тем же кодом, что строит SSH-команду.
+            _ = try InterfacePingProbe.command(interface: values.0, target: values.1,
+                                               count: count, method: method, port: port,
+                                               sourceAddress: sourceAddress)
+            guard let source = sourceAddress?.split(whereSeparator: { $0.isWhitespace }).first
+            else { throw TransportError("У интерфейса \(values.0) нет IPv4-адреса.") }
+            if method == .tcp {
+                path = "rci/tools/iperf3"
+                body = [
+                    "host": values.1,
+                    "port": port ?? method.defaultPort,
+                    "ipv4": true,
+                    "tcp": true,
+                    "time": 1,
+                    "streams": 1,
+                    "source-address": String(source),
+                ]
+            } else {
+                path = "rci/tools/traceroute"
+                body = [
+                    "host": values.1,
+                    "count": 1,
+                    "wait-time": 1,
+                    "max-ttl": 16,
+                    "port": port ?? method.defaultPort,
+                    "source-address": String(source),
+                    "type": method.rawValue,
+                ]
+            }
+        }
+        let startedAt = Date()
+        var reply = try rci(method: "POST", path: path, body: body)
+        var lines: [String] = []
+        let deadline = Date().addingTimeInterval(method == .icmp ? TimeInterval(count + 15) : 28)
+
+        while true {
+            guard let object = reply as? [String: Any] else {
+                throw TransportError("RCI-сетевой тест вернул ответ неизвестного формата.")
+            }
+            if let messages = object["message"] as? [String] {
+                lines.append(contentsOf: messages)
+            } else if let message = object["message"] as? String, !message.isEmpty {
+                lines.append(message)
+            }
+            guard object.keys.contains("continued") else { break }
+            guard Date() < deadline else {
+                throw TransportError("Тайм-аут ожидания сетевого теста.")
+            }
+            Thread.sleep(forTimeInterval: 1)
+            reply = try rci(method: "GET", path: path, body: nil)
+        }
+
+        return InterfacePingProbe.parse(lines.joined(separator: "\n"),
+                                        interface: values.0, target: values.1,
+                                        method: method, port: port,
+                                        sourceAddress: sourceAddress,
+                                        elapsedMilliseconds: method == .tcp
+                                            ? Date().timeIntervalSince(startedAt) * 1000
+                                            : nil)
     }
 
     /// Хоть у одного интерфейса есть подробности — значит форма запроса верная.
@@ -346,8 +453,18 @@ final class RCITransport: KeeneticTransport {
     }
 
     func close() {
-        session.invalidateAndCancel()
+        stateLock.lock()
+        guard !closed else {
+            stateLock.unlock()
+            return
+        }
+        closed = true
         authorized = false
+        // Держим замок до invalidate: perform() либо уже создал задачу, и
+        // она будет штатно отменена, либо увидит closed и не полезет в
+        // инвалидированную сессию.
+        session.invalidateAndCancel()
+        stateLock.unlock()
     }
 
     func abort() { close() }
@@ -365,7 +482,7 @@ final class RCITransport: KeeneticTransport {
 
     @discardableResult
     private func rci(method: String, path: String, body: Any?) throws -> Any? {
-        if !authorized { try authenticate() }
+        if !isAuthorized { try authenticate() }
 
         var attempt = 0
         while true {
@@ -381,7 +498,7 @@ final class RCITransport: KeeneticTransport {
 
             if response.statusCode == 401, attempt == 0 {
                 attempt += 1
-                authorized = false
+                clearAuthorization()
                 try authenticate()
                 continue
             }
@@ -447,7 +564,7 @@ final class RCITransport: KeeneticTransport {
         pattern: #"(?i)([\"']?(?:password|passwd|token|secret|authorization|cookie|set-cookie)[\"']?\s*[:=]\s*)(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^\s,;}\]]+)"#)
 
     private func textGET(_ path: String) throws -> String {
-        if !authorized { try authenticate() }
+        if !isAuthorized { try authenticate() }
 
         var attempt = 0
         while true {
@@ -455,7 +572,7 @@ final class RCITransport: KeeneticTransport {
 
             if response.statusCode == 401, attempt == 0 {
                 attempt += 1
-                authorized = false
+                clearAuthorization()
                 try authenticate()
                 continue
             }
@@ -511,7 +628,7 @@ final class RCITransport: KeeneticTransport {
         let url = URL(string: path, relativeTo: baseURL) ?? baseURL
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("KeeneticControl/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("KeeneticControl/1.1.0", forHTTPHeaderField: "User-Agent")
         return request
     }
 
@@ -522,6 +639,11 @@ final class RCITransport: KeeneticTransport {
         let lock = NSLock()
         var result: Result<(Data, HTTPURLResponse), Error>?
 
+        stateLock.lock()
+        guard !closed else {
+            stateLock.unlock()
+            throw TransportError("HTTP-сессия роутера уже закрыта.")
+        }
         let task = session.dataTask(with: request) { data, response, error in
             let value: Result<(Data, HTTPURLResponse), Error>
             if let error {
@@ -538,6 +660,7 @@ final class RCITransport: KeeneticTransport {
             semaphore.signal()
         }
         task.resume()
+        stateLock.unlock()
 
         // URLSession должен вызвать callback и при отмене, но отдельный предел
         // нужен как последняя страховка от зависшего сетевого стека: watchdog
@@ -555,6 +678,25 @@ final class RCITransport: KeeneticTransport {
         case .failure(let error): throw error
         case nil: throw TransportError("Запрос к роутеру не завершился.")
         }
+    }
+
+    private var isAuthorized: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return authorized && !closed
+    }
+
+    private func markAuthorized() throws {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !closed else { throw TransportError("HTTP-сессия роутера уже закрыта.") }
+        authorized = true
+    }
+
+    private func clearAuthorization() {
+        stateLock.lock()
+        authorized = false
+        stateLock.unlock()
     }
 
     private static func describe(_ error: Error) -> String {

@@ -102,6 +102,22 @@ struct RouterState {
     }
     var totalDomains: Int { groups.values.reduce(0) { $0 + $1.includes.count } }
     var routedGroups: Int { groups.values.filter { !$0.routeLines.isEmpty }.count }
+
+    /// DNS-серверы из running-config. Они нужны только для диагностики:
+    /// приложение не меняет их и не пытается угадывать настройки DNS.
+    var nameServers: [String] {
+        var result: [String] = []
+        for raw in configText.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw).trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("ip name-server ") else { continue }
+            for value in line.dropFirst("ip name-server ".count)
+                .split(whereSeparator: { $0.isWhitespace }) {
+                let server = String(value)
+                if !server.isEmpty, !result.contains(server) { result.append(server) }
+            }
+        }
+        return result
+    }
 }
 
 struct ProgressInfo: Equatable {
@@ -638,6 +654,11 @@ final class RouterSession: ObservableObject {
                 if transport === active || slot?.transport === active {
                     store(transport: nil, status: .failed(describe(error)), owner: operation.routerID)
                 }
+            } else {
+                // Живой монитор не должен молча оставлять старый статус. В
+                // журнале сохраняем только безопасное описание ошибки — без
+                // команд, адресов и содержимого конфигурации.
+                log(.warn, "Живой Ping-Check не выполнен: \(describe(error))")
             }
             throw error
         }
@@ -677,7 +698,14 @@ final class RouterSession: ObservableObject {
         try requireCurrent(operation)
         let owner = operation.routerID
         if let slot = slots[owner], slot.status.isOnline, let transport = slot.transport {
-            return transport
+            if transport.isAlive { return transport }
+
+            // После тайм-аута ссылка на SSH/HTTP-транспорт могла остаться в
+            // слоте, хотя сам дескриптор уже закрыт. Сбрасываем её перед
+            // повторным подключением — иначе каждая следующая проверка сразу
+            // падает с «сессия не подключена».
+            store(transport: nil, status: .offline, owner: owner)
+            transport.abort()
         }
         guard let slot = slots[owner] else {
             throw TransportError("Роутер был удалён во время операции.")
@@ -727,6 +755,7 @@ final class RouterSession: ObservableObject {
         try requireCurrent(operation)
         store(activity: "Читаю конфигурацию роутера…", owner: owner)
         defer { clearActivity(owner: owner) }
+        let readProfile = slots[owner]?.profile ?? router
 
         let fresh: RouterState = try await guarded(operation: operation, budget: 200) { transport in
             let configText = try transport.fetchText("show running-config", timeout: 180)
@@ -740,9 +769,27 @@ final class RouterSession: ObservableObject {
                 statusInterfaces = RouterConfigParser.parseInterfaceStatus(text)
             }
 
-            let interfaces = RouterConfigParser.merge(
+            var interfaces = RouterConfigParser.merge(
                 config: RouterConfigParser.parseConfigInterfaces(configText),
                 status: statusInterfaces)
+
+            // Ping-Check — отдельный operational endpoint/CLI-команда. Не
+            // смешиваем её отсутствие с ошибкой чтения всего роутера: старые
+            // прошивки могут не иметь компонента, но интерфейсы всё равно
+            // должны отобразиться.
+            let pingInfo: [String: PingCheckLiveInfo]
+            if let rci = transport as? RCITransport {
+                pingInfo = PingCheckStatusParser.parseJSON(
+                    RCITransport.pingCheckStatusJSON(rci))
+            } else {
+                // `show ping-check` на части Keenetic завершает текущий pty
+                // после ответа. Читаем его в коротком отдельном probe, чтобы
+                // обычное SSH-соединение осталось пригодным для UI и
+                // следующей операции.
+                pingInfo = (try? SSHTransport.fetchPingCheck(profile: readProfile)) ?? [:]
+            }
+            log(.info, "Ping-Check при чтении: интерфейсов " + String(pingInfo.count))
+            RouterConfigParser.applyPingCheck(pingInfo, to: &interfaces)
 
             let pingCheck = PingCheckParser.parse(config: configText)
             return RouterState(
@@ -766,8 +813,8 @@ final class RouterSession: ObservableObject {
     }
 
     /// Обновить только живые данные одного интерфейса. Полный running-config
-    /// здесь не нужен: Ping-Check и статистика WireGuard уже отдаются в
-    /// `show interface`, поэтому экран может обновляться каждые несколько
+    /// здесь не нужен: RCI читает только operational-статус, а SSH — отдельный
+    /// короткий блок `show ping-check`. Экран обновляется каждые несколько
     /// секунд без сброса черновиков и без ручного «Обновить».
     @discardableResult
     func refreshLiveInterface(_ ident: String) async throws -> KeeneticInterface? {
@@ -782,15 +829,76 @@ final class RouterSession: ObservableObject {
         guard let snapshot = readState(for: owner) else {
             throw TransportError("Сначала прочитай конфигурацию роутера.")
         }
+        // Для SSH берём ровно тот профиль, с которым началась операция. На
+        // прошивках, закрывающих pty после `show ping-check`, ниже поднимется
+        // отдельный одноразовый probe, не затрагивая основную сессию.
+        let liveProfile = slots[owner]?.profile ?? router
 
-        let statuses: [String: KeeneticInterface] = try await guarded(
-            operation: operation, budget: 35, preserveConnectionOnFailure: true) { transport in
+        let fetched: (interfaces: [String: KeeneticInterface],
+                      ping: [String: PingCheckLiveInfo]) = try await guarded(
+            // На SSH не трогаем основной pty: часть прошивок закрывает его
+            // после `show ping-check`, из-за чего следующий цикл раньше
+            // уходил в бесконечные переподключения. Статистика интерфейса
+            // остаётся из полного чтения, а статус и счётчики Ping-Check
+            // обновляются из отдельного одноразового probe.
+            operation: operation, budget: 45, preserveConnectionOnFailure: true) { transport in
+            let statuses: [String: KeeneticInterface]
             if let rci = transport as? RCITransport {
-                return RouterConfigParser.parseInterfaceStatus(
+                statuses = RouterConfigParser.parseInterfaceStatus(
                     json: RCITransport.interfaceStatusJSON(rci, logResult: false))
+            } else {
+                // SSH-вывод интерфейса уже прочитан при подключении. В
+                // стороже нужен только operational-ответ Ping-Check.
+                statuses = [:]
             }
-            let text = try transport.run("show interface \(trimmed)", timeout: 25)
-            return RouterConfigParser.parseInterfaceStatus(text)
+
+            let pingInfo: [String: PingCheckLiveInfo]
+            if let rci = transport as? RCITransport {
+                pingInfo = PingCheckStatusParser.parseJSON(
+                    RCITransport.pingCheckStatusJSON(rci))
+            } else {
+                // Новое соединение на каждый probe — намеренно: основной
+                // интерактивный SSH остаётся доступен для действий и не
+                // получает команду, после которой некоторые Keenetic
+                // закрывают pty. Ошибка пробрасывается наружу и видна в
+                // карточке, вместо ложного «роутер не сообщил».
+                _ = transport
+                pingInfo = try SSHTransport.fetchPingCheck(profile: liveProfile)
+            }
+            return (statuses, pingInfo)
+        }
+
+        // SSH-вариант содержит только записи Ping-Check; чужой интерфейс не
+        // должен считаться успешным ответом для выбранного.
+        if fetched.interfaces.isEmpty, fetched.ping[trimmed] == nil {
+            return nil
+        }
+
+        var statuses = fetched.interfaces
+        // SSH прислал только Ping-Check, поэтому подставляем последний
+        // полный снимок интерфейса как основу и накладываем свежий статус.
+        // Если operational-ответ пустой, `statuses` останется пустым и ниже
+        // вернётся nil — старые данные не выдаются за новую проверку.
+        if !fetched.ping.isEmpty, statuses[trimmed] == nil,
+           let cached = snapshot.interfaces[trimmed] {
+            statuses[trimmed] = cached
+        }
+        var pingInterfaces: [String: KeeneticInterface] = [:]
+        RouterConfigParser.applyPingCheck(fetched.ping, to: &pingInterfaces)
+        for (ident, item) in pingInterfaces {
+            var existing = statuses[ident] ?? KeeneticInterface(ident: ident)
+            if item.pingCheckStatus != nil { existing.pingCheckStatus = item.pingCheckStatus }
+            if item.pingCheckProfile != nil { existing.pingCheckProfile = item.pingCheckProfile }
+            if item.pingCheckFailureCount != nil {
+                existing.pingCheckFailureCount = item.pingCheckFailureCount
+            }
+            if item.pingCheckSuccessCount != nil {
+                existing.pingCheckSuccessCount = item.pingCheckSuccessCount
+            }
+            if !item.pingCheckResolvedAddresses.isEmpty {
+                existing.pingCheckResolvedAddresses = item.pingCheckResolvedAddresses
+            }
+            statuses[ident] = existing
         }
         try requireCurrent(operation)
 
@@ -810,12 +918,65 @@ final class RouterSession: ObservableObject {
         if !incoming.defaultGW.isEmpty { merged.defaultGW = incoming.defaultGW }
         if !incoming.securityLevel.isEmpty { merged.securityLevel = incoming.securityLevel }
         if incoming.pingCheckStatus != nil { merged.pingCheckStatus = incoming.pingCheckStatus }
+        if incoming.pingCheckProfile != nil { merged.pingCheckProfile = incoming.pingCheckProfile }
+        if incoming.pingCheckFailureCount != nil {
+            merged.pingCheckFailureCount = incoming.pingCheckFailureCount
+        }
+        if incoming.pingCheckSuccessCount != nil {
+            merged.pingCheckSuccessCount = incoming.pingCheckSuccessCount
+        }
+        if !incoming.pingCheckResolvedAddresses.isEmpty {
+            merged.pingCheckResolvedAddresses = incoming.pingCheckResolvedAddresses
+        }
         // Пустой массив здесь значим: у интерфейса могли исчезнуть все пиры.
         merged.peers = incoming.peers
         merged.aliases.formUnion(incoming.aliases)
         updated.interfaces[trimmed] = merged
         store(state: updated, owner: owner)
         return merged
+    }
+
+    /// Измерить RTT до указанного ресурса через конкретный WireGuard-интерфейс.
+    /// ICMP привязывается к имени интерфейса, TCP/UDP — к его IPv4-адресу
+    /// (иначе KeeneticOS 5.01 не может определить MTU для traceroute socket).
+    func ping(interface: String, target: String, count: Int = 3,
+              method: InterfaceProbeMethod = .icmp,
+              port: Int? = nil) async throws -> InterfacePingResult {
+        let values = try InterfacePingProbe.validate(interface: interface, target: target)
+        let operation = beginOperation()
+        let owner = operation.routerID
+        guard let snapshot = readState(for: owner),
+              snapshot.wireguardInterfaces.contains(values.0) else {
+            throw TransportError("Интерфейс \(values.0) не найден в текущей конфигурации.")
+        }
+        let sourceAddress = WireGuardState.parse(config: snapshot.configText, interface: values.0)
+            .addresses
+            .lazy
+            .compactMap { $0.split(whereSeparator: { $0.isWhitespace }).first.map(String.init) }
+            .first { IPTools.parseIPv4($0) != nil }
+        let profile = slots[owner]?.profile ?? router
+
+        if profile.transport == .ssh {
+            let result = try await background(owner: owner) {
+                try SSHTransport.ping(profile: profile, interface: values.0,
+                                      target: values.1, count: count,
+                                      method: method, port: port,
+                                      sourceAddress: sourceAddress)
+            }
+            try requireCurrent(operation)
+            return result
+        }
+
+        let budget = method == .icmp ? TimeInterval(count + 25) : 35
+        return try await guarded(operation: operation, budget: budget,
+                                 preserveConnectionOnFailure: true) { transport in
+            guard let rci = transport as? RCITransport else {
+                throw TransportError("Активный RCI-транспорт недоступен.")
+            }
+            return try rci.ping(interface: values.0, target: values.1, count: count,
+                                method: method, port: port,
+                                sourceAddress: sourceAddress)
+        }
     }
 
     // MARK: - Применение плана
