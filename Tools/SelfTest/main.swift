@@ -752,6 +752,27 @@ let health = RouterHealth.issues(state: healthState, maxDomainsPerList: 300)
 func hasIssue(_ prefix: String) -> Bool { health.contains { $0.id.hasPrefix(prefix) } }
 check("выключенный интерфейс с маршрутами замечен", hasIssue("down-Wireguard1"))
 check("несуществующий интерфейс замечен", hasIssue("missing-interface-Wireguard9"))
+
+// В маршрутах Keenetic встречается обиходное имя интерфейса, а не только
+// идентификатор: ISP — это подключение к провайдеру, и оно существует.
+var aliasState = RouterState()
+aliasState.interfaces = [
+    "GigabitEthernet1": KeeneticInterface(ident: "GigabitEthernet1",
+                                          descriptionText: "Провайдер",
+                                          state: "up", aliases: ["ISP", "GigabitEthernet1"]),
+]
+aliasState.groups = [
+    "domain-list0": FqdnGroup(ident: "domain-list0", includes: ["a.example"],
+                              routeLines: ["dns-proxy route object-group domain-list0 ISP auto"]),
+]
+check("интерфейс находится по обиходному имени", aliasState.hasInterface("ISP"))
+check("и по идентификатору тоже", aliasState.hasInterface("GigabitEthernet1"))
+check("несуществующее имя не находится", !aliasState.hasInterface("Wireguard7"))
+check("маршрут через ISP замечанием не считается",
+      !RouterHealth.issues(state: aliasState, maxDomainsPerList: 300)
+          .contains { $0.id.hasPrefix("missing-interface") })
+check("примечание берётся и по синониму", aliasState.note(for: "ISP") ?? "nil", "Провайдер")
+check("подпись по синониму читаемая", aliasState.label(for: "ISP"), "Провайдер · ISP")
 check("повисшее рукопожатие замечено", hasIssue("stale-handshake-Wireguard2"))
 check("список без маршрута замечен", hasIssue("unrouted"))
 check("живой туннель замечаний не даёт", !hasIssue("stale-handshake-Wireguard0"))

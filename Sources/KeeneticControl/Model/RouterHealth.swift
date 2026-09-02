@@ -42,7 +42,7 @@ enum RouterHealth {
         guard !state.interfaces.isEmpty else { return [] }
         var affected: [String: Set<String>] = [:]
         for group in state.groups.values {
-            for target in group.routedInterfaces where state.interfaces[target] == nil {
+            for target in group.routedInterfaces where !state.hasInterface(target) {
                 affected[target, default: []].insert(group.ident)
             }
         }
@@ -62,7 +62,7 @@ enum RouterHealth {
         var affected: [String: Int] = [:]
         for group in state.groups.values {
             for target in group.routedInterfaces {
-                guard let item = state.interfaces[target], !item.isUp else { continue }
+                guard let item = state.interface(named: target), !item.isUp else { continue }
                 affected[target, default: 0] += 1
             }
         }

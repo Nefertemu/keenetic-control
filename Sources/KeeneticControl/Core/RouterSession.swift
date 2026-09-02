@@ -44,8 +44,27 @@ struct RouterState {
 
     /// Примечание интерфейса из конфигурации роутера — то же, что видно
     /// в веб-панели рядом с именем.
+    /// Интерфейс по имени, каким его называют команды.
+    ///
+    /// В маршрутах Keenetic встречается не только идентификатор вида
+    /// `GigabitEthernet1`, но и его обиходное имя — например `ISP` у
+    /// подключения к провайдеру. Поиск строго по ключу такой интерфейс не
+    /// находил, и приложение объявляло рабочий маршрут «ведущим в никуда».
+    func interface(named ident: String) -> KeeneticInterface? {
+        if let exact = interfaces[ident] { return exact }
+        // Синоним теоретически может принадлежать нескольким интерфейсам —
+        // выбираем предсказуемо, а не как ляжет обход словаря.
+        return interfaces.values
+            .filter { $0.aliases.contains(ident) }
+            .sorted { $0.ident < $1.ident }
+            .first
+    }
+
+    /// Есть ли на роутере интерфейс с таким именем.
+    func hasInterface(_ ident: String) -> Bool { interface(named: ident) != nil }
+
     func note(for ident: String) -> String? {
-        let note = interfaces[ident]?.descriptionText ?? ""
+        let note = interface(named: ident)?.descriptionText ?? ""
         return note.isEmpty ? nil : note
     }
 

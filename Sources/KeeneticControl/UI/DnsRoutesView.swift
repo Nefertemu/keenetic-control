@@ -593,7 +593,10 @@ struct DnsRoutesView: View {
     private var headerRow: some View {
         HStack(spacing: 10) {
             Color.clear.frame(width: 18)
-            Text("Список").frame(width: 220, alignment: .leading)
+            // Имя списка тянется вместе с окном: раньше вся лишняя ширина
+            // доставалась колонке маршрутов, и на широком экране данные
+            // жались слева узкой полосой рядом с пустотой.
+            Text("Список").frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
             Text("Идентификатор").frame(width: 130, alignment: .leading)
             Text("Записей").frame(width: 70, alignment: .trailing)
             Text("Маршрут").frame(maxWidth: .infinity, alignment: .leading)
@@ -615,7 +618,7 @@ struct DnsRoutesView: View {
             Text(group.descriptionText.isEmpty ? "—" : group.descriptionText)
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
-                .frame(width: 220, alignment: .leading)
+                .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
                 .help(group.descriptionText)
 
             Text(group.ident)
