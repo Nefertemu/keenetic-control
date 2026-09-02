@@ -54,7 +54,7 @@ struct FqdnView: View {
                         $0.caseInsensitiveCompare(cleanIdent) == .orderedSame
                     }) else {
                         throw TransportError("Список «\(cleanIdent)» уже есть на роутере.",
-                                             hint: "Выбери другое имя или управляй существующим списком во вкладке «Маршруты списков».")
+                                             hint: "Выбери другое имя или управляй существующим списком на вкладке «Маршруты».")
                     }
                     let built = try ManualFqdnPlanner.plan(
                         ident: cleanIdent, description: description, entriesText: entries)
@@ -91,8 +91,7 @@ struct FqdnView: View {
                        subtitle: "Импорт наполняет object-group fqdn и НИКОГДА не трогает маршруты")
 
             Text("Домены и подсети раскладываются по частям не больше \(store.settings.chunkSize) записей — "
-                 + "как того требует прошивка. Части нумеруются автоматически, "
-                 + "маршруты назначаются отдельно на вкладке «Маршруты списков».")
+                 + "как того требует прошивка. Части нумеруются автоматически.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -291,7 +290,9 @@ struct FqdnView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Принудительно перекачать источники")
                         .font(.system(size: 12, weight: .medium))
-                    Text("Иначе берётся кэш, если ему меньше \(store.settings.cacheTTLMinutes) мин.")
+                    Text(store.settings.cacheTTLMinutes > 0
+                         ? "Иначе берётся кэш, если ему меньше \(store.settings.cacheTTLMinutes) мин."
+                         : "Кэш выключен в настройках — источники и так качаются заново каждый раз.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
@@ -573,7 +574,7 @@ struct SourceEditor: View {
 
 /// Маленький список удобнее создать прямо здесь, без временного файла или
 /// отдельного URL-источника. После применения он становится обычным списком
-/// роутера и доступен во вкладке «Маршруты списков».
+/// роутера и доступен на вкладке «Маршруты».
 struct ManualListEditor: View {
     @State private var ident = "test"
     @State private var description = "test"

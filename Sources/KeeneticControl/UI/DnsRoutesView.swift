@@ -86,7 +86,11 @@ struct DnsRoutesView: View {
                 resetScrollPosition(proxy)
             }
         }
-        .onAppear(perform: pickDefaultInterface)
+        .onAppear {
+            pickDefaultInterface()
+            // Пришли сюда из палитры команд — сразу показываем нужный список.
+            if let wanted = Navigator.shared.takeListQuery() { query = wanted }
+        }
         .onChange(of: session.state?.readAt) { _, _ in pickDefaultInterface() }
         .onChange(of: interfaceIdent) { _, newIdent in
             // В обычном (одноинтерфейсном) сценарии выбор сверху остаётся

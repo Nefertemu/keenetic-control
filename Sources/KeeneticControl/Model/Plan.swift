@@ -409,8 +409,18 @@ enum Planner {
                         : "Маршруты → " + ordered.joined(separator: " → "))
         guard !ordered.isEmpty else { return plan }
 
+        let wantedChain = ordered.map {
+            DnsRouteAssignment(interface: $0, auto: auto, reject: reject)
+        }
         var reordered = 0
+        var skipped = 0
         for group in groups {
+            // Список уже направлен ровно так, как просят, — в том же порядке
+            // и с теми же флагами. Трогать его нельзя: план снимает маршруты
+            // перед тем как назначить заново, и в этот промежуток домены
+            // уходят мимо туннеля.
+            if group.routeAssignments == wantedChain { skipped += 1; continue }
+
             let oldRoutes = group.routedInterfaces
             if !group.routeLines.isEmpty {
                 for line in group.routeLines {
@@ -439,8 +449,12 @@ enum Planner {
             plan.notes.append("У выбранных списков заменяются старые маршруты и задаётся порядок: "
                               + ordered.joined(separator: " → ") + ".")
         }
-        if !groups.isEmpty {
-            plan.notes.append("Маршруты назначаются для \(Format.lists(groups.count)) "
+        if skipped > 0 {
+            plan.notes.append("Уже с нужной последовательностью, не трогаем: "
+                              + Format.lists(skipped) + ".")
+        }
+        if groups.count > skipped {
+            plan.notes.append("Маршруты назначаются для \(Format.lists(groups.count - skipped)) "
                               + "на каждый интерфейс в последовательности резервирования.")
         }
         return plan

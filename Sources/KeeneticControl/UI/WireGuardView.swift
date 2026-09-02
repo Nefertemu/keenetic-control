@@ -111,7 +111,13 @@ struct WireGuardView: View {
             }
             .padding(20)
         }
-        .onAppear(perform: pickDefault)
+        .onAppear {
+            pickDefault()
+            // Переход из палитры команд к конкретному туннелю.
+            if let wanted = Navigator.shared.takeInterface(), interfaces.contains(wanted) {
+                interfaceIdent = wanted
+            }
+        }
         .onChange(of: session.state?.readAt) { _, _ in
             // Live Ping-Check обновляет readAt каждые несколько секунд. Не
             // сбрасываем из-за этого время последней проверки и её ошибку —

@@ -131,8 +131,11 @@ final class AutoUpdater: ObservableObject {
         lastCheck = Date()
         store.settings.lastAutoUpdate = lastCheck
 
+        // План собран под списки ЭТОГО роутера: идентификаторы domain-listN
+        // у соседа значат другое. Привязываем, чтобы применение к чужому
+        // роутеру отсеклось до отправки команд.
         let merged = Planner.merge(title: "Обновление списков от \(Format.humanDate(Date()))",
-                                   plans: plans)
+                                   plans: plans).forRouter(session.router)
             .forRouter(profile)
 
         if !failures.isEmpty {

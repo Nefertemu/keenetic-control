@@ -5,8 +5,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case wireguard
     case pingCheck
     case diagnostics
-    case fqdn
-    case dnsRoutes
+    case domains
     case staticRoutes
     case compare
     case backups
@@ -21,8 +20,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .wireguard:     return "WireGuard"
         case .pingCheck:     return "Ping-Check"
         case .diagnostics:   return "Диагностика"
-        case .fqdn:          return "Списки FQDN"
-        case .dnsRoutes:     return "Маршруты списков"
+        case .domains:       return "Списки доменов"
         case .staticRoutes:  return "Статические маршруты"
         case .compare:       return "Сравнение роутеров"
         case .backups:       return "Резервные копии"
@@ -37,8 +35,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .wireguard:     return "shield.lefthalf.filled"
         case .pingCheck:     return "waveform.path.ecg"
         case .diagnostics:   return "stethoscope"
-        case .fqdn:          return "list.bullet.rectangle"
-        case .dnsRoutes:     return "arrow.triangle.branch"
+        case .domains:       return "list.bullet.rectangle"
         case .staticRoutes:  return "point.topleft.down.to.point.bottomright.curvepath"
         case .compare:       return "arrow.left.arrow.right"
         case .backups:       return "clock.arrow.circlepath"
@@ -51,7 +48,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview:                          return "Роутер"
         case .wireguard, .pingCheck, .diagnostics: return "Туннели"
-        case .fqdn, .dnsRoutes, .staticRoutes, .compare:
+        case .domains, .staticRoutes, .compare:
                                                  return "Маршрутизация"
         case .backups, .journal, .routers:       return "Служебное"
         }
@@ -69,6 +66,9 @@ struct RootView: View {
     @State private var outcome: ApplyOutcome?
     /// Об осечке фонового чтения сообщаем один раз, а не каждый тик.
     @State private var autoReloadFailed = false
+    /// Какая половина «Списков доменов» открыта — помним между переходами.
+    @State private var domainsTab: DomainsTab = .routes
+    @State private var paletteOpen = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -113,6 +113,18 @@ struct RootView: View {
         .task {
             await session.monitorConnections()
         }
+        .background(shortcuts)
+        .onReceive(Navigator.shared.$paletteRequested) { requested in
+            guard requested else { return }
+            Navigator.shared.paletteRequested = false
+            paletteOpen = true
+        }
+        .sheet(isPresented: $paletteOpen) {
+            CommandPalette(items: paletteItems) { item in
+                paletteOpen = false
+                open(item)
+            } onCancel: { paletteOpen = false }
+        }
         // Перечитывание по таймеру. Ключ задачи — интервал: поменял в
         // настройках, цикл перезапустился с новым.
         .task(id: store.settings.autoReloadSeconds) { await autoReloadLoop() }
@@ -121,6 +133,82 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             Task { await autoReloadTick() }
+        }
+    }
+
+    // MARK: - Быстрый переход
+
+    /// Горячие клавиши живут невидимыми кнопками: так они работают на любом
+    /// экране и не зависят от того, где сейчас фокус.
+    private var shortcuts: some View {
+        ZStack {
+            ForEach(Array(AppSection.allCases.enumerated()), id: \.element) { index, item in
+                if index < 9 {
+                    Button("") { section = item }
+                        .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")),
+                                          modifiers: .command)
+                }
+            }
+            // Сочетание сопоставляется по СИМВОЛУ, а не по клавише: при
+            // русской раскладке та же клавиша даёт другую букву, и ⌘R с ⌘K
+            // просто не срабатывают. Цифры от раскладки не зависят, поэтому
+            // с ними проблемы нет. Дублируем буквенные сочетания кириллицей.
+            Button("") { paletteOpen = true }
+                .keyboardShortcut("л", modifiers: .command)
+            Button("") { Task { await refresh() } }
+                .keyboardShortcut("к", modifiers: .command)
+        }
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
+    private var paletteItems: [PaletteItem] {
+        var result: [PaletteItem] = []
+
+        for item in AppSection.allCases {
+            result.append(PaletteItem(id: "section-\(item.rawValue)", kind: .section(item),
+                                      title: item.title, subtitle: item.group,
+                                      icon: item.icon, group: "Разделы"))
+        }
+        for router in store.routers where router.id != session.router.id {
+            result.append(PaletteItem(id: "router-\(router.id)", kind: .router(router.id),
+                                      title: router.name, subtitle: router.endpoint,
+                                      icon: "wifi.router", group: "Роутеры"))
+        }
+        if let state = session.state {
+            for group in state.sortedGroups {
+                let name = group.descriptionText.isEmpty ? group.ident : group.descriptionText
+                result.append(PaletteItem(
+                    id: "list-\(group.ident)", kind: .list(name),
+                    title: name,
+                    subtitle: "\(group.ident) · \(Format.domains(group.count))",
+                    icon: "list.bullet.rectangle", group: "Списки"))
+            }
+            for ident in state.wireguardInterfaces {
+                result.append(PaletteItem(
+                    id: "iface-\(ident)", kind: .interfaceItem(ident),
+                    title: state.shortLabel(for: ident), subtitle: ident,
+                    icon: "shield.lefthalf.filled", group: "Туннели"))
+            }
+        }
+        return result
+    }
+
+    private func open(_ item: PaletteItem) {
+        switch item.kind {
+        case .section(let target):
+            section = target
+        case .router(let id):
+            guard let router = store.routers.first(where: { $0.id == id }) else { return }
+            store.selectedRouterID = id
+            Task { await session.switchTo(router) }
+        case .list(let name):
+            Navigator.shared.listQuery = name
+            domainsTab = .routes
+            section = .domains
+        case .interfaceItem(let ident):
+            Navigator.shared.interfaceIdent = ident
+            section = .wireguard
         }
     }
 
@@ -354,12 +442,37 @@ struct RootView: View {
                 .padding(.horizontal, 12)
             }
 
+            // Автоматическое перечитывание работало молча, и понять,
+            // свежие ли перед тобой данные, было неоткуда.
+            if let readAt = session.state?.readAt {
+                HStack(spacing: 5) {
+                    Image(systemName: store.settings.autoReloadSeconds > 0
+                          ? "arrow.triangle.2.circlepath" : "hand.tap")
+                        .font(.system(size: 9))
+                    Text(freshnessText(readAt))
+                        .font(.system(size: 10))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 12)
+                .help(store.settings.autoReloadSeconds > 0
+                      ? "Конфигурация перечитывается сама каждые "
+                        + "\(max(15, store.settings.autoReloadSeconds)) с и при возврате в приложение"
+                      : "Автоматическое перечитывание выключено в настройках")
+            }
+
             Text("Keenetic Control \(Bundle.appVersion)")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
         }
+    }
+
+    private func freshnessText(_ readAt: Date) -> String {
+        let age = Format.age(readAt)
+        guard store.settings.autoReloadSeconds > 0 else { return "прочитано \(age) · вручную" }
+        return "прочитано \(age) · сам"
     }
 
     // MARK: - Содержимое
@@ -375,8 +488,7 @@ struct RootView: View {
                 case .wireguard:     WireGuardView(alert: $alert, section: $section)
                 case .pingCheck:     PingCheckView(alert: $alert)
                 case .diagnostics:   DiagnosticsView(alert: $alert)
-                case .fqdn:          FqdnView(alert: $alert)
-                case .dnsRoutes:     DnsRoutesView(alert: $alert)
+                case .domains:       DomainsView(alert: $alert, tab: $domainsTab)
                 case .staticRoutes:  StaticRoutesView(alert: $alert)
                 case .compare:       CompareView(alert: $alert, section: $section)
                 case .backups:       BackupsView(alert: $alert)

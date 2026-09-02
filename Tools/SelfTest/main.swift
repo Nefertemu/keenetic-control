@@ -656,6 +656,44 @@ check("план запоминает точную failover-цепочку",
           ]
       })
 
+// Повторное назначение той же цепочки не должно ничего делать: план
+// сначала снимает маршруты и только потом вешает заново, и в этот
+// промежуток домены уходят мимо туннеля.
+var alreadyChained: [String: FqdnGroup] = [:]
+for (ident, group) in groups {
+    var copy = group
+    copy.routeLines = [
+        "dns-proxy route object-group \(ident) Wireguard0 auto",
+        "dns-proxy route object-group \(ident) ISP auto",
+    ]
+    alreadyChained[ident] = copy
+}
+let repeatPlan = Planner.planRoutes(groups: Array(alreadyChained.values),
+                                    interfaces: ["Wireguard0", "ISP"],
+                                    auto: true, reject: false)
+check("та же цепочка второй раз — план пустой", repeatPlan.isEmpty)
+check("и маршруты не снимаются впустую",
+      !repeatPlan.commands.contains { $0.hasPrefix("no dns-proxy route") })
+
+let reorderPlan = Planner.planRoutes(groups: Array(alreadyChained.values),
+                                     interfaces: ["ISP", "Wireguard0"],
+                                     auto: true, reject: false)
+check("другой порядок — план не пустой", !reorderPlan.isEmpty)
+let flagPlan = Planner.planRoutes(groups: Array(alreadyChained.values),
+                                  interfaces: ["Wireguard0", "ISP"],
+                                  auto: false, reject: false)
+check("другие флаги — тоже перекладываем", !flagPlan.isEmpty)
+
+var partialChain = alreadyChained
+if let first = partialChain.keys.sorted().first {
+    partialChain[first]?.routeLines = ["dns-proxy route object-group \(first) Wireguard0 auto"]
+}
+let mixedPlan = Planner.planRoutes(groups: Array(partialChain.values),
+                                   interfaces: ["Wireguard0", "ISP"],
+                                   auto: true, reject: false)
+check("трогаем только тот список, где цепочка не совпала",
+      mixedPlan.commands.filter { $0.hasPrefix("no dns-proxy route") }.count == 1)
+
 var exactFailoverGroups = groups
 for ident in Array(exactFailoverGroups.keys) {
     exactFailoverGroups[ident]?.routeLines = [

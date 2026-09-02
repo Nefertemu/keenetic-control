@@ -222,14 +222,14 @@ struct OverviewView: View {
                 HStack {
                     listsHeader(state)
                     Spacer()
-                    Button("Все списки") { section = .dnsRoutes }
+                    Button("Все списки") { section = .domains }
                         .buttonStyle(SubtleButtonStyle())
                 }
                 .frame(minWidth: 480)
 
                 VStack(alignment: .leading, spacing: 8) {
                     listsHeader(state)
-                    Button("Все списки") { section = .dnsRoutes }
+                    Button("Все списки") { section = .domains }
                         .buttonStyle(SubtleButtonStyle())
                 }
             }
@@ -247,7 +247,7 @@ struct OverviewView: View {
 
                     if state.groups.count > visible.count {
                         Divider()
-                        Text("и ещё \(state.groups.count - visible.count) — на вкладке «Маршруты списков»")
+                        Text("и ещё \(state.groups.count - visible.count) — на вкладке «Списки доменов»")
                             .font(.system(size: 11))
                             .foregroundStyle(.tertiary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -338,7 +338,7 @@ struct OverviewView: View {
         .help(targets.isEmpty
               ? "\(group.ident): маршрут не назначен"
               : "\(group.ident) →\n" + state.targetTooltip(targets))
-        .onTapGesture { section = .dnsRoutes }
+        .onTapGesture { section = .domains }
     }
 
     private func connect() async {

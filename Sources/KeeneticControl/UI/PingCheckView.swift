@@ -119,6 +119,7 @@ struct PingCheckView: View {
                 if let victim = confirmDelete {
                     plan = PingCheckParser.planDelete(victim, usedBy: users(of: victim))
                         .forRouter(session.router)
+                        .forRouter(session.router)
                 }
                 confirmDelete = nil
             }

@@ -14,6 +14,12 @@ struct KeeneticControlApp: App {
         .windowToolbarStyle(.unified(showsTitle: true))
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandMenu("Переход") {
+                Button("Быстрый переход…") { Navigator.shared.paletteRequested = true }
+                    .keyboardShortcut("k", modifiers: .command)
+                Divider()
+                Text("Разделы — ⌘1…⌘9")
+            }
             CommandGroup(after: .appInfo) {
                 Button("Открыть папку с данными") {
                     NSWorkspace.shared.open(AppPaths.support)
