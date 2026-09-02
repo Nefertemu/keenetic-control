@@ -11,7 +11,7 @@ jobs:
     name: Тесты и сборка
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Макросы SwiftUI живут в Xcode, а не в Command Line Tools. На
       # раннере Xcode может лежать под версионным именем, поэтому берём
