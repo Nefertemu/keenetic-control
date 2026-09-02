@@ -630,6 +630,48 @@ let syncPlan = Planner.planSync(reference: syncReference, current: [:], chunkSiz
                                 reservedIDs: &syncReserved)
 check("перенос не добавляет один домен дважды", syncPlan.addCount == 1)
 
+print("\n== Сравнение версий приложения ==")
+check("новее по минорной", AppVersion.isNewer("1.3.0", than: "1.2.0"))
+check("не новее сама себя", !AppVersion.isNewer("1.2.0", than: "1.2.0"))
+check("старее не считается новее", !AppVersion.isNewer("1.1.0", than: "1.2.0"))
+// Строкой «1.10.0» меньше «1.9.0» — обновление молча пропустилось бы.
+check("двузначная минорная больше однозначной", AppVersion.isNewer("1.10.0", than: "1.9.0"))
+check("и наоборот", !AppVersion.isNewer("1.9.0", than: "1.10.0"))
+check("префикс v не мешает", AppVersion.isNewer("v1.3.0", than: "1.2.0"))
+check("разная длина: 1.2 против 1.2.0", AppVersion.compare("1.2", "1.2.0") == 0)
+check("патч учитывается", AppVersion.isNewer("1.2.1", than: "1.2.0"))
+check("суффикс отбрасывается", AppVersion.compare("1.2.0-beta.1", "1.2.0") == 0)
+check("мусор не ломает разбор", AppVersion.parts("не-версия").isEmpty
+      || AppVersion.parts("не-версия") == [0])
+
+print("\n== Профили резервирования ==")
+let routerA = UUID(), routerB = UUID()
+let chain = FailoverProfile(name: "основная", routerID: routerA,
+                            interfaces: ["Wireguard0", "Wireguard1", "Wireguard2"])
+let resolved = chain.resolve(against: ["Wireguard0", "Wireguard2"])
+check("порядок сохраняется", resolved.present, ["Wireguard0", "Wireguard2"])
+check("исчезнувший интерфейс назван", resolved.missing, ["Wireguard1"])
+check("всё на месте — ничего не потеряно",
+      chain.resolve(against: ["Wireguard0", "Wireguard1", "Wireguard2"]).missing.isEmpty)
+
+func profileError(_ p: FailoverProfile, _ existing: [FailoverProfile]) -> String? {
+    do { try FailoverProfile.validate(p, existing: existing); return nil }
+    catch { return (error as? TransportError)?.message ?? error.localizedDescription }
+}
+check("без имени не сохраняется",
+      profileError(FailoverProfile(routerID: routerA, interfaces: ["Wireguard0"]), []) != nil)
+check("без интерфейсов не сохраняется",
+      profileError(FailoverProfile(name: "пусто", routerID: routerA), []) != nil)
+check("нормальный принимается", profileError(chain, []) == nil)
+check("имя занято на том же роутере",
+      profileError(FailoverProfile(name: "ОСНОВНАЯ", routerID: routerA,
+                                   interfaces: ["Wireguard0"]), [chain]) != nil)
+check("на другом роутере то же имя можно",
+      profileError(FailoverProfile(name: "основная", routerID: routerB,
+                                   interfaces: ["Wireguard0"]), [chain]) == nil)
+check("сам себя не считает занятым",
+      profileError(chain, [chain]) == nil)
+
 print("\n== Замечания по состоянию роутера ==")
 var healthState = RouterState()
 healthState.interfaces = [

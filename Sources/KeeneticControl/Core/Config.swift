@@ -234,6 +234,10 @@ final class Store: ObservableObject {
     @Published var customSources: [CustomSource] = [] {
         didSet { persistSources() }
     }
+    /// Сохранённые последовательности резервирования.
+    @Published var failoverProfiles: [FailoverProfile] = [] {
+        didSet { persistFailover() }
+    }
     @Published var selectedRouterID: UUID? {
         didSet {
             guard !loading, let id = selectedRouterID else { return }
@@ -280,6 +284,11 @@ final class Store: ObservableObject {
             customSources = saved
         }
 
+        if let data = try? Data(contentsOf: AppPaths.failoverFile),
+           let saved = try? decoder.decode([FailoverProfile].self, from: data) {
+            failoverProfiles = saved
+        }
+
         let remembered = UUID(uuidString: settings.lastRouterID)
         selectedRouterID = routers.contains { $0.id == remembered } ? remembered : routers.first?.id
         loading = false
@@ -308,6 +317,9 @@ final class Store: ObservableObject {
 
     func remove(_ router: RouterProfile) {
         routers.removeAll { $0.id == router.id }
+        // Профили резервирования держат имена интерфейсов ЭТОГО роутера —
+        // без него они бессмысленны и только копятся в файле.
+        failoverProfiles.removeAll { $0.routerID == router.id }
         if selectedRouterID == router.id { selectedRouterID = routers.first?.id }
 
         // Связка ключей умеет показать системный запрос и ждать ответа
@@ -344,6 +356,31 @@ final class Store: ObservableObject {
         try? FileManager.default.removeItem(at: source.spec.cacheFile)
         try? FileManager.default.removeItem(at: source.spec.subnetCacheFile)
         customSources.removeAll { $0.id == source.id }
+    }
+
+    /// Профили резервирования выбранного роутера.
+    func failoverProfiles(for routerID: UUID) -> [FailoverProfile] {
+        failoverProfiles.filter { $0.routerID == routerID }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func saveFailover(_ profile: FailoverProfile) {
+        if let index = failoverProfiles.firstIndex(where: { $0.id == profile.id }) {
+            failoverProfiles[index] = profile
+        } else {
+            failoverProfiles.append(profile)
+        }
+    }
+
+    func removeFailover(_ profile: FailoverProfile) {
+        failoverProfiles.removeAll { $0.id == profile.id }
+    }
+
+    private func persistFailover() {
+        guard !loading else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? encoder.encode(failoverProfiles).write(to: AppPaths.failoverFile, options: .atomic)
     }
 
     private func persistSources() {

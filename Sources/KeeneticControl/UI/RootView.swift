@@ -651,9 +651,3 @@ struct RootView: View {
         }
     }
 }
-
-extension Bundle {
-    static var appVersion: String {
-        (main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.1.0"
-    }
-}

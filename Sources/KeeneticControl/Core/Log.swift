@@ -116,6 +116,14 @@ func log(_ level: LogLevel, _ text: String) {
     Task { @MainActor in LogStore.shared.append(level, text) }
 }
 
+extension Bundle {
+    /// Версия из Info.plist. Нужна и интерфейсу, и проверке обновлений,
+    /// поэтому живёт рядом с остальным общим кодом, а не в вёрстке.
+    static var appVersion: String {
+        (main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.1.0"
+    }
+}
+
 enum AppPaths {
     static let support: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -132,6 +140,7 @@ enum AppPaths {
     static var settingsFile: URL { support.appendingPathComponent("settings.json") }
     static var routersFile: URL { support.appendingPathComponent("routers.json") }
     static var sourcesFile: URL { support.appendingPathComponent("sources.json") }
+    static var failoverFile: URL { support.appendingPathComponent("failover.json") }
 
     private static func subdirectory(_ name: String) -> URL {
         let url = support.appendingPathComponent(name, isDirectory: true)

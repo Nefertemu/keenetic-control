@@ -30,6 +30,8 @@ struct DnsRoutesView: View {
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
     @State private var confirmDelete = false
+    @State private var savingProfile = false
+    @State private var profileName = ""
 
     private let scrollTopID = "dns-routes-top"
 
@@ -109,6 +111,32 @@ struct DnsRoutesView: View {
             interfaceOrder.removeAll()
             addInterfaceIdent = ""
             pickDefaultInterface()
+        }
+        .sheet(isPresented: $savingProfile) {
+            VStack(alignment: .leading, spacing: 14) {
+                CardHeader(icon: "bookmark", title: "Сохранить порядок",
+                           subtitle: interfaceOrder.map(interfaceShortLabel)
+                               .joined(separator: " → "))
+                TextField("например, основная цепочка", text: $profileName)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(saveCurrentProfile)
+                Text("Профиль привяжется к роутеру «\(session.router.name)»: имена "
+                     + "интерфейсов у соседей значат другое.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Отмена") { savingProfile = false }
+                        .buttonStyle(SubtleButtonStyle())
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Сохранить", action: saveCurrentProfile)
+                        .buttonStyle(PrimaryButtonStyle())
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(22)
+            .frame(width: 460)
+            .background(Palette.surface)
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, state: session.state) { dryRun in
@@ -342,6 +370,76 @@ struct DnsRoutesView: View {
                 .font(.system(size: 12, weight: .semibold))
             Text("выбранные списки пойдут ровно на эти интерфейсы, лишние маршруты снимутся")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            profilesMenu
+        }
+    }
+
+    /// Одна и та же цепочка набиралась руками при каждом назначении.
+    private var profilesMenu: some View {
+        Menu {
+            let saved = store.failoverProfiles(for: session.router.id)
+            if saved.isEmpty {
+                Text("Сохранённых профилей нет")
+            } else {
+                ForEach(saved) { profile in
+                    Button(profileMenuTitle(profile)) { applyProfile(profile) }
+                }
+                Divider()
+                Menu("Удалить") {
+                    ForEach(saved) { profile in
+                        Button(profile.name, role: .destructive) { store.removeFailover(profile) }
+                    }
+                }
+                Divider()
+            }
+            Button("Сохранить текущий порядок…") { profileName = ""; savingProfile = true }
+                .disabled(interfaceOrder.isEmpty)
+        } label: {
+            Label("Профили", systemImage: "bookmark")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Сохранённые последовательности резервирования для этого роутера")
+    }
+
+    /// В названии сразу видно, если интерфейса из профиля больше нет.
+    private func profileMenuTitle(_ profile: FailoverProfile) -> String {
+        let available = (session.state?.candidates ?? []).map(\.ident)
+        let resolved = profile.resolve(against: available)
+        guard resolved.missing.isEmpty else {
+            return "\(profile.name) — нет \(resolved.missing.joined(separator: ", "))"
+        }
+        return "\(profile.name) · " + profile.interfaces.map(interfaceShortLabel)
+            .joined(separator: " → ")
+    }
+
+    private func applyProfile(_ profile: FailoverProfile) {
+        let available = (session.state?.candidates ?? []).map(\.ident)
+        let resolved = profile.resolve(against: available)
+        interfaceOrder = resolved.present
+        if let first = resolved.present.first { interfaceIdent = first }
+        addInterfaceIdent = ""
+        if !resolved.missing.isEmpty {
+            alert = AlertPayload(
+                title: "Профиль применён не полностью",
+                message: "На роутере больше нет: \(resolved.missing.joined(separator: ", ")). "
+                       + "Остальные интерфейсы расставлены в прежнем порядке.",
+                isError: false)
+        }
+    }
+
+    private func saveCurrentProfile() {
+        let profile = FailoverProfile(name: profileName.trimmingCharacters(in: .whitespaces),
+                                      routerID: session.router.id,
+                                      interfaces: interfaceOrder)
+        do {
+            try FailoverProfile.validate(profile, existing: store.failoverProfiles)
+            store.saveFailover(profile)
+            savingProfile = false
+        } catch {
+            alert = AlertPayload(title: "Профиль не сохранён",
+                                 message: session.describe(error))
         }
     }
 
