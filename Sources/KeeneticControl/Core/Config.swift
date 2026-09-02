@@ -165,6 +165,10 @@ struct AppSettings: Codable {
     var saveConfigAfterApply: Bool = true
     /// Интервал активной проверки всех клиентских WireGuard-туннелей.
     var wireGuardProbeIntervalSeconds: Int = 3
+    /// Как часто само перечитывать конфигурацию подключённого роутера,
+    /// чтобы правки из веб-панели появлялись без нажатия «Обновить».
+    /// 0 — не перечитывать.
+    var autoReloadSeconds: Int = 60
     /// Последний выбранный роутер — чтобы запуск не сбрасывал его на первый.
     var lastRouterID: String = ""
     /// Фоновая сверка источников с роутером.
@@ -201,6 +205,7 @@ struct AppSettings: Codable {
         saveConfigAfterApply = value(.saveConfigAfterApply, fallback.saveConfigAfterApply)
         wireGuardProbeIntervalSeconds = value(
             .wireGuardProbeIntervalSeconds, fallback.wireGuardProbeIntervalSeconds)
+        autoReloadSeconds = value(.autoReloadSeconds, fallback.autoReloadSeconds)
         lastRouterID = value(.lastRouterID, fallback.lastRouterID)
         autoUpdateEnabled = value(.autoUpdateEnabled, fallback.autoUpdateEnabled)
         autoUpdateHours = value(.autoUpdateHours, fallback.autoUpdateHours)

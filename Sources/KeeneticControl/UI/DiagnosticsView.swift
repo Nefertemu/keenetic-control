@@ -14,6 +14,11 @@ struct DiagnosticsView: View {
         session.state?.wireguardInterfaces ?? []
     }
 
+    /// Что должно измениться, чтобы проверка запустилась заново.
+    private var autoRunKey: String {
+        "\(session.router.id.uuidString)|\(interfaceIdent)|\(target.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -44,6 +49,16 @@ struct DiagnosticsView: View {
             .padding(20)
         }
         .onAppear { syncDefaults(force: true) }
+        // Проверка только читает роутер, поэтому запускается сама при смене
+        // интерфейса или цели. Раньше результат приходилось выбивать кнопкой,
+        // а первый клик после ввода уходил на снятие фокуса с поля — и на
+        // экране оставался отчёт по ПРЕДЫДУЩЕЙ цели, выглядевший свежим.
+        .task(id: autoRunKey) {
+            guard !interfaceIdent.isEmpty, !target.isEmpty, session.state != nil else { return }
+            do { try await Task.sleep(nanoseconds: 700_000_000) } catch { return }
+            guard !Task.isCancelled else { return }
+            await run()
+        }
         .onChange(of: session.state?.readAt) { _, _ in
             if !interfaces.contains(interfaceIdent) { syncDefaults(force: true) }
             else if target.isEmpty { syncTarget() }
@@ -113,6 +128,7 @@ struct DiagnosticsView: View {
             TextField("например, 1.1.1.1 или google.com", text: $target)
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 180, idealWidth: 250, maxWidth: 320)
+                .onSubmit { Task { await run() } }
         }
     }
 

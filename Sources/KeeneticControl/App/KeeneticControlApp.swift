@@ -33,7 +33,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { AppDelegate.session?.disconnectAll() }
+        MainActor.assumeIsolated {
+            // История туннелей пишется с задержкой — досохраняем накопленное,
+            // иначе последние минуты наблюдений пропали бы при выходе.
+            TunnelHealthStore.shared.flush()
+            AppDelegate.session?.disconnectAll()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

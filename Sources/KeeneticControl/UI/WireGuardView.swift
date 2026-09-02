@@ -222,7 +222,7 @@ struct WireGuardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     CardHeader(icon: "waveform.path.ecg",
                                title: "Встроенный Ping-Check",
-                               subtitle: "Статус роутера · автообновление каждые 4 секунды")
+                               subtitle: "Статус роутера · автообновление каждые \(liveStatusSeconds) с")
                     livePingStatus(check)
                 }
             }
@@ -301,7 +301,7 @@ struct WireGuardView: View {
             .font(.system(size: 10))
             .foregroundStyle(.secondary)
         } else if let pingUpdatedAt {
-            Text("Последняя проверка: \(pingUpdatedAt.formatted(date: .omitted, time: .standard)) · автообновление каждые 4 с")
+            Text("Последняя проверка: \(pingUpdatedAt.formatted(date: .omitted, time: .standard)) · автообновление каждые \(liveStatusSeconds) с")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         } else {
@@ -953,18 +953,29 @@ struct WireGuardView: View {
         min(300, max(3, store.settings.wireGuardProbeIntervalSeconds))
     }
 
+    /// Как часто спрашивать роутер о живом статусе Ping-Check.
+    ///
+    /// По RCI это дешёвый GET — можно часто. По SSH каждая проверка поднимает
+    /// ОТДЕЛЬНОЕ соединение с парольной аутентификацией (основной pty часть
+    /// прошивок закрывает после `show ping-check`). Раз в четыре секунды это
+    /// и лишняя нагрузка на роутер, и десятки логинов в минуту — ровно то,
+    /// на что у веб-панели есть защита от подбора.
+    private var liveStatusSeconds: Int {
+        session.router.transport == .ssh ? 30 : 4
+    }
+
     private func monitorLiveInterface() async {
         let ident = interfaceIdent
         guard !ident.isEmpty else { return }
-        // Без привязки нет смысла ходить в роутер каждые четыре секунды:
-        // статус «проверки нет» уже полностью описывает это состояние.
+        // Без привязки нет смысла ходить в роутер вообще: статус «проверки
+        // нет» уже полностью описывает это состояние.
         guard session.state?.hasPingCheck(ident) == true else { return }
         while !Task.isCancelled {
             if session.status.isOnline, session.state != nil {
                 await updateLiveInterface(ident: ident)
             }
             do {
-                try await Task.sleep(nanoseconds: 4_000_000_000)
+                try await Task.sleep(nanoseconds: UInt64(liveStatusSeconds) * 1_000_000_000)
             } catch {
                 return
             }

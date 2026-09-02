@@ -67,6 +67,9 @@ struct RootView: View {
     @State private var alert: AlertPayload?
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
+    /// Об осечке фонового чтения сообщаем один раз, а не каждый тик.
+    @State private var autoReloadFailed = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationSplitView {
@@ -109,6 +112,55 @@ struct RootView: View {
         }
         .task {
             await session.monitorConnections()
+        }
+        // Перечитывание по таймеру. Ключ задачи — интервал: поменял в
+        // настройках, цикл перезапустился с новым.
+        .task(id: store.settings.autoReloadSeconds) { await autoReloadLoop() }
+        // Вернулся в приложение из веб-панели роутера — читаем сразу, не
+        // дожидаясь следующего тика. Ради этого случая всё и затевалось.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await autoReloadTick() }
+        }
+    }
+
+    // MARK: - Автоматическое перечитывание конфигурации
+
+    private func autoReloadLoop() async {
+        while !Task.isCancelled {
+            // Полное чтение running-config — это десятки килобайт и заметная
+            // работа роутера. Чаще чем раз в четверть минуты не ходим, даже
+            // если в поле вписали единицу.
+            let seconds = max(15, store.settings.autoReloadSeconds)
+            guard store.settings.autoReloadSeconds > 0 else { return }
+            do { try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000) }
+            catch { return }
+            await autoReloadTick()
+        }
+    }
+
+    private func autoReloadTick() async {
+        guard store.settings.autoReloadSeconds > 0 else { return }
+        // Только уже подключённый роутер. Сама фоновая задача подключаться
+        // не должна: неверный пароль в цикле — это путь к блокировке
+        // веб-панели, которую роутер ставит за подбор.
+        guard session.status.isOnline else { return }
+        // Идёт операция — не мешаем: её собственная проверка перечитает
+        // конфигурацию сама, а лишнее чтение только отнимет канал.
+        guard session.progress == nil else { return }
+
+        do {
+            _ = try await session.refresh(quiet: true)
+            if autoReloadFailed {
+                autoReloadFailed = false
+                log(.ok, "Автоматическое чтение конфигурации восстановилось.")
+            }
+        } catch {
+            // О неудаче говорим один раз, а не каждую минуту.
+            guard !autoReloadFailed else { return }
+            autoReloadFailed = true
+            log(.warn, "Автоматическое чтение конфигурации не удалось: "
+                + session.describe(error))
         }
     }
 

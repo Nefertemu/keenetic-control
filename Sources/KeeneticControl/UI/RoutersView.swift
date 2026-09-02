@@ -252,6 +252,13 @@ struct RoutersView: View {
                 numberField("Проверка VPN, с", value: $store.settings.wireGuardProbeIntervalSeconds,
                             range: 3...300,
                             hint: "Как часто обновлять пинг всех WireGuard-туннелей.")
+                numberField("Перечитывать конфигурацию, с",
+                            value: $store.settings.autoReloadSeconds,
+                            range: 0...3600,
+                            hint: store.settings.autoReloadSeconds == 0
+                              ? "0 — только вручную кнопкой «Обновить»."
+                              : "Правки из веб-панели роутера подхватятся сами. "
+                                + "Читается и сразу при возврате в приложение.")
             }
 
             Divider()

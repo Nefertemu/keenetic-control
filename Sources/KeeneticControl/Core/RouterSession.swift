@@ -105,15 +105,24 @@ struct RouterState {
 
     /// DNS-серверы из running-config. Они нужны только для диагностики:
     /// приложение не меняет их и не пытается угадывать настройки DNS.
+    /// Адреса DNS-серверов роутера.
+    ///
+    /// В строке `ip name-server` за адресом идут ещё домен и привязка к
+    /// интерфейсу — например `ip name-server 1.1.1.1 "" on Wireguard0`.
+    /// Раньше в список попадали все слова подряд, и рядом с адресами
+    /// оказывались `""`, `on` и имена интерфейсов, выданные за серверы.
     var nameServers: [String] {
         var result: [String] = []
         for raw in configText.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw).trimmingCharacters(in: .whitespaces)
             guard line.hasPrefix("ip name-server ") else { continue }
+            // Берём адреса с начала строки и останавливаемся на первом слове,
+            // которое адресом не является.
             for value in line.dropFirst("ip name-server ".count)
                 .split(whereSeparator: { $0.isWhitespace }) {
                 let server = String(value)
-                if !server.isEmpty, !result.contains(server) { result.append(server) }
+                guard IPTools.isIP(server) else { break }
+                if !result.contains(server) { result.append(server) }
             }
         }
         return result
@@ -794,6 +803,14 @@ final class RouterSession: ObservableObject {
         try await refresh(operation: beginOperation())
     }
 
+    /// Фоновое перечитывание. `quiet` убирает подпись «Читаю конфигурацию…»
+    /// и строку в журнале: раз в минуту они бы только мельтешили и засоряли
+    /// журнал, а по-настоящему интересно лишь то, что конфигурация изменилась.
+    @discardableResult
+    func refresh(quiet: Bool) async throws -> RouterState {
+        try await refresh(operation: beginOperation(), quiet: quiet)
+    }
+
     /// Подключить и сразу прочитать конкретный роутер. Выбор в боковой
     /// панели на результат не влияет: состояние сохранится в его слоте.
     @discardableResult
@@ -819,20 +836,23 @@ final class RouterSession: ObservableObject {
     /// Вариант для составных операций: проверяет, что профиль не был
     /// отредактирован между несколькими чтениями и командами.
     @discardableResult
-    func refresh(operation: RouterOperation) async throws -> RouterState {
+    func refresh(operation: RouterOperation, quiet: Bool = false) async throws -> RouterState {
         let owner = operation.routerID
         try requireCurrent(operation)
-        store(activity: "Читаю конфигурацию роутера…", owner: owner)
-        defer { clearActivity(owner: owner) }
+        if !quiet {
+            store(activity: "Читаю конфигурацию роутера…", owner: owner)
+        }
+        defer { if !quiet { clearActivity(owner: owner) } }
         let readProfile = slots[owner]?.profile ?? router
 
         let fresh: RouterState = try await guarded(operation: operation, budget: 200) { transport in
-            let configText = try transport.fetchText("show running-config", timeout: 180)
+            let configText = try transport.fetchText("show running-config", timeout: 180,
+                                                     quiet: quiet)
 
             var statusInterfaces: [String: KeeneticInterface] = [:]
             if let rci = transport as? RCITransport {
                 statusInterfaces = RouterConfigParser.parseInterfaceStatus(
-                    json: RCITransport.interfaceStatusJSON(rci))
+                    json: RCITransport.interfaceStatusJSON(rci, logResult: !quiet))
             } else {
                 let text = try transport.run("show interface", timeout: 120)
                 statusInterfaces = RouterConfigParser.parseInterfaceStatus(text)
@@ -857,7 +877,9 @@ final class RouterSession: ObservableObject {
                 // следующей операции.
                 pingInfo = (try? SSHTransport.fetchPingCheck(profile: readProfile)) ?? [:]
             }
-            log(.info, "Ping-Check при чтении: интерфейсов " + String(pingInfo.count))
+            if !quiet {
+                log(.info, "Ping-Check при чтении: интерфейсов " + String(pingInfo.count))
+            }
             RouterConfigParser.applyPingCheck(pingInfo, to: &interfaces)
 
             let pingCheck = PingCheckParser.parse(config: configText)
@@ -876,10 +898,20 @@ final class RouterSession: ObservableObject {
         }
 
         try requireCurrent(operation)
+        let previous = readState(for: owner)?.configText
         store(state: fresh, owner: owner)
-        log(.ok, "Прочитано: \(Format.lists(fresh.groups.count)), "
-            + "\(Format.domains(fresh.totalDomains)), "
-            + "\(Format.routes(fresh.staticRoutes.count)).")
+        if quiet {
+            // В тихом режиме говорим только о том, ради чего он и нужен:
+            // конфигурация на роутере стала другой.
+            if let previous, previous != fresh.configText {
+                log(.ok, "Конфигурация «\(slots[owner]?.profile.name ?? "роутера")» "
+                    + "изменилась — перечитал сам.")
+            }
+        } else {
+            log(.ok, "Прочитано: \(Format.lists(fresh.groups.count)), "
+                + "\(Format.domains(fresh.totalDomains)), "
+                + "\(Format.routes(fresh.staticRoutes.count)).")
+        }
         return fresh
     }
 

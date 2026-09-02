@@ -30,11 +30,20 @@ protocol KeeneticTransport: AnyObject {
     func run(_ command: String, timeout: TimeInterval) throws -> String
     func runBatch(_ commands: [String], timeout: TimeInterval) throws -> String
     /// Длинные текстовые выгрузки (running-config и подобное).
-    func fetchText(_ command: String, timeout: TimeInterval) throws -> String
+    /// `quiet` глушит информационные строки в журнале. Нужен фоновому
+    /// перечитыванию: раз в минуту одни и те же записи только мешают.
+    func fetchText(_ command: String, timeout: TimeInterval, quiet: Bool) throws -> String
     func close()
     /// Оборвать всё немедленно из другого потока — сторож операций.
     func abort()
 }
+extension KeeneticTransport {
+    /// Прежняя короткая форма: обычное чтение говорит в журнал как раньше.
+    func fetchText(_ command: String, timeout: TimeInterval) throws -> String {
+        try fetchText(command, timeout: timeout, quiet: false)
+    }
+}
+
 
 extension KeeneticTransport {
     func run(_ command: String) throws -> String { try run(command, timeout: 90) }

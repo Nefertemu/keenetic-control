@@ -82,6 +82,12 @@ final class TunnelHealthStore: ObservableObject {
     private let retention: TimeInterval = 7 * 24 * 60 * 60
     private let sameStateInterval: TimeInterval = 60
     private let maxSamplesPerTunnel = 30_000
+    /// Точки задержки приходят каждые несколько секунд, а на диск уезжает
+    /// весь файл целиком — за неделю он вырастает до мегабайтов. Копим
+    /// изменения и пишем редко; смена состояния туннеля идёт сразу.
+    private let saveDebounce: TimeInterval = 20
+    private var pendingSave = false
+    private var saveTask: Task<Void, Never>?
 
     private init() {
         fileURL = AppPaths.support.appendingPathComponent("tunnel-health.json")
@@ -120,13 +126,17 @@ final class TunnelHealthStore: ObservableObject {
             return
         }
 
+        // Переход между состояниями — событие, ради которого эту историю и
+        // ведут. Такое сохраняем немедленно, чтобы обрыв не потерялся при
+        // внезапном выходе.
+        let transition = samples.last?.state != state
         samples.append(TunnelHealthSample(timestamp: now, state: state,
                                           interfaceUp: interfaceUp,
                                           handshakeFresh: handshakeFresh,
                                           pingStatus: pingStatus))
         trim(&samples, now: now)
         records[recordKey] = samples
-        persist()
+        scheduleSave(immediate: transition)
     }
 
     /// Сохранить именно измеренную задержку активной проверки. Эти точки
@@ -153,7 +163,7 @@ final class TunnelHealthStore: ObservableObject {
             probeMethod: result.method.rawValue))
         trim(&samples, now: timestamp)
         records[recordKey] = samples
-        persist()
+        scheduleSave(immediate: samples.dropLast().last?.state != state)
     }
 
     func latencySamples(routerID: UUID, interface: String,
@@ -244,11 +254,49 @@ final class TunnelHealthStore: ObservableObject {
         return try? decoder.decode(Snapshot.self, from: data)
     }
 
+    /// Отложенная запись. Без неё каждая точка задержки переписывала весь
+    /// файл — при открытом экране WireGuard это мегабайты на диск каждые
+    /// несколько секунд и кодирование JSON на главном потоке.
+    private func scheduleSave(immediate: Bool) {
+        pendingSave = true
+        if immediate {
+            saveTask?.cancel()
+            saveTask = nil
+            persist()
+            return
+        }
+        guard saveTask == nil else { return }
+        saveTask = Task { [weak self, saveDebounce] in
+            try? await Task.sleep(nanoseconds: UInt64(saveDebounce * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.saveTask = nil
+                self?.persist()
+            }
+        }
+    }
+
+    /// Записать немедленно — при выходе из приложения, чтобы накопленное
+    /// за последние секунды не пропало.
+    func flush() {
+        saveTask?.cancel()
+        saveTask = nil
+        persist()
+    }
+
     private func persist() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(Snapshot(records: records)) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        guard pendingSave else { return }
+        pendingSave = false
+        // Кодирование мегабайтного JSON уводим с главного потока: иначе
+        // интерфейс подёргивался ровно в такт с проверками туннелей.
+        let snapshot = Snapshot(records: records)
+        let url = fileURL
+        Task.detached(priority: .utility) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            guard let data = try? encoder.encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
     }
 }

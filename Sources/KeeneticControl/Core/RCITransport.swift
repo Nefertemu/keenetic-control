@@ -368,7 +368,7 @@ final class RCITransport: KeeneticTransport {
         return RCITransport.renderStatus(result, command: commands.joined(separator: "; "))
     }
 
-    func fetchText(_ command: String, timeout: TimeInterval) throws -> String {
+    func fetchText(_ command: String, timeout: TimeInterval, quiet: Bool = false) throws -> String {
         let candidates: [String]
         if command.hasPrefix("show startup-config") {
             candidates = ["ci/startup-config.txt", "rci/show/startup-config"]
@@ -393,7 +393,9 @@ final class RCITransport: KeeneticTransport {
 
             let text = CLI.normalizeNewlines(RCITransport.unwrapConfig(raw))
             if RCITransport.looksLikeConfig(text) {
-                log(.info, "RCI: конфигурация получена из /\(path) (\(Format.bytes(text.utf8.count))).")
+                if !quiet {
+                    log(.info, "RCI: конфигурация получена из /\(path) (\(Format.bytes(text.utf8.count))).")
+                }
                 return text
             }
 

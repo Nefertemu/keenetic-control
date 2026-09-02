@@ -277,7 +277,7 @@ final class SSHTransport: KeeneticTransport {
         return CLI.stripEcho(chunks.joined(separator: "\n"), commands: commands)
     }
 
-    func fetchText(_ command: String, timeout: TimeInterval) throws -> String {
+    func fetchText(_ command: String, timeout: TimeInterval, quiet: Bool = false) throws -> String {
         try run(command, timeout: timeout)
     }
 

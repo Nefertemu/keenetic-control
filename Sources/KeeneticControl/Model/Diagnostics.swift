@@ -66,7 +66,9 @@ enum RouterDiagnosticsBuilder {
         let pingState = state.pingCheck(for: cleanInterface)
 
         let dns = dnsCheck(state: state, target: cleanTarget,
-                           pingState: pingState, resolved: interfaceState?.pingCheckResolvedAddresses ?? [])
+                           pingState: pingState,
+                           profileTarget: pingCheckTarget(state: state, interface: cleanInterface),
+                           resolved: interfaceState?.pingCheckResolvedAddresses ?? [])
         let route = routeCheck(state: state, interface: cleanInterface)
         let mtu = mtuCheck(state: state, interface: cleanInterface)
 
@@ -75,8 +77,19 @@ enum RouterDiagnosticsBuilder {
                                        route: route, mtu: mtu)
     }
 
+    /// Цель, которую роутер реально резолвит для этого интерфейса, — это
+    /// узел из назначенного профиля Ping-Check, и только он.
+    static func pingCheckTarget(state: RouterState, interface: String) -> String? {
+        guard let name = state.pingCheckBindings[interface]?.profile, !name.isEmpty,
+              let profile = state.pingCheckProfiles.first(where: { $0.name == name })
+        else { return nil }
+        let value = profile.target.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
     private static func dnsCheck(state: RouterState, target: String,
                                  pingState: PingCheckLiveState,
+                                 profileTarget: String?,
                                  resolved: [String]) -> DiagnosticCheck {
         let addresses = resolved.filter(IPTools.isIP)
         if target.isEmpty {
@@ -90,7 +103,14 @@ enum RouterDiagnosticsBuilder {
                                    detail: "Цель \(target) — IP-адрес, резолвинг не нужен.",
                                    severity: .info)
         }
-        if !addresses.isEmpty {
+        // Адреса приходят из статуса Ping-Check и относятся к узлу ЕГО
+        // профиля. Подписать ими произвольную цель значило бы утверждать
+        // резолвинг, которого роутер не делал.
+        let matchesProfile = profileTarget.map {
+            $0.caseInsensitiveCompare(target) == .orderedSame
+        } ?? false
+
+        if !addresses.isEmpty, matchesProfile {
             let servers = state.nameServers.isEmpty
                 ? "DNS-серверы роутер не перечислил."
                 : "Серверы: \(state.nameServers.joined(separator: ", "))."
@@ -98,6 +118,15 @@ enum RouterDiagnosticsBuilder {
                                    value: "резолвинг работает",
                                    detail: "\(target) → \(addresses.joined(separator: ", ")). \(servers)",
                                    severity: .pass)
+        }
+
+        if !addresses.isEmpty, let profileTarget {
+            return DiagnosticCheck(
+                id: "dns", title: "DNS", value: "не проверялась",
+                detail: "Роутер резолвит только узел своего профиля Ping-Check — "
+                      + "\(profileTarget). Про \(target) он ничего не сообщал. "
+                      + "Впиши сюда \(profileTarget) или поменяй цель в профиле.",
+                severity: .info)
         }
 
         let reason: String

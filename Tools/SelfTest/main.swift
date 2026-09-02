@@ -267,9 +267,41 @@ let diagnostics = RouterDiagnosticsBuilder.build(state: diagnosticState,
                                                  target: "example.com")
 check("DNS-серверы читаются", diagnosticState.nameServers,
       ["1.1.1.1", "8.8.8.8"])
-check("диагностика DNS видит резолвинг", diagnostics.dns.severity == .pass)
+
+// Реальная строка Keenetic несёт за адресом ещё домен и привязку к
+// интерфейсу. Они не серверы и в списке появляться не должны.
+var serverState = RouterState()
+serverState.configText = """
+ip name-server 192.168.248.21 "" on ISP
+ip name-server 1.1.1.1 "" on Wireguard0
+ip name-server 1.0.0.1
+"""
+check("за адресом ничего лишнего не подбираем", serverState.nameServers,
+      ["192.168.248.21", "1.1.1.1", "1.0.0.1"])
 check("диагностика маршрута видит FQDN и static", diagnostics.route.severity == .pass)
 check("диагностика MTU видит безопасное значение", diagnostics.mtu.severity == .pass)
+
+// Адреса из статуса Ping-Check относятся к узлу ЕГО профиля. Подписать ими
+// произвольную цель — значит утверждать резолвинг, которого не было.
+check("чужую цель не выдаём за резолвинг", diagnostics.dns.severity != .pass)
+check("и объясняем, чей узел роутер на самом деле резолвит",
+      diagnostics.dns.detail.contains("1.1.1.1"))
+
+diagnosticState.pingCheckProfiles = [PingCheckProfile(name: "vpn", host: "example.com")]
+let matching = RouterDiagnosticsBuilder.build(state: diagnosticState,
+                                              interface: "Wireguard0",
+                                              target: "example.com")
+check("совпала с профилем — резолвинг подтверждён", matching.dns.severity == .pass)
+check("регистр цели не мешает",
+      RouterDiagnosticsBuilder.build(state: diagnosticState, interface: "Wireguard0",
+                                     target: "Example.COM").dns.severity == .pass)
+check("узел профиля определяется",
+      RouterDiagnosticsBuilder.pingCheckTarget(state: diagnosticState,
+                                               interface: "Wireguard0") ?? "nil",
+      "example.com")
+check("без профиля узла нет",
+      RouterDiagnosticsBuilder.pingCheckTarget(state: diagnosticState,
+                                               interface: "Wireguard9") == nil)
 
 // Роутер прислал details, но без ping-check — тоже «не знаем».
 let noCheck = RouterConfigParser.parseInterfaceStatus(json: [
@@ -979,6 +1011,9 @@ if let restored = try? JSONDecoder().decode(AppSettings.self, from: oldSettings)
 } else {
     check("файл настроек прошлой версии читается", false)
 }
+check("новый интервал перечитывания взял значение по умолчанию",
+      String((try? JSONDecoder().decode(AppSettings.self, from: oldSettings))?.autoReloadSeconds ?? -1),
+      "60")
 check("пустой объект не ломает чтение",
       (try? JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))) != nil)
 check("полный цикл записи и чтения",
