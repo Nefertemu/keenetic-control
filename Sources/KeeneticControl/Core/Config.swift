@@ -178,6 +178,9 @@ struct AppSettings: Codable {
     var autoUpdateSources: [String] = []
     var autoUpdateNotify: Bool = true
     var lastAutoUpdate: Date?
+    /// Проверка новых версий приложения на GitHub.
+    var checkAppUpdates: Bool = true
+    var lastUpdateCheck: Date?
 
     static let `default` = AppSettings()
 
@@ -211,6 +214,8 @@ struct AppSettings: Codable {
         autoUpdateHours = value(.autoUpdateHours, fallback.autoUpdateHours)
         autoUpdateSources = value(.autoUpdateSources, fallback.autoUpdateSources)
         autoUpdateNotify = value(.autoUpdateNotify, fallback.autoUpdateNotify)
+        checkAppUpdates = value(.checkAppUpdates, fallback.checkAppUpdates)
+        lastUpdateCheck = try? box.decodeIfPresent(Date.self, forKey: .lastUpdateCheck)
         lastAutoUpdate = try? box.decodeIfPresent(Date.self, forKey: .lastAutoUpdate)
     }
 }

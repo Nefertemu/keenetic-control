@@ -14,6 +14,7 @@ struct RoutersView: View {
     /// нельзя, это выглядит как поломка на ровном месте.
     @State private var havePassword: Set<UUID>?
     @ObservedObject private var updater = AutoUpdater.shared
+    @ObservedObject private var appUpdates = UpdateChecker.shared
 
     var body: some View {
         ScrollView {
@@ -21,6 +22,7 @@ struct RoutersView: View {
                 routers
                 settings
                 autoUpdate
+                appUpdate
                 storage
             }
             .padding(20)
@@ -410,6 +412,58 @@ struct RoutersView: View {
         }
         .buttonStyle(SubtleButtonStyle())
         .disabled(updater.checking)
+    }
+
+    // MARK: - Обновления приложения
+
+    private var appUpdate: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                CardHeader(icon: "arrow.down.circle", title: "Версия приложения",
+                           subtitle: "Сейчас установлена \(Bundle.appVersion)")
+                Spacer()
+                Button {
+                    Task { await appUpdates.check(manual: true) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if appUpdates.checking { ProgressView().controlSize(.small) }
+                        Text(appUpdates.checking ? "Проверяю…" : "Проверить сейчас")
+                    }
+                }
+                .buttonStyle(SubtleButtonStyle())
+                .disabled(appUpdates.checking)
+            }
+
+            Toggle(isOn: $store.settings.checkAppUpdates) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Проверять новые версии на GitHub")
+                        .font(.system(size: 12, weight: .medium))
+                    Text("Раз в сутки. Приложение только сообщает о версии и открывает "
+                         + "страницу релиза — ничего не скачивает и не подменяет себя само.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if let release = appUpdates.available {
+                HStack(spacing: 10) {
+                    StatusPill(text: "доступна \(release.version)", tint: Palette.accent)
+                    Text(release.title)
+                        .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                    Button("Открыть релиз") { NSWorkspace.shared.open(release.pageURL) }
+                        .buttonStyle(SubtleButtonStyle())
+                }
+            } else if let error = appUpdates.lastError {
+                Text(error)
+                    .font(.system(size: 11)).foregroundStyle(Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let last = appUpdates.lastCheck {
+                Text("Последняя проверка \(Format.age(last)) — установлена самая новая версия.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .card()
     }
 
     // MARK: - Данные на диске

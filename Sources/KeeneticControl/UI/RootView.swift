@@ -55,6 +55,7 @@ struct RootView: View {
     @ObservedObject private var store = Store.shared
 
     @ObservedObject private var updater = AutoUpdater.shared
+    @ObservedObject private var appUpdates = UpdateChecker.shared
     @State private var section: AppSection = .overview
     @State private var alert: AlertPayload?
     @State private var plan: Plan?
@@ -108,6 +109,13 @@ struct RootView: View {
         }
         .task {
             await session.monitorConnections()
+        }
+        .task {
+            // Раз в сутки и при запуске. Чаще незачем: релизы выходят реже.
+            guard store.settings.checkAppUpdates else { return }
+            if let last = store.settings.lastUpdateCheck,
+               Date().timeIntervalSince(last) < 24 * 3600 { return }
+            await appUpdates.check(manual: false)
         }
         .background(shortcuts)
         .onReceive(Navigator.shared.$paletteRequested) { requested in
@@ -500,7 +508,10 @@ struct RootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-            if let found = updater.finding { updateBanner(found) }
+            VStack(spacing: 8) {
+                if let release = appUpdates.available { releaseBanner(release) }
+                if let found = updater.finding { updateBanner(found) }
+            }
         }
         .navigationTitle(section.title)
         .toolbar {
@@ -515,6 +526,44 @@ struct RootView: View {
                 .help("Перечитать конфигурацию роутера (⌘R)")
             }
         }
+    }
+
+    /// Вышла новая версия приложения. Ничего не скачиваем сами — только
+    /// говорим и открываем страницу релиза.
+    private func releaseBanner(_ release: AvailableUpdate) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Palette.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Вышла версия \(release.version)")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("У тебя \(Bundle.appVersion). Приложение ничего не скачивает само.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Button("Открыть релиз") { NSWorkspace.shared.open(release.pageURL) }
+                .buttonStyle(PrimaryButtonStyle())
+            Button {
+                appUpdates.dismiss()
+            } label: {
+                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Скрыть до следующей версии")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Palette.surface))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
+            .strokeBorder(Palette.accent.opacity(0.5), lineWidth: 1)
+            .allowsHitTesting(false))
+        .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
+        .padding(.horizontal, 20)
+        .padding(.top, 12)
     }
 
     /// Фоновая сверка что-то нашла. Полоса поверх содержимого, а не
