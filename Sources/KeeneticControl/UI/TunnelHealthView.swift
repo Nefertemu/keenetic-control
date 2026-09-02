@@ -367,3 +367,161 @@ struct TunnelHealthSparkline: View {
         }
     }
 }
+
+// MARK: - Общая шкала доступности
+
+/// Что показывать по одному туннелю на общей шкале.
+struct TunnelAvailabilityRow: Identifiable {
+    var interface: String
+    var label: String
+    var colorIndex: Int
+    var samples: [TunnelHealthSample]
+    var availability: Double?
+    var outages: [TunnelOutageInterval]
+    var id: String { interface }
+}
+
+/// Доступность всех туннелей на ОДНОЙ временной шкале.
+///
+/// Отдельные карточки отвечали на вопрос «как жил этот туннель», но не на
+/// главный при резервировании — «когда именно связь ушла с одного на
+/// другой». Для этого полосы должны стоять друг под другом и делить общее
+/// время.
+struct TunnelAvailabilityMatrix: View {
+    let rows: [TunnelAvailabilityRow]
+    let hours: Double
+
+    private var window: (start: Date, end: Date) {
+        let end = Date()
+        return (end.addingTimeInterval(-hours * 3600), end)
+    }
+
+    private var hasData: Bool { rows.contains { !$0.samples.isEmpty } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CardHeader(icon: "square.stack.3d.down.right",
+                       title: "Доступность туннелей",
+                       subtitle: "Общая шкала за \(Int(hours)) ч — видно, когда связь ушла с одного на другой")
+
+            if !hasData {
+                EmptyHint(icon: "chart.bar.xaxis",
+                          title: "Наблюдений пока нет",
+                          message: "Полосы появятся, когда накопится история проверок.")
+                    .padding(.vertical, 4)
+            } else {
+                VStack(spacing: 7) {
+                    ForEach(rows) { row in bar(row) }
+                }
+                .padding(10)
+                .inset(cornerRadius: 10)
+
+                HStack(spacing: 14) {
+                    legend(.healthy, "в норме")
+                    legend(.degraded, "нестабильно")
+                    legend(.offline, "выключен")
+                    legend(.unknown, "нет данных")
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .padding(12)
+        .inset()
+    }
+
+    private func bar(_ row: TunnelAvailabilityRow) -> some View {
+        HStack(spacing: 9) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.label)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                Text(row.interface)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            .frame(width: 128, alignment: .leading)
+
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.secondary.opacity(0.12))
+                    ForEach(Array(segments(row).enumerated()), id: \.offset) { _, segment in
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(tint(for: segment.state))
+                            .frame(width: max(1, segment.width * proxy.size.width))
+                            .offset(x: segment.start * proxy.size.width)
+                    }
+                }
+            }
+            .frame(height: 16)
+
+            Text(row.availability.map { String(format: "%.1f%%", $0 * 100) } ?? "—")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(availabilityTint(row.availability))
+                .frame(width: 52, alignment: .trailing)
+        }
+        .help(summaryText(row))
+    }
+
+    /// Доли шкалы: начало и ширина в пределах 0…1.
+    private func segments(_ row: TunnelAvailabilityRow) -> [(start: Double, width: Double,
+                                                             state: TunnelHealthState)] {
+        let bounds = window
+        let total = bounds.end.timeIntervalSince(bounds.start)
+        guard total > 0 else { return [] }
+
+        let inside = row.samples
+            .filter { $0.timestamp >= bounds.start }
+            .sorted { $0.timestamp < $1.timestamp }
+        guard !inside.isEmpty else { return [] }
+
+        var result: [(Double, Double, TunnelHealthState)] = []
+        for (index, sample) in inside.enumerated() {
+            let start = sample.timestamp.timeIntervalSince(bounds.start) / total
+            // Отрезок тянется до следующего наблюдения: состояние держалось
+            // всё это время, а не мгновение в точке замера.
+            let next = index + 1 < inside.count
+                ? inside[index + 1].timestamp.timeIntervalSince(bounds.start) / total
+                : 1.0
+            result.append((max(0, start), max(0, next - start), sample.state))
+        }
+        return result.map { (start: $0.0, width: $0.1, state: $0.2) }
+    }
+
+    private func summaryText(_ row: TunnelAvailabilityRow) -> String {
+        var parts = [row.label]
+        if let availability = row.availability {
+            parts.append(String(format: "доступность %.2f%%", availability * 100))
+        }
+        parts.append(row.outages.isEmpty
+                     ? "обрывов нет"
+                     : Format.plural(row.outages.count, "обрыв", "обрыва", "обрывов"))
+        return parts.joined(separator: " · ")
+    }
+
+    private func legend(_ state: TunnelHealthState, _ title: String) -> some View {
+        HStack(spacing: 5) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(tint(for: state))
+                .frame(width: 12, height: 8)
+            Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+        }
+    }
+
+    private func availabilityTint(_ value: Double?) -> Color {
+        guard let value else { return .secondary }
+        if value >= 0.995 { return Palette.success }
+        if value >= 0.95 { return Palette.warning }
+        return Palette.danger
+    }
+
+    private func tint(for state: TunnelHealthState) -> Color {
+        switch state {
+        case .healthy:  return Palette.success
+        case .degraded: return Palette.warning
+        case .offline:  return Palette.danger
+        case .unknown:  return Color.secondary.opacity(0.35)
+        }
+    }
+}

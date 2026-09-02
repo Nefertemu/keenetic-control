@@ -111,7 +111,7 @@ struct DnsRoutesView: View {
             pickDefaultInterface()
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
-            PlanSheet(plan: box.plan) { dryRun in
+            PlanSheet(plan: box.plan, state: session.state) { dryRun in
                 plan = nil
                 Task { await apply(box.plan, dryRun: dryRun) }
             } onCancel: { plan = nil }
@@ -340,7 +340,7 @@ struct DnsRoutesView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("Порядок резервирования")
                 .font(.system(size: 12, weight: .semibold))
-            Text("(для кнопки «Назначить по порядку»)")
+            Text("выбранные списки пойдут ровно на эти интерфейсы, лишние маршруты снимутся")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
     }
@@ -585,11 +585,13 @@ struct DnsRoutesView: View {
     private func buildRoutePlan() {
         let ordered = interfaceOrder.isEmpty && !interfaceIdent.isEmpty
             ? [interfaceIdent] : interfaceOrder
-        let built = ordered.count <= 1
-            ? Planner.planRoutes(groups: selectedGroups, interface: ordered.first ?? "",
-                                 auto: useAuto, reject: useReject)
-            : Planner.planRoutes(groups: selectedGroups, interfaces: ordered,
-                                 auto: useAuto, reject: useReject)
+        // Кнопка одна и называется «по порядку», значит и смысл у неё один:
+        // список направляется РОВНО на перечисленные интерфейсы. Раньше при
+        // единственном интерфейсе она молча переключалась на «добавить к
+        // этому», и список с тремя маршрутами получал ответ «уже назначено»,
+        // хотя два лишних оставались на месте.
+        let built = Planner.planRoutes(groups: selectedGroups, interfaces: ordered,
+                                       auto: useAuto, reject: useReject)
         if built.isEmpty {
             alert = AlertPayload(title: "Уже назначено",
                                  message: "Все выбранные списки уже направлены на выбранные интерфейсы.",

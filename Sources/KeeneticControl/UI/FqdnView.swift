@@ -71,7 +71,7 @@ struct FqdnView: View {
             } onCancel: { manualListEditor = false }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
-            PlanSheet(plan: box.plan, applyTitle: planApplyTitle) { dryRun in
+            PlanSheet(plan: box.plan, applyTitle: planApplyTitle, state: session.state) { dryRun in
                 plan = nil
                 Task { await apply(box.plan, dryRun: dryRun) }
             } onCancel: {

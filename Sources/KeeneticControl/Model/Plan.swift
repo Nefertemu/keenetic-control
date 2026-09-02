@@ -658,3 +658,101 @@ enum ManualFqdnPlanner {
         return plan
     }
 }
+
+// MARK: - Человеческая разница плана
+
+/// Одна строка сводки «что изменится» — по одному списку.
+struct PlanChangeRow: Identifiable, Hashable {
+    var ident: String
+    var title: String
+    var domainsBefore: Int
+    var domainsAfter: Int
+    var routesBefore: [String]
+    var routesAfter: [String]
+    var isNew: Bool
+    var isDeleted: Bool
+
+    var id: String { ident }
+    var domainsChanged: Bool { domainsBefore != domainsAfter }
+    var routesChanged: Bool { routesBefore != routesAfter }
+}
+
+extension Plan {
+    /// Во что превратится конфигурация, если план применить.
+    ///
+    /// В предпросмотре были только команды CLI. Понять по ним, что список
+    /// вырастет с 18 записей до 24 и поедет ещё в один туннель, можно —
+    /// но считать это глазами по три десятка строк никто не станет.
+    func changes(against state: RouterState?) -> [PlanChangeRow] {
+        let groups = state?.groups ?? [:]
+        let deleted = Plan.deletedGroupIdents(in: commands)
+
+        var idents = Set(adds.keys)
+            .union(removes.keys)
+            .union(createdGroups.map(\.ident))
+            .union(routeTargets.map(\.group))
+            .union(unrouteTargets.map(\.group))
+            .union(exactRouteChains.keys)
+            .union(deleted)
+        // Списки, о которых нечего сказать, в сводке не нужны.
+        idents = idents.filter { !$0.isEmpty }
+
+        return idents.sorted { left, right in
+            RouterConfigParser.identOrder(left) < RouterConfigParser.identOrder(right)
+        }.map { ident in
+            let existing = groups[ident]
+            let created = createdGroups.first { $0.ident == ident }
+            let before = existing?.includes ?? []
+            let isDeleted = deleted.contains(ident)
+
+            let after: Set<String>
+            if isDeleted {
+                after = []
+            } else {
+                let seeded = existing == nil ? (created?.includes ?? []) : before
+                after = seeded.union(adds[ident] ?? []).subtracting(removes[ident] ?? [])
+            }
+
+            let routesBefore = existing?.routeAssignments.map(\.interface) ?? []
+            let routesAfter: [String]
+            if isDeleted {
+                routesAfter = []
+            } else if let chain = exactRouteChains[ident] {
+                routesAfter = chain.map(\.interface)
+            } else {
+                var result = routesBefore
+                for target in unrouteTargets where target.group == ident {
+                    result.removeAll { $0 == target.interface }
+                }
+                for target in routeTargets where target.group == ident
+                    && !result.contains(target.interface) {
+                    result.append(target.interface)
+                }
+                routesAfter = result
+            }
+
+            let name = existing?.descriptionText.isEmpty == false
+                ? existing!.descriptionText
+                : (created?.descriptionText.isEmpty == false ? created!.descriptionText : ident)
+
+            return PlanChangeRow(
+                ident: ident, title: name,
+                domainsBefore: before.count, domainsAfter: after.count,
+                routesBefore: routesBefore, routesAfter: routesAfter,
+                isNew: existing == nil && !isDeleted,
+                isDeleted: isDeleted)
+        }
+    }
+
+    /// `no object-group fqdn X` без `include` — это удаление списка целиком.
+    static func deletedGroupIdents(in commands: [String]) -> Set<String> {
+        var result: Set<String> = []
+        let prefix = "no object-group fqdn "
+        for command in commands where command.hasPrefix(prefix) {
+            let tail = command.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+            let parts = tail.split(whereSeparator: { $0.isWhitespace })
+            if parts.count == 1 { result.insert(String(parts[0])) }
+        }
+        return result
+    }
+}

@@ -2,9 +2,7 @@ import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable {
     case overview
-    case wireguard
-    case pingCheck
-    case diagnostics
+    case tunnels
     case domains
     case staticRoutes
     case compare
@@ -17,9 +15,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .overview:      return "Обзор"
-        case .wireguard:     return "WireGuard"
-        case .pingCheck:     return "Ping-Check"
-        case .diagnostics:   return "Диагностика"
+        case .tunnels:       return "Туннели"
         case .domains:       return "Списки доменов"
         case .staticRoutes:  return "Статические маршруты"
         case .compare:       return "Сравнение роутеров"
@@ -32,9 +28,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .overview:      return "square.grid.2x2"
-        case .wireguard:     return "shield.lefthalf.filled"
-        case .pingCheck:     return "waveform.path.ecg"
-        case .diagnostics:   return "stethoscope"
+        case .tunnels:       return "shield.lefthalf.filled"
         case .domains:       return "list.bullet.rectangle"
         case .staticRoutes:  return "point.topleft.down.to.point.bottomright.curvepath"
         case .compare:       return "arrow.left.arrow.right"
@@ -46,8 +40,9 @@ enum AppSection: String, CaseIterable, Identifiable {
 
     var group: String {
         switch self {
-        case .overview:                          return "Роутер"
-        case .wireguard, .pingCheck, .diagnostics: return "Туннели"
+        // Раздел один — отдельная группа из одного пункта с тем же именем
+        // выглядела как ошибка вёрстки.
+        case .overview, .tunnels:                return "Роутер"
         case .domains, .staticRoutes, .compare:
                                                  return "Маршрутизация"
         case .backups, .journal, .routers:       return "Служебное"
@@ -68,6 +63,7 @@ struct RootView: View {
     @State private var autoReloadFailed = false
     /// Какая половина «Списков доменов» открыта — помним между переходами.
     @State private var domainsTab: DomainsTab = .routes
+    @State private var tunnelsTab: TunnelsTab = .status
     @State private var paletteOpen = false
     @Environment(\.scenePhase) private var scenePhase
 
@@ -86,7 +82,7 @@ struct RootView: View {
                   dismissButton: .default(Text("Понятно")))
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
-            PlanSheet(plan: box.plan, applyTitle: "Загрузить на роутер") { dryRun in
+            PlanSheet(plan: box.plan, applyTitle: "Загрузить на роутер", state: session.state) { dryRun in
                 plan = nil
                 Task { await apply(box.plan, dryRun: dryRun) }
             } onCancel: { plan = nil }
@@ -118,6 +114,12 @@ struct RootView: View {
             guard requested else { return }
             Navigator.shared.paletteRequested = false
             paletteOpen = true
+        }
+        .onReceive(Navigator.shared.$tunnelsTab) { requested in
+            guard let requested else { return }
+            Navigator.shared.tunnelsTab = nil
+            tunnelsTab = requested
+            section = .tunnels
         }
         .sheet(isPresented: $paletteOpen) {
             CommandPalette(items: paletteItems) { item in
@@ -208,7 +210,8 @@ struct RootView: View {
             section = .domains
         case .interfaceItem(let ident):
             Navigator.shared.interfaceIdent = ident
-            section = .wireguard
+            tunnelsTab = .status
+            section = .tunnels
         }
     }
 
@@ -485,9 +488,8 @@ struct RootView: View {
             Group {
                 switch section {
                 case .overview:      OverviewView(alert: $alert, section: $section)
-                case .wireguard:     WireGuardView(alert: $alert, section: $section)
-                case .pingCheck:     PingCheckView(alert: $alert)
-                case .diagnostics:   DiagnosticsView(alert: $alert)
+                case .tunnels:       TunnelsView(alert: $alert, section: $section,
+                                                 tab: $tunnelsTab)
                 case .domains:       DomainsView(alert: $alert, tab: $domainsTab)
                 case .staticRoutes:  StaticRoutesView(alert: $alert)
                 case .compare:       CompareView(alert: $alert, section: $section)

@@ -6,6 +6,10 @@ struct WireGuardView: View {
     @EnvironmentObject private var session: RouterSession
     @Binding var alert: AlertPayload?
     @Binding var section: AppSection
+    /// Наблюдение и опасное обновление конфига — разные задачи, и держать
+    /// их в одной прокрутке значило ставить кнопку «Безопасно обновить»
+    /// под живым графиком.
+    var mode: WireGuardMode = .status
 
     @State private var interfaceIdent = ""
     @State private var interfaceName = ""
@@ -75,6 +79,20 @@ struct WireGuardView: View {
         }
     }
 
+    /// Доступность всех туннелей для общей шкалы.
+    private var availabilityRows: [TunnelAvailabilityRow] {
+        interfaces.enumerated().map { index, ident in
+            TunnelAvailabilityRow(
+                interface: ident,
+                label: session.state?.shortLabel(for: ident) ?? ident,
+                colorIndex: index,
+                samples: healthStore.samples(routerID: session.router.id, interface: ident),
+                availability: healthStore.availability(routerID: session.router.id,
+                                                       interface: ident),
+                outages: healthStore.outages(routerID: session.router.id, interface: ident))
+        }
+    }
+
     private func pingTint(_ state: PingCheckLiveState) -> Color {
         switch state {
         case .passing:       return Palette.success
@@ -93,8 +111,10 @@ struct WireGuardView: View {
                     notConnected
                 } else if interfaces.isEmpty {
                     noInterfaces
-                } else {
+                } else if mode == .status {
                     interfaceCard
+                    TunnelAvailabilityMatrix(rows: availabilityRows, hours: 24)
+                } else {
                     ViewThatFits(in: .horizontal) {
                         HStack(alignment: .top, spacing: 16) {
                             fileCard
@@ -187,7 +207,7 @@ struct WireGuardView: View {
             WireGuardResultSheet(result: box.value) { result = nil }
         }
         .sheet(item: Binding(get: { namePlan.map(PlanBox.init) }, set: { namePlan = $0?.plan })) { box in
-            PlanSheet(plan: box.plan, applyTitle: "Сохранить имя") { dryRun in
+            PlanSheet(plan: box.plan, applyTitle: "Сохранить имя", state: session.state) { dryRun in
                 namePlan = nil
                 Task { await applyName(box.plan, dryRun: dryRun) }
             } onCancel: { namePlan = nil }
@@ -318,12 +338,12 @@ struct WireGuardView: View {
     }
 
     private var configurePingButton: some View {
-        Button("Настроить в Ping-Check") { section = .pingCheck }
+        Button("Настроить в Ping-Check") { Navigator.shared.tunnelsTab = .pingCheck }
             .buttonStyle(SubtleButtonStyle(tint: Palette.accent))
     }
 
     private var diagnosticsButton: some View {
-        Button("Диагностика") { section = .diagnostics }
+        Button("Диагностика") { Navigator.shared.tunnelsTab = .diagnostics }
             .buttonStyle(SubtleButtonStyle(tint: Palette.accent))
     }
 

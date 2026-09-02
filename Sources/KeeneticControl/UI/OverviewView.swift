@@ -2,6 +2,7 @@ import SwiftUI
 
 struct OverviewView: View {
     @EnvironmentObject private var session: RouterSession
+    @ObservedObject private var store = Store.shared
     @Binding var alert: AlertPayload?
     @Binding var section: AppSection
 
@@ -13,6 +14,7 @@ struct OverviewView: View {
                 switch session.status {
                 case .online:
                     if let state = session.state {
+                        issues(state)
                         metrics(state)
                         ViewThatFits(in: .horizontal) {
                             HStack(alignment: .top, spacing: 16) {
@@ -103,6 +105,72 @@ struct OverviewView: View {
     }
 
     // MARK: - Содержимое
+
+    /// Что не в порядке прямо сейчас — до всего остального. Раньше обзор
+    /// повторял списки с других экранов, то есть показывал то, что и так
+    /// видно; а вот выключенный туннель с маршрутами приходилось искать
+    /// самому.
+    @ViewBuilder
+    private func issues(_ state: RouterState) -> some View {
+        let found = RouterHealth.issues(state: state,
+                                        maxDomainsPerList: store.settings.maxDomainsPerList)
+        if found.isEmpty {
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Palette.success)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Замечаний нет")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Туннели на связи, списки направлены, лимиты не превышены.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .card()
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                CardHeader(icon: "exclamationmark.triangle.fill",
+                           title: "На что посмотреть",
+                           subtitle: "\(Format.plural(found.count, "замечание", "замечания", "замечаний")) по текущему состоянию",
+                           tint: found.contains { $0.severity == .danger }
+                             ? Palette.danger : Palette.warning)
+
+                VStack(spacing: 0) {
+                    ForEach(found) { item in
+                        issueRow(item)
+                        if item.id != found.last?.id { Divider() }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .inset()
+            }
+            .card()
+        }
+    }
+
+    private func issueRow(_ item: RouterIssue) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: item.severity == .danger
+                  ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(item.severity == .danger ? Palette.danger : Palette.warning)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(item.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 8)
+    }
 
     private func metrics(_ state: RouterState) -> some View {
         VStack(alignment: .leading, spacing: 12) {

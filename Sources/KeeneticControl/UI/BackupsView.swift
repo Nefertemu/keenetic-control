@@ -83,7 +83,7 @@ struct BackupsView: View {
             } onCancel: { comparison = nil }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
-            PlanSheet(plan: box.plan, applyTitle: "Вернуть как было") { dryRun in
+            PlanSheet(plan: box.plan, applyTitle: "Вернуть как было", state: session.state) { dryRun in
                 plan = nil
                 Task { await apply(box.plan, dryRun: dryRun) }
             } onCancel: { plan = nil }

@@ -6,6 +6,9 @@ import SwiftUI
 struct PlanSheet: View {
     let plan: Plan
     var applyTitle: String = "Применить"
+    /// Текущее состояние роутера — чтобы показать не только команды, но и
+    /// во что они превратят конфигурацию.
+    var state: RouterState?
     var onApply: (_ dryRun: Bool) -> Void
     var onCancel: () -> Void
 
@@ -25,6 +28,7 @@ struct PlanSheet: View {
                 VStack(alignment: .leading, spacing: 16) {
                     if !plan.summary.isEmpty { summaryTiles }
                     if !plan.notes.isEmpty { notes }
+                    if !changes.isEmpty { changesCard }
                     commands
                 }
                 .padding(20)
@@ -64,6 +68,93 @@ struct PlanSheet: View {
             Spacer()
         }
         .padding(18)
+    }
+
+    private var changes: [PlanChangeRow] {
+        plan.changes(against: state).filter { $0.domainsChanged || $0.routesChanged
+                                              || $0.isNew || $0.isDeleted }
+    }
+
+    /// «Было → станет» по каждому списку. По голым командам CLI посчитать
+    /// это можно, но никто не станет — а именно эта разница и есть то,
+    /// ради чего план открывают.
+    private var changesCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CardHeader(icon: "arrow.left.arrow.right", title: "Что изменится",
+                       subtitle: "Состояние списков до и после применения")
+
+            VStack(spacing: 0) {
+                ForEach(changes) { row in
+                    changeRow(row)
+                    if row.id != changes.last?.id { Divider() }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .inset()
+        }
+        .card()
+    }
+
+    private func changeRow(_ row: PlanChangeRow) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(row.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                if row.isNew { StatusPill(text: "новый", tint: Palette.accent) }
+                if row.isDeleted { StatusPill(text: "удаляется", tint: Palette.danger) }
+                Spacer(minLength: 6)
+                Text(row.ident)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+
+            if row.domainsChanged {
+                transition(title: "домены",
+                           before: row.isNew ? "—" : String(row.domainsBefore),
+                           after: row.isDeleted ? "—" : String(row.domainsAfter),
+                           delta: row.domainsAfter - row.domainsBefore)
+            }
+            if row.routesChanged {
+                transition(title: "маршруты",
+                           before: row.routesBefore.isEmpty ? "нет"
+                                 : (state?.targetSummary(row.routesBefore)
+                                    ?? row.routesBefore.joined(separator: ", ")),
+                           after: row.routesAfter.isEmpty ? "нет"
+                                : (state?.targetSummary(row.routesAfter)
+                                   ?? row.routesAfter.joined(separator: ", ")),
+                           delta: nil)
+            }
+        }
+        .padding(.vertical, 7)
+    }
+
+    private func transition(title: String, before: String, after: String,
+                            delta: Int?) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .frame(width: 62, alignment: .leading)
+            Text(before)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Image(systemName: "arrow.right")
+                .font(.system(size: 8))
+                .foregroundStyle(.tertiary)
+            Text(after)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Palette.accent)
+                .lineLimit(1)
+            if let delta, delta != 0 {
+                Text(delta > 0 ? "+\(delta)" : String(delta))
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(delta > 0 ? Palette.success : Palette.danger)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     private var summaryTiles: some View {

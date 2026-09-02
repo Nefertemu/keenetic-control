@@ -630,6 +630,105 @@ let syncPlan = Planner.planSync(reference: syncReference, current: [:], chunkSiz
                                 reservedIDs: &syncReserved)
 check("перенос не добавляет один домен дважды", syncPlan.addCount == 1)
 
+print("\n== Замечания по состоянию роутера ==")
+var healthState = RouterState()
+healthState.interfaces = [
+    "Wireguard0": KeeneticInterface(ident: "Wireguard0", descriptionText: "Hetzner FIN",
+                                    state: "up",
+                                    peers: [WireGuardPeerState(online: true, handshakeAge: 20)]),
+    "Wireguard1": KeeneticInterface(ident: "Wireguard1", descriptionText: "Hetzner DE",
+                                    state: "down"),
+    "Wireguard2": KeeneticInterface(ident: "Wireguard2", descriptionText: "Infomaniak",
+                                    state: "up",
+                                    peers: [WireGuardPeerState(online: true, handshakeAge: 900)]),
+]
+healthState.groups = [
+    "domain-list0": FqdnGroup(ident: "domain-list0", includes: ["a.example"],
+                              routeLines: ["dns-proxy route object-group domain-list0 Wireguard0 auto"]),
+    "domain-list1": FqdnGroup(ident: "domain-list1", includes: ["b.example"],
+                              routeLines: ["dns-proxy route object-group domain-list1 Wireguard1 auto"]),
+    "domain-list2": FqdnGroup(ident: "domain-list2", includes: ["c.example"]),
+    "domain-list3": FqdnGroup(ident: "domain-list3", includes: ["d.example"],
+                              routeLines: ["dns-proxy route object-group domain-list3 Wireguard9 auto"]),
+]
+let health = RouterHealth.issues(state: healthState, maxDomainsPerList: 300)
+func hasIssue(_ prefix: String) -> Bool { health.contains { $0.id.hasPrefix(prefix) } }
+check("выключенный интерфейс с маршрутами замечен", hasIssue("down-Wireguard1"))
+check("несуществующий интерфейс замечен", hasIssue("missing-interface-Wireguard9"))
+check("повисшее рукопожатие замечено", hasIssue("stale-handshake-Wireguard2"))
+check("список без маршрута замечен", hasIssue("unrouted"))
+check("живой туннель замечаний не даёт", !hasIssue("stale-handshake-Wireguard0"))
+check("опасное идёт раньше предупреждений",
+      health.first?.severity == RouterIssue.Severity.danger)
+
+var cleanState = RouterState()
+cleanState.interfaces = [
+    "Wireguard0": KeeneticInterface(ident: "Wireguard0", state: "up",
+                                    peers: [WireGuardPeerState(online: true, handshakeAge: 10)]),
+]
+cleanState.groups = [
+    "domain-list0": FqdnGroup(ident: "domain-list0", includes: ["a.example"],
+                              routeLines: ["dns-proxy route object-group domain-list0 Wireguard0 auto"]),
+]
+check("здоровый роутер — без замечаний",
+      RouterHealth.issues(state: cleanState, maxDomainsPerList: 300).isEmpty)
+
+var bigState = cleanState
+bigState.groups["domain-list0"]?.includes = Set((0..<500).map { "d\($0).example" })
+check("превышение лимита замечено",
+      RouterHealth.issues(state: bigState, maxDomainsPerList: 300)
+          .contains { $0.id == "oversized" })
+check("без лимита не придираемся",
+      !RouterHealth.issues(state: bigState, maxDomainsPerList: 0)
+          .contains { $0.id == "oversized" })
+
+print("\n== Разница плана «было → станет» ==")
+var diffState = RouterState()
+diffState.groups = [
+    "domain-list0": FqdnGroup(ident: "domain-list0", descriptionText: "kinopub",
+                              includes: ["a.example", "b.example"],
+                              routeLines: ["dns-proxy route object-group domain-list0 Wireguard0 auto"]),
+    "domain-list1": FqdnGroup(ident: "domain-list1", includes: ["c.example"]),
+]
+var diffPlan = Plan(title: "Проверка")
+diffPlan.addDomain("domain-list0", "new.example",
+                   command: "object-group fqdn domain-list0 include new.example")
+diffPlan.removeDomain("domain-list0", "a.example",
+                      command: "no object-group fqdn domain-list0 include a.example")
+diffPlan.exactRouteChains["domain-list0"] = [
+    DnsRouteAssignment(interface: "Wireguard0", auto: true, reject: false),
+    DnsRouteAssignment(interface: "Wireguard1", auto: true, reject: false),
+]
+diffPlan.commands.append("no object-group fqdn domain-list1")
+
+let rows = diffPlan.changes(against: diffState)
+let first = rows.first { $0.ident == "domain-list0" }
+check("имя списка берётся из описания", first?.title ?? "nil", "kinopub")
+check("доменов было", String(first?.domainsBefore ?? -1), "2")
+check("доменов станет", String(first?.domainsAfter ?? -1), "2")
+check("маршруты были", first?.routesBefore ?? [], ["Wireguard0"])
+check("маршруты станут", first?.routesAfter ?? [], ["Wireguard0", "Wireguard1"])
+
+let removed = rows.first { $0.ident == "domain-list1" }
+check("удаление списка распознано", removed?.isDeleted ?? false)
+check("после удаления доменов нет", String(removed?.domainsAfter ?? -1), "0")
+check("удаление include не считается удалением списка",
+      Plan.deletedGroupIdents(in: ["no object-group fqdn X include a.b"]).isEmpty)
+check("удаление списка считается",
+      Plan.deletedGroupIdents(in: ["no object-group fqdn X"]) == ["X"])
+
+var createPlan = Plan(title: "Создание")
+createPlan.createdGroups = [FqdnGroup(ident: "domain-list9", descriptionText: "новый",
+                                      includes: ["z.example"])]
+createPlan.addDomain("domain-list9", "z.example",
+                     command: "object-group fqdn domain-list9 include z.example")
+let created = createPlan.changes(against: diffState).first { $0.ident == "domain-list9" }
+check("новый список помечен", created?.isNew ?? false)
+check("у нового списка было ноль", String(created?.domainsBefore ?? -1), "0")
+check("а станет столько, сколько добавили", String(created?.domainsAfter ?? -1), "1")
+check("порядок строк по номеру, а не по алфавиту",
+      RouterConfigParser.identOrder("domain-list10") > RouterConfigParser.identOrder("domain-list9"))
+
 print("\n== Планировщик маршрутов ==")
 let routePlan = Planner.planRoutes(groups: Array(groups.values), interface: "ISP", auto: true, reject: false)
 check("2 команды маршрутов", String(routePlan.commands.count), "2")

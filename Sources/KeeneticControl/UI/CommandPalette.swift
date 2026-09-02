@@ -16,6 +16,8 @@ final class Navigator: ObservableObject {
     @Published var interfaceIdent: String?
     /// Палитру открывает пункт меню — оттуда до состояния окна не дотянуться.
     @Published var paletteRequested = false
+    /// Вкладка раздела «Туннели», на которую нужно перейти.
+    @Published var tunnelsTab: TunnelsTab?
 
     private init() {}
 

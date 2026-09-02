@@ -609,17 +609,20 @@ enum RouterConfigParser {
         }
     }
 
+    private static let identTail = try! NSRegularExpression(pattern: "(\\d+)$")
+
+    /// «domain-list10» должен идти после «domain-list9», а не между 1 и 2.
+    static func identOrder(_ ident: String) -> Int {
+        let range = NSRange(ident.startIndex..., in: ident)
+        guard let match = identTail.firstMatch(in: ident, range: range),
+              let captured = Range(match.range(at: 1), in: ident),
+              let value = Int(ident[captured]) else { return Int.max }
+        return value
+    }
+
     static func sortedGroups(_ groups: [String: FqdnGroup]) -> [FqdnGroup] {
-        let tail = try! NSRegularExpression(pattern: "(\\d+)$")
-        func number(_ ident: String) -> Int {
-            let range = NSRange(ident.startIndex..., in: ident)
-            guard let match = tail.firstMatch(in: ident, range: range),
-                  let captured = Range(match.range(at: 1), in: ident),
-                  let value = Int(ident[captured]) else { return Int.max }
-            return value
-        }
-        return groups.values.sorted {
-            let lhs = number($0.ident), rhs = number($1.ident)
+        groups.values.sorted {
+            let lhs = identOrder($0.ident), rhs = identOrder($1.ident)
             return lhs == rhs ? $0.ident < $1.ident : lhs < rhs
         }
     }
