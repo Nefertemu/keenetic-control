@@ -514,26 +514,20 @@ struct DnsRoutesView: View {
                 EmptyHint(icon: "tray", title: "Ничего не нашлось",
                           message: "Поменяй фильтр или залей списки на вкладке «Списки FQDN».")
             } else {
-                GeometryReader { proxy in
-                    ScrollView([.horizontal, .vertical]) {
-                        LazyVStack(spacing: 0) {
-                            headerRow
-                            ForEach(groups) { group in
-                                row(group)
-                                Divider()
-                            }
+                // 478 занимают фиксированные колонки со списком,
+                // идентификатором и счётчиком; на три ярлыка маршрутов
+                // нужно ещё около трёхсот. При меньшей ширине они начинают
+                // резаться на «Hetzne…», и прокрутка полезнее обрезки.
+                AdaptiveTable(minContentWidth: 820) {
+                    LazyVStack(spacing: 0) {
+                        headerRow
+                        ForEach(groups) { group in
+                            row(group)
+                            Divider()
                         }
-                        // A two-axis ScrollView proposes an unbounded width;
-                        // without an explicit viewport width SwiftUI centers
-                        // the compact content and squeezes the route column.
-                        // Fill the viewport first, while retaining a minimum
-                        // width for genuinely narrow windows.
-                        .frame(minWidth: max(720, proxy.size.width - 24),
-                               alignment: .leading)
-                        .padding(.horizontal, 12)
                     }
-                    .inset()
                 }
+                .inset()
                 // Таблица раньше забирала всю оставшуюся высоту окна даже
                 // для одной строки. В результате единственный маршрут висел
                 // посреди огромной пустой области. Высота теперь следует за

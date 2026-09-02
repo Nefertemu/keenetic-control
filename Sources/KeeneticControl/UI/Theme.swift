@@ -186,6 +186,39 @@ struct LiveStateLine: View {
     }
 }
 
+/// Таблица, которая едет вбок ТОЛЬКО когда действительно не влезает.
+///
+/// Двухосевая прокрутка предлагает содержимому неограниченную ширину, и
+/// таблицу приходилось растягивать вручную под область. Растянутая ровно
+/// по ширине, она переставала помещаться, как только появлялся вертикальный
+/// ползунок, — и снизу вылезала горизонтальная полоса при полностью видимом
+/// содержимом. Здесь ось добавляется только если места правда не хватает.
+struct AdaptiveTable<Content: View>: View {
+    var minContentWidth: CGFloat
+    var horizontalPadding: CGFloat = 12
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        GeometryReader { proxy in
+            // Запас на ползунок: у самой границы иначе моргает лишняя ось.
+            let needed = minContentWidth + horizontalPadding * 2 + 20
+            if proxy.size.width >= needed {
+                ScrollView(.vertical) {
+                    content()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, horizontalPadding)
+                }
+            } else {
+                ScrollView([.horizontal, .vertical]) {
+                    content()
+                        .frame(minWidth: minContentWidth, alignment: .leading)
+                        .padding(.horizontal, horizontalPadding)
+                }
+            }
+        }
+    }
+}
+
 struct MetricTile: View {
     var value: String
     var label: String

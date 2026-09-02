@@ -190,7 +190,7 @@ struct StaticRoutesView: View {
                             ? "Добавь первый маршрут или импортируй список из BAT-файла."
                             : "По запросу «\(query)» ничего не нашлось.")
             } else {
-                ScrollView([.horizontal, .vertical]) {
+                AdaptiveTable(minContentWidth: 760) {
                     LazyVStack(spacing: 0) {
                         routeHeader
                         Divider()
@@ -199,8 +199,6 @@ struct StaticRoutesView: View {
                             Divider()
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .frame(minWidth: 760, alignment: .leading)
                 }
             }
         }
