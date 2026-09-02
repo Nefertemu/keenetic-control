@@ -1,0 +1,77 @@
+name: Релиз
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Тег релиза
+        required: true
+
+jobs:
+  release:
+    name: Проверить и приложить архив
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Макросы SwiftUI живут в Xcode, а не в Command Line Tools. На
+      # раннере Xcode может лежать под версионным именем, поэтому берём
+      # самый свежий из установленных.
+      - name: Выбрать Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "выбран $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          swift --version
+          xcodebuild -version
+
+      - name: Самотест
+        run: |
+          mkdir -p .build
+          swiftc -O Sources/KeeneticControl/{Core,Model,Crypto}/*.swift \
+                 Tools/SelfTest/main.swift -o .build/selftest
+          .build/selftest
+
+      - name: Сборка приложения
+        run: ./build.sh
+
+      - name: Версия совпадает с тегом
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            "dist/Keenetic Control.app/Contents/Info.plist")
+          echo "тег $TAG, в бандле $APP_VERSION"
+          if [ "$TAG" != "$APP_VERSION" ]; then
+            echo "::error::Версия в build.sh ($APP_VERSION) не совпадает с тегом ($TAG)"
+            exit 1
+          fi
+
+      - name: Упаковать
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Keenetic Control.app" "dist/Keenetic-Control-$TAG.zip"
+
+      # Сборка в CI подписана ад-хок: сертификата разработчика здесь нет.
+      # Поэтому архив прикладывается ТОЛЬКО если релиз ещё пуст — чтобы не
+      # затереть сборку, выпущенную с настоящей подписью.
+      - name: Приложить архив, если релиз пуст
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Keenetic Control $TAG" --generate-notes
+          fi
+          COUNT=$(gh release view "$TAG" --json assets --jq '.assets | length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "У релиза уже есть вложения ($COUNT) — подписанную сборку не трогаем."
+            exit 0
+          fi
+          gh release upload "$TAG" "dist/Keenetic-Control-$TAG.zip"

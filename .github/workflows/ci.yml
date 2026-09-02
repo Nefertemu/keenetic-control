@@ -1,0 +1,44 @@
+name: Проверка
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Тесты и сборка
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Макросы SwiftUI живут в Xcode, а не в Command Line Tools. На
+      # раннере Xcode может лежать под версионным именем, поэтому берём
+      # самый свежий из установленных.
+      - name: Выбрать Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "выбран $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          swift --version
+          xcodebuild -version
+
+      - name: Самотест
+        run: |
+          mkdir -p .build
+          swiftc -O Sources/KeeneticControl/{Core,Model,Crypto}/*.swift \
+                 Tools/SelfTest/main.swift -o .build/selftest
+          .build/selftest
+
+      - name: Сборка приложения
+        run: ./build.sh
+
+      # Подписи в CI нет, поэтому build.sh честно уходит на ад-хок. Так и
+      # должно быть: это проверка сборки, а не выпуск.
+      - name: Проверить бандл
+        run: |
+          APP="dist/Keenetic Control.app"
+          test -x "$APP/Contents/MacOS/KeeneticControl"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist"
+          codesign --verify --verbose=1 "$APP"
