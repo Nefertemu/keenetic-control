@@ -413,8 +413,9 @@ struct PingCheckView: View {
         let existing = isNew ? nil : profiles.first {
             $0.name.caseInsensitiveCompare(cleaned.name) == .orderedSame && !$0.isBuiltIn
         }
-        plan = PingCheckParser.planSave(cleaned, existing: existing)
-            .forRouter(session.router)
+        let candidate = PingCheckParser.planSave(cleaned, existing: existing)
+        guard !candidate.isEmpty else { return true }
+        plan = candidate.forRouter(session.router)
         return true
     }
 
@@ -452,9 +453,24 @@ struct PingCheckView: View {
 
 struct PingCheckEditor: View {
     @State var profile: PingCheckProfile
+    private let original: PingCheckProfile
     let isNew: Bool
     var onSave: (PingCheckProfile) -> Void
     var onCancel: () -> Void
+
+    init(profile: PingCheckProfile, isNew: Bool,
+         onSave: @escaping (PingCheckProfile) -> Void,
+         onCancel: @escaping () -> Void) {
+        _profile = State(initialValue: profile)
+        original = profile
+        self.isNew = isNew
+        self.onSave = onSave
+        self.onCancel = onCancel
+    }
+
+    private var hasChanges: Bool {
+        isNew || !profile.isSemanticallyEqual(to: original)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -533,6 +549,7 @@ struct PingCheckEditor: View {
                 }
                 .buttonStyle(PrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)
+                .disabled(!hasChanges)
             }
         }
         .padding(22)

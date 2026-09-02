@@ -163,6 +163,8 @@ struct AppSettings: Codable {
     var keepBackups: Int = 20
     var removeStaleByDefault: Bool = true
     var saveConfigAfterApply: Bool = true
+    /// Интервал активной проверки всех клиентских WireGuard-туннелей.
+    var wireGuardProbeIntervalSeconds: Int = 3
     /// Последний выбранный роутер — чтобы запуск не сбрасывал его на первый.
     var lastRouterID: String = ""
     /// Фоновая сверка источников с роутером.
@@ -197,6 +199,8 @@ struct AppSettings: Codable {
         keepBackups = value(.keepBackups, fallback.keepBackups)
         removeStaleByDefault = value(.removeStaleByDefault, fallback.removeStaleByDefault)
         saveConfigAfterApply = value(.saveConfigAfterApply, fallback.saveConfigAfterApply)
+        wireGuardProbeIntervalSeconds = value(
+            .wireGuardProbeIntervalSeconds, fallback.wireGuardProbeIntervalSeconds)
         lastRouterID = value(.lastRouterID, fallback.lastRouterID)
         autoUpdateEnabled = value(.autoUpdateEnabled, fallback.autoUpdateEnabled)
         autoUpdateHours = value(.autoUpdateHours, fallback.autoUpdateHours)

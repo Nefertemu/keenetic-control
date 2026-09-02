@@ -5,11 +5,16 @@ struct TransportError: LocalizedError {
     var hint: String?
     /// Роутер не принял логин или пароль — повторять бессмысленно.
     var isAuthFailure: Bool
+    /// Соединение уже было установлено, но исчезло до выполнения команды.
+    /// Читающие операции можно один раз безопасно повторить после входа.
+    var isSessionFailure: Bool
 
-    init(_ message: String, hint: String? = nil, isAuthFailure: Bool = false) {
+    init(_ message: String, hint: String? = nil, isAuthFailure: Bool = false,
+         isSessionFailure: Bool = false) {
         self.message = message
         self.hint = hint
         self.isAuthFailure = isAuthFailure
+        self.isSessionFailure = isSessionFailure
     }
     var errorDescription: String? { message }
 }

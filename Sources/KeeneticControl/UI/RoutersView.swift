@@ -249,6 +249,9 @@ struct RoutersView: View {
                 numberField("Хранить резервных копий", value: $store.settings.keepBackups,
                             range: 1...200,
                             hint: "Старые снимки удаляются автоматически.")
+                numberField("Проверка VPN, с", value: $store.settings.wireGuardProbeIntervalSeconds,
+                            range: 3...300,
+                            hint: "Как часто обновлять пинг всех WireGuard-туннелей.")
             }
 
             Divider()

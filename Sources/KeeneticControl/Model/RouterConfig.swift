@@ -143,6 +143,12 @@ struct KeeneticInterface: Identifiable, Hashable {
 
     var isVPN: Bool {
         let haystack = ([ident, type, descriptionText] + aliases).joined(separator: " ")
+        let lower = haystack.lowercased()
+        if lower.contains("vpn server") || lower.contains("wireguard server")
+            || lower.contains("wg server") || lower.contains("vpn-сервер")
+            || lower.contains("сервер vpn") {
+            return false
+        }
         return RouterConfigParser.vpnPattern.firstMatch(
             in: haystack, range: NSRange(haystack.startIndex..., in: haystack)) != nil
     }
@@ -565,7 +571,8 @@ enum RouterConfigParser {
     }
 
     /// Интерфейсы, на которые осмысленно вешать маршруты: VPN — первыми.
-    static func likelyRouteInterfaces(_ items: [String: KeeneticInterface]) -> [KeeneticInterface] {
+    static func likelyRouteInterfaces(_ items: [String: KeeneticInterface],
+                                      wireGuardClients: Set<String>? = nil) -> [KeeneticInterface] {
         let all = Array(items.values)
         let accessPoint = try! NSRegularExpression(pattern: "^WifiMaster\\d+$")
 
@@ -578,8 +585,13 @@ enum RouterConfigParser {
             return ["accesspoint", "radio", "bridge", "switch", "loopback"].contains(item.type.lowercased())
         }
 
-        let filtered = all.filter { !isLocalOrService($0) }
-        let pool = filtered.isEmpty ? all : filtered
+        let eligible = all.filter { item in
+            guard item.ident.range(of: "^Wireguard\\d+$", options: .regularExpression) != nil,
+                  let wireGuardClients else { return true }
+            return wireGuardClients.contains(item.ident)
+        }
+        let filtered = eligible.filter { !isLocalOrService($0) }
+        let pool = filtered.isEmpty ? eligible : filtered
 
         func rank(_ item: KeeneticInterface) -> Int {
             if item.isVPN { return 0 }

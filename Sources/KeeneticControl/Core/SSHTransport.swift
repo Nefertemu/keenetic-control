@@ -244,14 +244,18 @@ final class SSHTransport: KeeneticTransport {
     // MARK: - Команды
 
     func run(_ command: String, timeout: TimeInterval) throws -> String {
-        guard isOpen else { throw TransportError("SSH-сессия не подключена.") }
+        guard isOpen else {
+            throw TransportError("SSH-сессия не подключена.", isSessionFailure: true)
+        }
         send(command + "\n")
         let output = try waitForPrompt(timeout: timeout)
         return CLI.stripEcho(output, commands: [command])
     }
 
     func runBatch(_ commands: [String], timeout: TimeInterval) throws -> String {
-        guard isOpen else { throw TransportError("SSH-сессия не подключена.") }
+        guard isOpen else {
+            throw TransportError("SSH-сессия не подключена.", isSessionFailure: true)
+        }
         guard !commands.isEmpty else { return "" }
 
         // Пишем пачку крупными кусками, но не переполняя буфер терминала.
@@ -343,7 +347,7 @@ final class SSHTransport: KeeneticTransport {
                 send(" ")   // постраничный вывод — просим следующую страницу
 
             case .eof:
-                throw TransportError("SSH-соединение закрыто роутером.")
+                throw TransportError("SSH-соединение закрыто роутером.", isSessionFailure: true)
 
             case .timeout:
                 throw TransportError("Тайм-аут ожидания ответа (\(Int(timeout)) с).")

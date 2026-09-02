@@ -71,6 +71,23 @@ struct PingCheckProfile: Identifiable, Hashable {
 
     var target: String { mode.usesURI ? uri : host }
 
+    /// Представление для сравнения с прочитанной конфигурацией. Пробелы в
+    /// полях ввода не являются изменением, а служебный флаг встроенного
+    /// профиля к командам роутера отношения не имеет.
+    var normalizedForComparison: PingCheckProfile {
+        var value = self
+        value.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.uri = uri.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.isBuiltIn = false
+        if !value.mode.usesPort { value.port = nil }
+        return value
+    }
+
+    func isSemanticallyEqual(to other: PingCheckProfile) -> Bool {
+        normalizedForComparison == other.normalizedForComparison
+    }
+
     /// Короткая сводка параметров для списка.
     var summary: String {
         var parts: [String] = [mode.rawValue]
@@ -519,6 +536,9 @@ extension PingCheckParser {
         var plan = Plan(title: existing == nil
                         ? "Новый профиль Ping-Check «\(profile.name)»"
                         : "Изменение профиля «\(profile.name)»")
+        if let existing, profile.isSemanticallyEqual(to: existing) {
+            return plan
+        }
         let head = "ping-check profile \(profile.name)"
         var commands = [head]
 

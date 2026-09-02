@@ -642,12 +642,14 @@ final class RCITransport: KeeneticTransport {
         stateLock.lock()
         guard !closed else {
             stateLock.unlock()
-            throw TransportError("HTTP-сессия роутера уже закрыта.")
+            throw TransportError("HTTP-сессия роутера уже закрыта.", isSessionFailure: true)
         }
         let task = session.dataTask(with: request) { data, response, error in
             let value: Result<(Data, HTTPURLResponse), Error>
             if let error {
-                value = .failure(TransportError(RCITransport.describe(error)))
+                value = .failure(TransportError(
+                    RCITransport.describe(error),
+                    isSessionFailure: (error as NSError).code == NSURLErrorCancelled))
             } else if let http = response as? HTTPURLResponse {
                 value = .success((data ?? Data(), http))
             } else {
@@ -689,7 +691,9 @@ final class RCITransport: KeeneticTransport {
     private func markAuthorized() throws {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard !closed else { throw TransportError("HTTP-сессия роутера уже закрыта.") }
+        guard !closed else {
+            throw TransportError("HTTP-сессия роутера уже закрыта.", isSessionFailure: true)
+        }
         authorized = true
     }
 

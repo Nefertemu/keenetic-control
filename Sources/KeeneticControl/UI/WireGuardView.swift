@@ -29,6 +29,7 @@ struct WireGuardView: View {
     @State private var probeUpdatedAt: Date?
     @State private var probeError: String?
     @ObservedObject private var healthStore = TunnelHealthStore.shared
+    @ObservedObject private var store = Store.shared
 
     private var interfaces: [String] { session.state?.wireguardInterfaces ?? [] }
 
@@ -51,7 +52,7 @@ struct WireGuardView: View {
     }
 
     private var interfaceProbeMonitorID: String {
-        "\(session.router.id.uuidString)|\(interfaces.joined(separator: ","))|\(probeMethod.rawValue)"
+        "\(session.router.id.uuidString)|\(interfaces.joined(separator: ","))|\(probeMethod.rawValue)|\(probeRefreshSeconds)"
     }
 
     private var currentPingCheck: PingCheckLiveState {
@@ -64,19 +65,14 @@ struct WireGuardView: View {
         return session.state?.pingCheckProfiles.first { $0.name == name }
     }
 
-    private var healthSamples: [TunnelHealthSample] {
-        guard !interfaceIdent.isEmpty else { return [] }
-        return healthStore.samples(routerID: session.router.id, interface: interfaceIdent)
-    }
-
-    private var healthOutages: [TunnelOutageInterval] {
-        guard !interfaceIdent.isEmpty else { return [] }
-        return healthStore.outages(routerID: session.router.id, interface: interfaceIdent)
-    }
-
-    private var healthAvailability: Double? {
-        guard !interfaceIdent.isEmpty else { return nil }
-        return healthStore.availability(routerID: session.router.id, interface: interfaceIdent)
+    private var latencySeries: [TunnelLatencySeries] {
+        interfaces.enumerated().map { index, ident in
+            TunnelLatencySeries(interface: ident,
+                                label: session.state?.shortLabel(for: ident) ?? ident,
+                                colorIndex: index,
+                                samples: healthStore.latencySamples(
+                                    routerID: session.router.id, interface: ident))
+        }
     }
 
     private func pingTint(_ state: PingCheckLiveState) -> Color {
@@ -349,12 +345,9 @@ struct WireGuardView: View {
 
             livePingCard
 
-            if currentPingCheck != .notConfigured {
-                TunnelHealthCard(samples: healthSamples,
-                                 outages: healthOutages,
-                                 availability: healthAvailability,
-                                 interface: interfaceIdent)
-            }
+            TunnelLatencyCard(series: latencySeries,
+                              target: probeTarget,
+                              refreshSeconds: probeRefreshSeconds)
 
             if let live = liveState {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
@@ -490,6 +483,15 @@ struct WireGuardView: View {
                 }
                 .buttonStyle(SubtleButtonStyle(tint: Palette.accent))
                 .disabled(probeRunning || !session.status.isOnline)
+
+                Picker("Интервал", selection: $store.settings.wireGuardProbeIntervalSeconds) {
+                    ForEach([3, 5, 10, 20, 30, 60, 120, 300], id: \.self) { seconds in
+                        Text("каждые \(seconds) с").tag(seconds)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 122)
             }
 
             if probeMethod != .icmp {
@@ -924,27 +926,32 @@ struct WireGuardView: View {
         for ident in targets {
             guard !Task.isCancelled, owner == session.router.id else { return }
             do {
-                let result = try await session.ping(interface: ident, target: cleanTarget, count: 3,
+                let result = try await session.ping(interface: ident, target: cleanTarget, count: 1,
                                                     method: probeMethod, port: checkedPort)
                 guard !Task.isCancelled, owner == session.router.id,
                       cleanTarget == probeTarget.trimmingCharacters(in: .whitespacesAndNewlines)
                 else { return }
                 probeResults[ident] = result
+                healthStore.record(routerID: owner, result: result)
             } catch is CancellationError {
                 return
             } catch {
                 guard !Task.isCancelled, owner == session.router.id else { return }
-                probeResults[ident] = InterfacePingResult(
+                let failed = InterfacePingResult(
                     interface: ident, target: cleanTarget,
                     method: probeMethod, port: checkedPort, source: nil,
                     transmitted: 0, received: 0, rtt: [], checkedAt: Date(),
                     error: session.describe(error))
+                probeResults[ident] = failed
+                healthStore.record(routerID: owner, result: failed)
             }
         }
         probeUpdatedAt = Date()
     }
 
-    private var probeRefreshSeconds: Int { probeMethod == .icmp ? 20 : 60 }
+    private var probeRefreshSeconds: Int {
+        min(300, max(3, store.settings.wireGuardProbeIntervalSeconds))
+    }
 
     private func monitorLiveInterface() async {
         let ident = interfaceIdent

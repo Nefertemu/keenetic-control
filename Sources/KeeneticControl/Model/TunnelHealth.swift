@@ -30,15 +30,25 @@ struct TunnelHealthSample: Codable, Hashable, Identifiable {
     var interfaceUp: Bool
     var handshakeFresh: Bool
     var pingStatus: String?
+    var latencyMS: Double?
+    var lossPercent: Double?
+    var probeTarget: String?
+    var probeMethod: String?
 
     init(id: UUID = UUID(), timestamp: Date = Date(), state: TunnelHealthState,
-         interfaceUp: Bool, handshakeFresh: Bool, pingStatus: String?) {
+         interfaceUp: Bool, handshakeFresh: Bool, pingStatus: String?,
+         latencyMS: Double? = nil, lossPercent: Double? = nil,
+         probeTarget: String? = nil, probeMethod: String? = nil) {
         self.id = id
         self.timestamp = timestamp
         self.state = state
         self.interfaceUp = interfaceUp
         self.handshakeFresh = handshakeFresh
         self.pingStatus = pingStatus
+        self.latencyMS = latencyMS
+        self.lossPercent = lossPercent
+        self.probeTarget = probeTarget
+        self.probeMethod = probeMethod
     }
 }
 
@@ -71,7 +81,7 @@ final class TunnelHealthStore: ObservableObject {
     private let fileURL: URL
     private let retention: TimeInterval = 7 * 24 * 60 * 60
     private let sameStateInterval: TimeInterval = 60
-    private let maxSamplesPerTunnel = 10_000
+    private let maxSamplesPerTunnel = 30_000
 
     private init() {
         fileURL = AppPaths.support.appendingPathComponent("tunnel-health.json")
@@ -117,6 +127,40 @@ final class TunnelHealthStore: ObservableObject {
         trim(&samples, now: now)
         records[recordKey] = samples
         persist()
+    }
+
+    /// Сохранить именно измеренную задержку активной проверки. Эти точки
+    /// пишутся каждые несколько секунд и затем рисуются общим графиком для
+    /// всех клиентских туннелей.
+    func record(routerID: UUID, result: InterfacePingResult, now: Date? = nil) {
+        guard !result.interface.isEmpty else { return }
+        let timestamp = now ?? result.checkedAt
+        let reachable = result.isReachable
+        let state: TunnelHealthState = reachable
+            ? (result.lossPercent > 0 ? .degraded : .healthy)
+            : .offline
+        let recordKey = key(routerID: routerID, interface: result.interface)
+        var samples = records[recordKey, default: []]
+        samples.append(TunnelHealthSample(
+            timestamp: timestamp,
+            state: state,
+            interfaceUp: true,
+            handshakeFresh: reachable,
+            pingStatus: result.error,
+            latencyMS: result.averageRTT,
+            lossPercent: result.lossPercent,
+            probeTarget: result.target,
+            probeMethod: result.method.rawValue))
+        trim(&samples, now: timestamp)
+        records[recordKey] = samples
+        persist()
+    }
+
+    func latencySamples(routerID: UUID, interface: String,
+                        since: TimeInterval = 24 * 60 * 60,
+                        now: Date = Date()) -> [TunnelHealthSample] {
+        samples(routerID: routerID, interface: interface, since: since, now: now)
+            .filter { $0.latencyMS != nil || $0.lossPercent != nil }
     }
 
     func samples(routerID: UUID, interface: String,

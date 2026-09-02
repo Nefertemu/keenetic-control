@@ -107,6 +107,9 @@ struct RootView: View {
                     + migration.failures.joined(separator: "; "))
             }
         }
+        .task {
+            await session.monitorConnections()
+        }
     }
 
     // MARK: - Боковая панель

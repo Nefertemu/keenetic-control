@@ -53,6 +53,7 @@ interface Wireguard0
         endpoint 203.0.113.9:51820
         keepalive-interval 25
         allow-ips 0.0.0.0 0.0.0.0
+        connect
         !
     ip address 10.7.0.2 255.255.255.0
     ip mtu 1420
@@ -514,6 +515,23 @@ check("порт прочитан", live.listenPort, "51820")
 check("интерфейс поднят", live.isUp)
 check("MTU интерфейса прочитан", String(live.mtu ?? -1), "1420")
 check("список wg-интерфейсов", WireGuardState.interfaceNames(config: sampleConfig) == ["Wireguard0"])
+let wireGuardServerConfig = sampleConfig + """
+
+interface Wireguard3
+    description Wireguard VPN Server
+    security-level private
+    wireguard peer serverClientKey=
+        endpoint 198.51.100.7:51820
+        allow-ips 10.99.0.2 255.255.255.255
+        !
+    ip address 10.99.0.1 255.255.255.0
+    up
+!
+"""
+check("VPN-сервер не считается клиентским туннелем",
+      WireGuardState.interfaceNames(config: wireGuardServerConfig) == ["Wireguard0"])
+check("полный разбор всё ещё видит сервер для диагностики",
+      WireGuardState.allInterfaceNames(config: wireGuardServerConfig) == ["Wireguard0", "Wireguard3"])
 let renamePlan = try? WireGuardPlanner.planRename(interface: "Wireguard0",
                                                   current: "старое имя",
                                                   desired: "Hetzner FIN")
@@ -846,11 +864,12 @@ check("default распознан как встроенный",
 check("привязка к Wireguard0", ping.bindings["Wireguard0"]?.profile ?? "nil", "vpn")
 check("перезапуск включён", ping.bindings["Wireguard0"]?.restart ?? false)
 check("у GigabitEthernet1 перезапуска нет", !(ping.bindings["GigabitEthernet1"]?.restart ?? true))
-check("команды профиля собираются обратно",
-      PingCheckParser.planSave(vpn!, existing: vpn!).commands.joined(separator: " | "),
-      "ping-check profile vpn | ping-check profile vpn mode icmp | "
-      + "ping-check profile vpn host google.com | ping-check profile vpn update-interval 3 | "
-      + "ping-check profile vpn max-fails 3 | ping-check profile vpn min-success 3")
+check("профиль без изменений не предлагает сохранять",
+      PingCheckParser.planSave(vpn!, existing: vpn!).isEmpty)
+var changedVPN = vpn!
+changedVPN.timeout = 2
+check("настоящее изменение по-прежнему создаёт команды",
+      !PingCheckParser.planSave(changedVPN, existing: vpn!).isEmpty)
 check("mode и update-interval никогда не снимаются — у них нет формы no",
       !PingCheckParser.planSave(PingCheckProfile(name: "t", host: "a.b"), existing: vpn!)
           .commands.contains { $0.contains("no mode") || $0.contains("no update-interval") })
@@ -955,6 +974,8 @@ if let restored = try? JSONDecoder().decode(AppSettings.self, from: oldSettings)
     check("новое поле взяло значение по умолчанию", !restored.autoUpdateEnabled)
     check("и число тоже", String(restored.autoUpdateHours), "24")
     check("и список", restored.autoUpdateSources.isEmpty)
+    check("новый интервал проверки VPN взял безопасное значение",
+          String(restored.wireGuardProbeIntervalSeconds), "3")
 } else {
     check("файл настроек прошлой версии читается", false)
 }

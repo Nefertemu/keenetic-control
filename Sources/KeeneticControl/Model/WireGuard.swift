@@ -376,6 +376,22 @@ struct WireGuardState {
     var mtu: Int?
     var isUp: Bool = false
     var descriptionText: String = ""
+    /// У клиентского туннеля endpoint задан в конфигурации. У VPN-сервера
+    /// адреса клиентов появляются динамически и команды `endpoint` нет.
+    var hasConfiguredEndpoint = false
+    var peerAcceptsDefaultRoute = false
+    var securityLevel = ""
+
+    var isClientTunnel: Bool {
+        let name = descriptionText.lowercased()
+        let explicitlyServer = name.contains("vpn server")
+            || name.contains("wireguard server")
+            || name.contains("wg server")
+            || name.contains("vpn-сервер")
+            || name.contains("сервер vpn")
+        return hasConfiguredEndpoint && peerAcceptsDefaultRoute
+            && securityLevel.lowercased() != "private" && !explicitlyServer
+    }
 
     static func parse(config text: String, interface: String) -> WireGuardState {
         var state = WireGuardState(interface: interface)
@@ -397,8 +413,20 @@ struct WireGuardState {
                 if !key.isEmpty, !state.peerKeys.contains(key) { state.peerKeys.append(key) }
             } else if trimmed.hasPrefix("wireguard listen-port ") {
                 state.listenPort = String(trimmed.dropFirst("wireguard listen-port ".count))
+            } else if trimmed.hasPrefix("endpoint ") {
+                state.hasConfiguredEndpoint = true
+            } else if trimmed.hasPrefix("allow-ips ") {
+                let value = String(trimmed.dropFirst("allow-ips ".count))
+                    .trimmingCharacters(in: .whitespaces)
+                    .lowercased()
+                if value == "0.0.0.0 0.0.0.0" || value == "0.0.0.0/0"
+                    || value == ":: 0" || value == "::/0" {
+                    state.peerAcceptsDefaultRoute = true
+                }
             } else if trimmed.hasPrefix("ip address ") {
                 state.addresses.append(String(trimmed.dropFirst("ip address ".count)))
+            } else if trimmed.hasPrefix("security-level ") {
+                state.securityLevel = String(trimmed.dropFirst("security-level ".count))
             } else if trimmed.hasPrefix("ip mtu ") {
                 state.mtu = Int(trimmed.dropFirst("ip mtu ".count)
                     .trimmingCharacters(in: .whitespaces))
@@ -413,8 +441,16 @@ struct WireGuardState {
         return state
     }
 
-    /// Имена всех WireGuard-интерфейсов роутера.
+    /// Имена клиентских WireGuard-туннелей. Серверный интерфейс не является
+    /// выходом в VPN: его нельзя пинговать как маршрут и назначать спискам.
     static func interfaceNames(config text: String) -> [String] {
+        allInterfaceNames(config: text).filter {
+            parse(config: text, interface: $0).isClientTunnel
+        }
+    }
+
+    /// Полный список нужен только для диагностики и разбора конфигурации.
+    static func allInterfaceNames(config text: String) -> [String] {
         var names: [String] = []
         for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw)

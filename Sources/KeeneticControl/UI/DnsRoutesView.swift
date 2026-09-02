@@ -31,6 +31,8 @@ struct DnsRoutesView: View {
     @State private var outcome: ApplyOutcome?
     @State private var confirmDelete = false
 
+    private let scrollTopID = "dns-routes-top"
+
     private var groups: [FqdnGroup] {
         guard let state = session.state else { return [] }
         return state.sortedGroups.filter { group in
@@ -64,12 +66,26 @@ struct DnsRoutesView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if let progress = session.progress { ProgressBanner(info: progress) }
-            controls
-            table
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let progress = session.progress { ProgressBanner(info: progress) }
+                    controls
+                    table
+                }
+                .padding(.top, 4)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .id(scrollTopID)
+            }
+            .onAppear {
+                resetScrollPosition(proxy)
+            }
+            .onChange(of: session.router.id) { _, _ in
+                resetScrollPosition(proxy)
+            }
         }
-        .padding(20)
         .onAppear(perform: pickDefaultInterface)
         .onChange(of: session.state?.readAt) { _, _ in pickDefaultInterface() }
         .onChange(of: interfaceIdent) { _, newIdent in
@@ -124,7 +140,10 @@ struct DnsRoutesView: View {
                     Spacer()
                     routeActions
                 }
-                .frame(minWidth: 700)
+                // Измеряем настоящую ширину всех кнопок. Старый minWidth
+                // скрывал переполнение, и SwiftUI выбирал этот вариант даже
+                // когда действия уже вылезали за правую границу карточки.
+                .fixedSize(horizontal: true, vertical: false)
 
                 VStack(alignment: .leading, spacing: 12) {
                     ViewThatFits(in: .horizontal) {
@@ -133,7 +152,7 @@ struct DnsRoutesView: View {
                             flagsControl
                             Spacer(minLength: 0)
                         }
-                        .frame(minWidth: 420)
+                        .fixedSize(horizontal: true, vertical: false)
 
                         VStack(alignment: .leading, spacing: 10) {
                             interfaceControl
@@ -233,7 +252,7 @@ struct DnsRoutesView: View {
                     Spacer()
                     failoverSummary
                 }
-                .frame(minWidth: 580)
+                .fixedSize(horizontal: true, vertical: false)
 
                 VStack(alignment: .leading, spacing: 4) {
                     failoverTitle
@@ -351,6 +370,15 @@ struct DnsRoutesView: View {
         interfaceOrder.swapAt(index, target)
     }
 
+    private func resetScrollPosition(_ proxy: ScrollViewProxy) {
+        // NavigationSplitView на macOS иногда переносит offset с предыдущей
+        // длинной вкладки. После layout-pass возвращаем именно этот экран к
+        // шапке, чтобы карточка не оказалась под системным toolbar.
+        DispatchQueue.main.async {
+            proxy.scrollTo(scrollTopID, anchor: .top)
+        }
+    }
+
     // MARK: - Таблица
 
     private var table: some View {
@@ -404,7 +432,11 @@ struct DnsRoutesView: View {
                     }
                     .inset()
                 }
-                .frame(minHeight: 320, maxHeight: .infinity)
+                // Таблица раньше забирала всю оставшуюся высоту окна даже
+                // для одной строки. В результате единственный маршрут висел
+                // посреди огромной пустой области. Высота теперь следует за
+                // содержимым, а длинный список прокручивается внутри карточки.
+                .frame(height: min(520, max(132, CGFloat(groups.count) * 48 + 62)))
             }
         }
         .card()

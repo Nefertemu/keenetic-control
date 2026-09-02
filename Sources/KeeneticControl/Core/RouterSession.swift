@@ -637,14 +637,50 @@ final class RouterSession: ObservableObject {
                             preserveConnectionOnFailure: Bool = false,
                             _ body: @escaping (KeeneticTransport) throws -> T) async throws -> T {
         try requireCurrent(operation)
-        let active = try await session(operation: operation)
+        var active = try await session(operation: operation)
         do {
-            let result = try await watch(active, budget: budget, owner: operation.routerID) {
-                try body(active)
+            // Диагностические RCI ping/traceroute имеют собственный deadline.
+            // Их нельзя завершать abort() основного HTTP-транспорта: один
+            // медленный туннель тогда закрывал сессию всему приложению.
+            let result: T
+            if preserveConnectionOnFailure {
+                result = try await background(owner: operation.routerID) { try body(active) }
+            } else {
+                result = try await watch(active, budget: budget, owner: operation.routerID) {
+                    try body(active)
+                }
             }
             try requireCurrent(operation)
             return result
         } catch {
+            if !Task.isCancelled,
+               (error as? TransportError)?.isSessionFailure == true {
+                // Роутер закрыл давно простаивавшую сессию между isAlive и
+                // запросом. Для этих трёх вызовов body только читает данные
+                // или выполняет диагностический ping, поэтому один повтор
+                // безопасен и не дублирует пользовательские изменения.
+                active.abort()
+                store(transport: nil,
+                      status: .failed("Сессия прервалась · переподключаюсь…"),
+                      owner: operation.routerID)
+                active = try await session(operation: operation)
+                do {
+                    let result: T
+                    if preserveConnectionOnFailure {
+                        result = try await background(owner: operation.routerID) { try body(active) }
+                    } else {
+                        result = try await watch(active, budget: budget,
+                                                 owner: operation.routerID) { try body(active) }
+                    }
+                    try requireCurrent(operation)
+                    return result
+                } catch {
+                    active.abort()
+                    store(transport: nil, status: .failed(describe(error)),
+                          owner: operation.routerID)
+                    throw error
+                }
+            }
             // Для длинных операций транспорт мёртв — следующая операция
             // поднимет новый. Короткая живая проверка интерфейса не должна
             // ронять весь подключённый роутер из-за одного временного сбоя:
@@ -661,6 +697,39 @@ final class RouterSession: ObservableObject {
                 log(.warn, "Живой Ping-Check не выполнен: \(describe(error))")
             }
             throw error
+        }
+    }
+
+    /// Фоновая проверка обнаруживает закрытую роутером сессию до того, как
+    /// пользователь нажмёт «Сохранить». Проверка ничего не меняет и идёт в
+    /// той же последовательной очереди, что остальные команды.
+    func monitorConnections() async {
+        while !Task.isCancelled {
+            let connected = slots.compactMap { owner, slot -> (UUID, KeeneticTransport)? in
+                guard slot.status.isOnline, slot.progress == nil, let transport = slot.transport
+                else { return nil }
+                return (owner, transport)
+            }
+            for (owner, candidate) in connected {
+                guard !Task.isCancelled, slots[owner]?.transport === candidate else { continue }
+                do {
+                    _ = try await background(owner: owner) {
+                        try candidate.run("show version", timeout: 12)
+                    }
+                    guard candidate.isAlive else {
+                        throw TransportError("Сессия закрыта роутером.", isSessionFailure: true)
+                    }
+                } catch {
+                    guard slots[owner]?.transport === candidate else { continue }
+                    candidate.abort()
+                    store(transport: nil,
+                          status: .failed("Сессия прервалась: \(describe(error))"),
+                          owner: owner)
+                    log(.warn, "Сторож соединения обнаружил обрыв: \(describe(error))")
+                }
+            }
+            do { try await Task.sleep(nanoseconds: 6_000_000_000) }
+            catch { return }
         }
     }
 
@@ -792,13 +861,15 @@ final class RouterSession: ObservableObject {
             RouterConfigParser.applyPingCheck(pingInfo, to: &interfaces)
 
             let pingCheck = PingCheckParser.parse(config: configText)
+            let wireGuardClients = WireGuardState.interfaceNames(config: configText)
             return RouterState(
                 configText: configText,
                 groups: RouterConfigParser.parseFqdnGroups(configText),
                 interfaces: interfaces,
-                candidates: RouterConfigParser.likelyRouteInterfaces(interfaces),
+                candidates: RouterConfigParser.likelyRouteInterfaces(
+                    interfaces, wireGuardClients: Set(wireGuardClients)),
                 staticRoutes: StaticRouteParser.parse(config: configText),
-                wireguardInterfaces: WireGuardState.interfaceNames(config: configText),
+                wireguardInterfaces: wireGuardClients,
                 pingCheckProfiles: pingCheck.profiles,
                 pingCheckBindings: pingCheck.bindings,
                 readAt: Date())

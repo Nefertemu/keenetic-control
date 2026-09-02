@@ -1,5 +1,163 @@
 import SwiftUI
 
+struct TunnelLatencySeries: Identifiable {
+    var interface: String
+    var label: String
+    var colorIndex: Int
+    var samples: [TunnelHealthSample]
+    var id: String { interface }
+
+    var latest: TunnelHealthSample? { samples.last }
+    var latestLatency: Double? { latest?.latencyMS }
+    var lossPercent: Double {
+        let recent = samples.suffix(100)
+        guard !recent.isEmpty else { return 0 }
+        return recent.compactMap(\.lossPercent).reduce(0, +) / Double(recent.count)
+    }
+}
+
+/// Один график для всех клиентских WireGuard-туннелей: теперь видно не
+/// только факт доступности, но и какой маршрут отвечает быстрее или начал
+/// заметно тормозить.
+struct TunnelLatencyCard: View {
+    let series: [TunnelLatencySeries]
+    let target: String
+    let refreshSeconds: Int
+
+    private var hasData: Bool { series.contains { !$0.samples.isEmpty } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    header
+                    Spacer(minLength: 10)
+                    Text("обновление · \(refreshSeconds) с")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    header
+                    Text("Обновление каждые \(refreshSeconds) с")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+
+            if hasData {
+                TunnelLatencyChart(series: series)
+                    .frame(height: 150)
+                    .padding(10)
+                    .inset(cornerRadius: 10)
+
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 8)], spacing: 8) {
+                    ForEach(series) { item in latencyLegend(item) }
+                }
+            } else {
+                EmptyHint(icon: "chart.xyaxis.line",
+                          title: "Пинги ещё не накопились",
+                          message: "Первая точка появится после активной проверки туннелей выше.")
+                    .padding(.vertical, 4)
+            }
+        }
+        .padding(12)
+        .inset()
+    }
+
+    private var header: some View {
+        CardHeader(icon: "chart.xyaxis.line",
+                   title: "Пинги туннелей",
+                   subtitle: "Все VPN до \(target) · последние 24 часа")
+    }
+
+    private func latencyLegend(_ item: TunnelLatencySeries) -> some View {
+        HStack(spacing: 8) {
+            Circle().fill(chartColor(item.colorIndex)).frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.label).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                Text(item.interface).font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            if let latency = item.latestLatency {
+                Text(String(format: "%.0f мс", latency))
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(item.lossPercent > 0 ? Palette.warning : Palette.success)
+            } else {
+                Text(item.samples.isEmpty ? "нет данных" : "нет ответа")
+                    .font(.system(size: 10)).foregroundStyle(Palette.danger)
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .inset(cornerRadius: 8)
+    }
+}
+
+struct TunnelLatencyChart: View {
+    let series: [TunnelLatencySeries]
+
+    private var visible: [TunnelLatencySeries] {
+        series.map {
+            var copy = $0
+            if copy.samples.count > 600 {
+                let stride = max(1, copy.samples.count / 600)
+                copy.samples = copy.samples.enumerated().compactMap { index, sample in
+                    index.isMultiple(of: stride) || index == copy.samples.count - 1 ? sample : nil
+                }
+            }
+            return copy
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let values = visible
+            let width = max(1, geometry.size.width)
+            let height = max(1, geometry.size.height)
+            let dated = values.flatMap(\.samples)
+            let start = dated.map(\.timestamp).min() ?? Date()
+            let end = max(dated.map(\.timestamp).max() ?? start, start.addingTimeInterval(1))
+            let ceiling = max(25, dated.compactMap(\.latencyMS).max() ?? 25)
+
+            ZStack {
+                Path { path in
+                    for fraction in [0.25, 0.5, 0.75] {
+                        path.move(to: CGPoint(x: 0, y: height * fraction))
+                        path.addLine(to: CGPoint(x: width, y: height * fraction))
+                    }
+                }
+                .stroke(Palette.stroke.opacity(0.8),
+                        style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
+
+                ForEach(values) { item in
+                    Path { path in
+                        var drawing = false
+                        for sample in item.samples {
+                            guard let latency = sample.latencyMS else {
+                                drawing = false
+                                continue
+                            }
+                            let x = CGFloat(sample.timestamp.timeIntervalSince(start)
+                                            / end.timeIntervalSince(start)) * width
+                            let y = height - CGFloat(min(1, latency / ceiling)) * (height - 8) - 4
+                            if drawing { path.addLine(to: CGPoint(x: x, y: y)) }
+                            else { path.move(to: CGPoint(x: x, y: y)); drawing = true }
+                        }
+                    }
+                    .stroke(chartColor(item.colorIndex),
+                            style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                }
+            }
+        }
+    }
+}
+
+private func chartColor(_ index: Int) -> Color {
+    let colors: [Color] = [Palette.accent, Palette.success, Palette.warning,
+                           .purple, .cyan, .pink, .orange]
+    return colors[index % colors.count]
+}
+
 /// Карточка истории одной VPN-связи. Данные уже подготовлены хранилищем,
 /// поэтому вьюха остаётся лёгкой и не запускает сетевые запросы сама.
 struct TunnelHealthCard: View {
