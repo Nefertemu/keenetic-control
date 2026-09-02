@@ -66,6 +66,7 @@ struct RootView: View {
     @State private var domainsTab: DomainsTab = .routes
     @State private var tunnelsTab: TunnelsTab = .status
     @State private var paletteOpen = false
+    @State private var connectingAll = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -318,7 +319,10 @@ struct RootView: View {
                 Spacer(minLength: 2)
             }
 
-            if store.routers.count > 1 { routerTabs }
+            if store.routers.count > 1 {
+                routerTabs
+                connectAllButton
+            }
 
             // Адрес занимает всю ширину карточки: рядом с иконкой ему тесно,
             // и он резался посередине.
@@ -352,6 +356,70 @@ struct RootView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .inset(cornerRadius: 11)
+    }
+
+    /// Подключить и прочитать все роутеры разом.
+    ///
+    /// Чтения идут параллельно: у каждого роутера своя очередь операций,
+    /// и ждать их по очереди незачем. Уже подключённые не трогаются, а те,
+    /// чей пароль роутер отверг, отсекаются до обращения к нему.
+    private var connectAllButton: some View {
+        let offline = store.routers.filter { !session.connectionStatus(for: $0.id).isOnline }
+        return Button {
+            Task { await connectEveryRouter() }
+        } label: {
+            HStack(spacing: 6) {
+                if connectingAll {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                Text(connectingAll
+                     ? "Подключаюсь…"
+                     : (offline.isEmpty ? "Все на связи" : "Подключить все (\(offline.count))"))
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 26)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(offline.isEmpty ? Color.secondary : Palette.accent)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.primary.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(Palette.stroke, lineWidth: 1))
+        .disabled(connectingAll || offline.isEmpty)
+        .help("Подключиться и прочитать конфигурацию всех роутеров сразу")
+    }
+
+    private func connectEveryRouter() async {
+        connectingAll = true
+        defer { connectingAll = false }
+        let outcome = await session.connectAll(store.routers)
+
+        if outcome.failed.isEmpty {
+            let read = outcome.connected.count
+            guard read > 0 else { return }
+            log(.ok, "Прочитаны роутеры: " + outcome.connected.joined(separator: ", ") + ".")
+            return
+        }
+
+        // О неудачах говорим поимённо: «часть не подключилась» без имён
+        // заставляет обходить вкладки вручную.
+        let details = outcome.failed
+            .map { "\($0.name): \($0.reason)" }
+            .joined(separator: "\n\n")
+        alert = AlertPayload(
+            title: outcome.connected.isEmpty
+                ? "Не подключился ни один роутер"
+                : "Подключились не все",
+            message: (outcome.connected.isEmpty
+                      ? ""
+                      : "Прочитаны: " + outcome.connected.joined(separator: ", ") + ".\n\n")
+                   + details)
     }
 
     /// Вертикальные вкладки вместо скрытого меню со стрелкой. Каждая вкладка

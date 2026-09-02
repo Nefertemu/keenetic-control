@@ -12,6 +12,9 @@ struct TunnelsView: View {
     @Binding var alert: AlertPayload?
     @Binding var section: AppSection
     @Binding var tab: TunnelsTab
+    /// Выбранный туннель принадлежит разделу, а не вкладке: перешёл с
+    /// «Состояния» на «Обновление» — смотришь на тот же интерфейс.
+    @State private var interfaceIdent = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -34,9 +37,9 @@ struct TunnelsView: View {
 
             switch tab {
             case .status:
-                WireGuardView(alert: $alert, section: $section, mode: .status)
+                TunnelStatusView(alert: $alert, interfaceIdent: $interfaceIdent)
             case .update:
-                WireGuardView(alert: $alert, section: $section, mode: .update)
+                TunnelUpdateView(alert: $alert, interfaceIdent: $interfaceIdent)
             case .pingCheck:
                 PingCheckView(alert: $alert)
             case .diagnostics:
@@ -77,8 +80,3 @@ enum TunnelsTab: String, CaseIterable, Identifiable {
     }
 }
 
-/// Какую половину экрана WireGuard показывать.
-enum WireGuardMode {
-    case status
-    case update
-}

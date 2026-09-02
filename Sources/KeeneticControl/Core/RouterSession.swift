@@ -904,6 +904,61 @@ final class RouterSession: ObservableObject {
         try await refresh(operation: beginOperation(), quiet: quiet)
     }
 
+    /// Итог массового подключения.
+    struct BulkConnectOutcome {
+        var connected: [String] = []
+        var alreadyOnline: [String] = []
+        var failed: [(name: String, reason: String)] = []
+
+        var isEmpty: Bool {
+            connected.isEmpty && alreadyOnline.isEmpty && failed.isEmpty
+        }
+    }
+
+    /// Подключиться и прочитать сразу все роутеры.
+    ///
+    /// У каждого своя очередь операций, поэтому чтения идут параллельно, а
+    /// не одно за другим. Уже подключённые не трогаем, а тем, чей пароль
+    /// роутер уже отверг, `connect(to:)` откажет сам — массовая кнопка не
+    /// должна превращаться в перебор паролей по всем роутерам сразу.
+    func connectAll(_ profiles: [RouterProfile]) async -> BulkConnectOutcome {
+        var outcome = BulkConnectOutcome()
+        var pending: [RouterProfile] = []
+
+        for profile in profiles {
+            let slot = slots[profile.id]
+            if slot?.status.isOnline == true, slot?.state != nil {
+                outcome.alreadyOnline.append(profile.name)
+            } else {
+                pending.append(profile)
+            }
+        }
+
+        await withTaskGroup(of: (String, String?).self) { group in
+            for profile in pending {
+                group.addTask { @MainActor in
+                    do {
+                        _ = try await self.connectAndRefresh(profile)
+                        return (profile.name, nil)
+                    } catch {
+                        return (profile.name, self.describe(error))
+                    }
+                }
+            }
+            for await (name, failure) in group {
+                if let failure {
+                    outcome.failed.append((name, failure))
+                } else {
+                    outcome.connected.append(name)
+                }
+            }
+        }
+
+        outcome.connected.sort()
+        outcome.failed.sort { $0.name < $1.name }
+        return outcome
+    }
+
     /// Подключить и сразу прочитать конкретный роутер. Выбор в боковой
     /// панели на результат не влияет: состояние сохранится в его слоте.
     @discardableResult
