@@ -672,6 +672,61 @@ check("на другом роутере то же имя можно",
 check("сам себя не считает занятым",
       profileError(chain, [chain]) == nil)
 
+print("\n== Что изменилось на роутере ==")
+let configBefore = """
+object-group fqdn domain-list0
+    description "kinopub"
+    include a.example
+    include b.example
+!
+object-group fqdn domain-list1
+    description "telegram"
+    include c.example
+!
+dns-proxy route object-group domain-list0 Wireguard0 auto
+ip route 10.50.0.0 255.255.0.0 Wireguard0 auto
+!
+"""
+let configAfter = """
+object-group fqdn domain-list0
+    description "kinopub"
+    include a.example
+    include b.example
+    include new1.example
+    include new2.example
+!
+object-group fqdn domain-list2
+    description "meta"
+    include d.example
+!
+dns-proxy route object-group domain-list0 Wireguard0 auto
+dns-proxy route object-group domain-list0 Wireguard1 auto
+!
+"""
+let routerChange = RouterChange(
+    at: Date(), difference: Restore.compare(backup: configBefore, current: configAfter))
+check("изменение затронуло то, чем управляем", routerChange.touchesManagedSettings)
+let changeText = routerChange.lines.joined(separator: " | ")
+check("добавленные домены названы с именем списка",
+      changeText.contains("добавлено 2 домена в domain-list0"))
+check("появившийся список назван", changeText.contains("появился 1 список в domain-list2"))
+check("исчезнувший список назван", changeText.contains("удалён 1 список в domain-list1"))
+check("новый маршрут посчитан", changeText.contains("назначено маршрутов списков: 1"))
+check("удалённый статический маршрут посчитан", changeText.contains("удалён 1 маршрут"))
+check("про списки, которых не касались, молчим", !changeText.contains("убран"))
+check("глагол согласуется с единицей", Format.agree(1, "добавлен", "добавлено"), "добавлен")
+check("и с двойкой", Format.agree(2, "добавлен", "добавлено"), "добавлено")
+check("одиннадцать — не единица", Format.agree(11, "добавлен", "добавлено"), "добавлено")
+check("двадцать один — единица", Format.agree(21, "добавлен", "добавлено"), "добавлен")
+
+// Поменялось что-то за пределами нашего ведения — врать про списки нельзя.
+let unrelated = RouterChange(
+    at: Date(),
+    difference: Restore.compare(backup: configBefore,
+                                current: configBefore + "\nip name-server 1.1.1.1\n"))
+check("чужая правка не выдаётся за правку списков", !unrelated.touchesManagedSettings)
+check("и строк не порождает", unrelated.lines.isEmpty)
+
 print("\n== Замечания по состоянию роутера ==")
 var healthState = RouterState()
 healthState.interfaces = [

@@ -129,6 +129,76 @@ struct RouterState {
     }
 }
 
+/// Последнее замеченное изменение конфигурации роутера.
+///
+/// Фоновое перечитывание умело сказать «конфигурация изменилась», но не
+/// что именно. А правки приходят и из веб-панели роутера, так что вопрос
+/// «что там поменялось, пока меня не было» — рабочий.
+struct RouterChange {
+    var at: Date
+    var difference: Restore.Difference
+
+    /// Пусто — поменялось что-то, чем приложение не управляет (Wi-Fi,
+    /// NAT, межсетевой экран), и выдавать это за правку списков нельзя.
+    var touchesManagedSettings: Bool { !difference.isEmpty }
+
+    /// Сводка «что стало другим».
+    ///
+    /// `Restore.Difference` описывает разницу словами возврата к копии
+    /// («вернуть», «убрать»), а здесь смысл обратный: слева прошлое
+    /// состояние, справа текущее. Поэтому формулировки свои.
+    var lines: [String] {
+        var result: [String] = []
+        if difference.extraDomainCount > 0 {
+            result.append(Format.agree(difference.extraDomainCount, "добавлен", "добавлено")
+                          + " \(Format.domains(difference.extraDomainCount))"
+                          + namesSuffix(Array(difference.extraDomains.keys)))
+        }
+        if difference.missingDomainCount > 0 {
+            result.append(Format.agree(difference.missingDomainCount, "убран", "убрано")
+                          + " \(Format.domains(difference.missingDomainCount))"
+                          + namesSuffix(Array(difference.missingDomains.keys)))
+        }
+        if !difference.extraGroups.isEmpty {
+            result.append(Format.agree(difference.extraGroups.count, "появился", "появилось")
+                          + " \(Format.lists(difference.extraGroups.count))"
+                          + namesSuffix(difference.extraGroups.map(\.ident)))
+        }
+        if !difference.missingGroups.isEmpty {
+            result.append(Format.agree(difference.missingGroups.count, "удалён", "удалено")
+                          + " \(Format.lists(difference.missingGroups.count))"
+                          + namesSuffix(difference.missingGroups.map(\.ident)))
+        }
+        if !difference.extraRouteLines.isEmpty {
+            result.append("назначено маршрутов списков: \(difference.extraRouteLines.count)")
+        }
+        if !difference.missingRouteLines.isEmpty {
+            result.append("снято маршрутов списков: \(difference.missingRouteLines.count)")
+        }
+        if !difference.extraRoutes.isEmpty {
+            result.append(Format.agree(difference.extraRoutes.count, "добавлен", "добавлено")
+                          + " \(Format.routes(difference.extraRoutes.count))")
+        }
+        if !difference.missingRoutes.isEmpty {
+            result.append(Format.agree(difference.missingRoutes.count, "удалён", "удалено")
+                          + " \(Format.routes(difference.missingRoutes.count))")
+        }
+        return result
+    }
+
+    /// «в itdog ru inside 2» или «в 3 списках» — чтобы не вываливать
+    /// десяток идентификаторов в одну строку.
+    private func namesSuffix(_ idents: [String]) -> String {
+        let sorted = idents.sorted {
+            RouterConfigParser.identOrder($0) < RouterConfigParser.identOrder($1)
+        }
+        guard !sorted.isEmpty else { return "" }
+        if sorted.count == 1 { return " в \(sorted[0])" }
+        if sorted.count == 2 { return " в \(sorted[0]) и \(sorted[1])" }
+        return " в \(Format.lists(sorted.count))"
+    }
+}
+
 struct ProgressInfo: Equatable {
     var label: String
     var done: Int
@@ -173,6 +243,9 @@ final class RouterSlot {
     var profile: RouterProfile
     var transport: KeeneticTransport?
     var state: RouterState?
+    /// Держится до следующего изменения, а не до следующего чтения:
+    /// иначе после первой же тихой сверки сводка обнулялась бы.
+    var lastChange: RouterChange?
     var status: ConnectionStatus = .offline
     /// Ход длинной операции принадлежит роутеру, а не окну: пока идёт
     /// заливка списков на один, второй должен оставаться рабочим.
@@ -205,6 +278,10 @@ final class RouterSession: ObservableObject {
     // чтобы состояние пережило переключение.
     @Published private(set) var status: ConnectionStatus = .offline {
         didSet { slots[router.id]?.status = status }
+    }
+    /// Зеркало lastChange активного роутера — чтобы экран обновлялся.
+    @Published private(set) var lastChange: RouterChange? {
+        didSet { slots[router.id]?.lastChange = lastChange }
     }
     @Published private(set) var state: RouterState? {
         didSet { slots[router.id]?.state = state }
@@ -337,6 +414,7 @@ final class RouterSession: ObservableObject {
         status = target.status
         progress = target.progress
         activity = target.activity
+        lastChange = target.lastChange
     }
 
     /// Занят ли конкретный роутер длинной операцией — чтобы кнопки
@@ -477,12 +555,27 @@ final class RouterSession: ObservableObject {
     }
 
     private func store(state newValue: RouterState, owner: UUID) {
+        let previous = readState(for: owner)?.configText
         if owner == router.id {
             state = newValue
         } else if let slot = slots[owner] {
             objectWillChange.send()
             slot.state = newValue
         }
+        rememberChange(from: previous, to: newValue.configText, owner: owner)
+    }
+
+    /// Разница считается один раз в момент изменения: доменов тут тысячи,
+    /// и пересчёт на каждую перерисовку экрана заметно тормозил бы.
+    private func rememberChange(from previous: String?, to current: String, owner: UUID) {
+        guard let previous, !previous.isEmpty, previous != current else { return }
+        let change = RouterChange(at: Date(),
+                                  difference: Restore.compare(backup: previous, current: current))
+        if owner == router.id { lastChange = change } else { slots[owner]?.lastChange = change }
+    }
+
+    func forgetChange() {
+        lastChange = nil
     }
 
     private func clearActivity(owner: UUID) { store(activity: nil, owner: owner) }

@@ -14,6 +14,7 @@ struct OverviewView: View {
                 switch session.status {
                 case .online:
                     if let state = session.state {
+                        changed
                         issues(state)
                         metrics(state)
                         ViewThatFits(in: .horizontal) {
@@ -105,6 +106,48 @@ struct OverviewView: View {
     }
 
     // MARK: - Содержимое
+
+    /// Что стало другим на роутере с прошлого чтения. Правки приходят и
+    /// из веб-панели, а раньше приложение сообщало только сам факт
+    /// изменения, без единого слова о том, какого.
+    @ViewBuilder
+    private var changed: some View {
+        if let change = session.lastChange, change.touchesManagedSettings {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    CardHeader(icon: "clock.arrow.2.circlepath",
+                               title: "Изменилось на роутере",
+                               subtitle: Format.humanDate(change.at))
+                    Spacer(minLength: 8)
+                    Button {
+                        session.forgetChange()
+                    } label: {
+                        Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Скрыть до следующего изменения")
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(change.lines.enumerated()), id: \.offset) { _, line in
+                        HStack(alignment: .top, spacing: 7) {
+                            Circle().fill(Palette.accent)
+                                .frame(width: 5, height: 5)
+                                .padding(.top, 5)
+                            Text(line)
+                                .font(.system(size: 12))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(11)
+                .inset()
+            }
+            .card()
+        }
+    }
 
     /// Что не в порядке прямо сейчас — до всего остального. Раньше обзор
     /// повторял списки с других экранов, то есть показывал то, что и так

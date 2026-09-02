@@ -151,7 +151,11 @@ if [ "$verified" -ne 1 ]; then
     echo "Не удалось подтвердить подпись готового бандла после очистки xattr." >&2
     exit 1
 fi
-codesign -d -r- "$OUTPUT_BUNDLE" 2>&1 | grep -i "^designated" | sed 's/^/    /'
+# Ад-хок подпись печатает требование как «# designated», сертификат — без
+# решётки. Совпадения может не быть вовсе, а пустой grep возвращает 1 и с
+# set -e роняет сборку, которая на самом деле удалась.
+codesign -d -r- "$OUTPUT_BUNDLE" 2>&1 | grep -i "designated" \
+    | sed 's/^[[:space:]]*#\{0,1\}[[:space:]]*/    /' || true
 
 echo
 echo "Готово: $OUTPUT_BUNDLE"

@@ -40,6 +40,14 @@ enum Format {
         return "\(count) \(word)"
     }
 
+    /// Согласование глагола с числом: «добавлен 1 домен», но
+    /// «добавлено 2 домена». Без этого выходило «появилось 1 список».
+    static func agree(_ count: Int, _ single: String, _ plural: String) -> String {
+        let mod100 = count % 100, mod10 = count % 10
+        if (11...14).contains(mod100) { return plural }
+        return mod10 == 1 ? single : plural
+    }
+
     static func domains(_ count: Int) -> String { plural(count, "домен", "домена", "доменов") }
     static func commands(_ count: Int) -> String { plural(count, "команда", "команды", "команд") }
     static func lists(_ count: Int) -> String { plural(count, "список", "списка", "списков") }
