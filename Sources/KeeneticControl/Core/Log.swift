@@ -126,6 +126,14 @@ extension Bundle {
 
 enum AppPaths {
     static let support: URL = {
+        // XCTest загружает тот же модуль приложения, но его файлы должны
+        // оставаться во временной папке даже при обычном `swift test`.
+        if NSClassFromString("XCTestCase") != nil {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("KeeneticControl-tests-\(ProcessInfo.processInfo.processIdentifier)")
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            return url
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let url = base.appendingPathComponent("KeeneticControl", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

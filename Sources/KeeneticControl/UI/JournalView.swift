@@ -67,7 +67,11 @@ struct JournalView: View {
                         .padding(12)
                     }
                     .inset()
-                    .onChange(of: entries.count) { _, _ in
+                    .onAppear {
+                        guard followTail, let last = entries.last else { return }
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                    .onChange(of: entries.last?.id) { _, _ in
                         guard followTail, let last = entries.last else { return }
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
@@ -145,10 +149,10 @@ struct JournalView: View {
                 .map { "\($0.stamp) [\($0.level.rawValue)] \($0.text)" }
                 .joined(separator: "\n")
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text.isEmpty ? store.plainText : text,
-                                           forType: .string)
+            NSPasteboard.general.setString(text, forType: .string)
         }
         .buttonStyle(SubtleButtonStyle())
+        .disabled(entries.isEmpty)
     }
 
     private var clearButton: some View {

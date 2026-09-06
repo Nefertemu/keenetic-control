@@ -219,6 +219,23 @@ struct AdaptiveTable<Content: View>: View {
     }
 }
 
+/// Внутри вертикального экрана таблица занимает доступную ширину, а в
+/// узком окне получает горизонтальную прокрутку с видимым индикатором.
+struct AdaptiveHorizontalContent<Content: View>: View {
+    var minContentWidth: CGFloat
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            content()
+                .frame(minWidth: minContentWidth, maxWidth: .infinity, alignment: .leading)
+            ScrollView(.horizontal) {
+                content().frame(width: minContentWidth, alignment: .leading)
+            }
+        }
+    }
+}
+
 struct MetricTile: View {
     var value: String
     var label: String
@@ -232,6 +249,8 @@ struct MetricTile: View {
                 Text(label).font(.system(size: 11, weight: .medium))
             }
             .foregroundStyle(tint)
+            .lineLimit(2)
+            .frame(height: 28, alignment: .topLeading)
 
             Text(value)
                 .font(.system(size: 24, weight: .semibold, design: .rounded))

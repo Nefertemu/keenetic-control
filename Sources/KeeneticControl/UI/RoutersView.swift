@@ -53,6 +53,7 @@ struct RoutersView: View {
                     // системного запроса связки ключей он уже переключился
                     // на другой роутер.
                     if session.activeRouterID == activeBeforeSave {
+                        store.selectedRouterID = updated.id
                         await session.switchTo(updated)
                     }
                     refreshPasswordFlags()
@@ -610,6 +611,13 @@ struct RouterEditor: View {
                 }
             }
 
+            if let message = profile.validationError {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Button("Отмена", action: onCancel)
                     .buttonStyle(SubtleButtonStyle())
@@ -617,9 +625,11 @@ struct RouterEditor: View {
                 Spacer()
                 Button("Сохранить") {
                     var cleaned = profile
-                    cleaned.name = cleaned.name.trimmingCharacters(in: .whitespaces)
-                    cleaned.host = cleaned.host.trimmingCharacters(in: .whitespaces)
-                    cleaned.user = cleaned.user.trimmingCharacters(in: .whitespaces)
+                    cleaned.name = cleaned.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    cleaned.host = cleaned.host.trimmingCharacters(in: .whitespacesAndNewlines)
+                    cleaned.user = cleaned.user.trimmingCharacters(in: .whitespacesAndNewlines)
+                    cleaned.webURL = cleaned.webURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard cleaned.validationError == nil else { return }
                     if cleaned.name.isEmpty { cleaned.name = cleaned.host }
                     // nil — пароль не меняли; пустая строка — удалить его из
                     // связки ключей. Раньше очистить поле и сохранить было
@@ -628,8 +638,7 @@ struct RouterEditor: View {
                 }
                 .buttonStyle(PrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)
-                .disabled(profile.host.trimmingCharacters(in: .whitespaces).isEmpty
-                          && profile.webURL.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(profile.validationError != nil)
             }
         }
         .padding(22)

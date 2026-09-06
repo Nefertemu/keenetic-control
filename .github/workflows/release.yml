@@ -31,12 +31,16 @@ jobs:
           swift --version
           xcodebuild -version
 
-      - name: Самотест
-        run: |
-          mkdir -p .build
-          swiftc -O Sources/KeeneticControl/{Core,Model,Crypto}/*.swift \
-                 Tools/SelfTest/main.swift -o .build/selftest
-          .build/selftest
+      - name: Тесты Swift Package
+        run: ./Tools/test.sh
+
+      - name: Снимки интерфейса
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-snapshots
+          path: .build/ui-snapshots/
+          if-no-files-found: ignore
 
       - name: Сборка приложения
         run: ./build.sh

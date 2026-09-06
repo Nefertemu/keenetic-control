@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "KeeneticControl",
             path: "Sources/KeeneticControl"
+        ),
+        .testTarget(
+            name: "KeeneticControlTests",
+            dependencies: ["KeeneticControl"],
+            path: "Tests/KeeneticControlTests"
         )
     ]
 )

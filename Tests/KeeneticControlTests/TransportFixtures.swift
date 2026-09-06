@@ -1,0 +1,94 @@
+import Foundation
+import XCTest
+@testable import KeeneticControl
+
+/// Блокирующий транспорт как настоящий SSH, но без сети и таймерных гонок.
+final class TransportGate {
+    let started = XCTestExpectation(description: "Transport entered")
+    private let condition = NSCondition()
+    private var released = false
+
+    func wait() throws {
+        started.fulfill()
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(5)
+        while !released {
+            guard condition.wait(until: deadline) else {
+                throw TransportError("Test gate timed out")
+            }
+        }
+    }
+
+    func release() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+final class FakeTransport: KeeneticTransport {
+    let kind: TransportKind = .ssh
+    private let lock = NSLock()
+    private var alive = false
+    private var recorded: [String] = []
+    private var aborts = 0
+    var onConnect: () throws -> Void = {}
+    var onRead: () throws -> String = { RegressionFixtures.sampleConfig }
+    var onRun: (String) throws -> String = { _ in "" }
+    var onAbort: () -> Void = {}
+
+    var isAlive: Bool { lock.withLock { alive } }
+    var commands: [String] { lock.withLock { recorded } }
+    var abortCount: Int { lock.withLock { aborts } }
+
+    func connect() throws {
+        try onConnect()
+        lock.withLock { alive = true }
+    }
+    func run(_ command: String, timeout: TimeInterval) throws -> String {
+        lock.withLock { recorded.append(command) }
+        return try onRun(command)
+    }
+    func runBatch(_ commands: [String], timeout: TimeInterval) throws -> String {
+        try commands.map { try run($0, timeout: timeout) }.joined(separator: "\n")
+    }
+    func fetchText(_ command: String, timeout: TimeInterval, quiet: Bool) throws -> String {
+        lock.withLock { recorded.append(command) }
+        return try onRead()
+    }
+    func close() { lock.withLock { alive = false } }
+    func abort() {
+        lock.withLock { alive = false; aborts += 1 }
+        onAbort()
+    }
+}
+
+@MainActor
+final class SessionFixture {
+    let profile = RouterProfile(name: "Fixture", host: "fixture.invalid")
+    var transports: [FakeTransport]
+    private(set) var opened: [RouterProfile] = []
+    private(set) var backups: [String] = []
+    var backupSucceeds = true
+    var settings = AppSettings.default
+
+    init(_ transports: FakeTransport...) { self.transports = transports }
+
+    func session() -> RouterSession {
+        RouterSession(router: profile, dependencies: RouterSessionDependencies(
+            makeTransport: { [self] profile, _ in
+                opened.append(profile)
+                guard !transports.isEmpty else { throw TransportError("Unexpected connection") }
+                return transports.removeFirst()
+            },
+            password: { _ in nil },
+            retryDelay: { try Task.checkCancellation() },
+            settings: { [self] in settings },
+            backup: { [self] _, text, _ in
+                backups.append(text)
+                return backupSucceeds ? URL(fileURLWithPath: "/test/backup.kcb") : nil
+            }))
+    }
+}

@@ -115,6 +115,39 @@ struct RouterProfile: Identifiable, Codable, Hashable {
         "\(transport.rawValue)|\(host)|\(port)|\(user)|\(effectiveWebURL)"
     }
 
+    /// Проверяем выбранный транспорт до сохранения и обращения к связке ключей.
+    var validationError: String? {
+        let login = user.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !login.isEmpty else { return "Укажи пользователя роутера." }
+        guard login.rangeOfCharacter(from: .controlCharacters) == nil else {
+            return "Логин не может содержать служебные символы."
+        }
+        switch transport {
+        case .ssh:
+            let address = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !address.isEmpty else { return "Укажи адрес роутера для SSH." }
+            guard (1...65535).contains(port) else { return "Порт SSH должен быть от 1 до 65535." }
+            let forbidden = CharacterSet.whitespacesAndNewlines
+                .union(.controlCharacters).union(CharacterSet(charactersIn: "/@\\\"'!;?#"))
+            guard address.rangeOfCharacter(from: forbidden) == nil, !address.hasPrefix("-"),
+                  !address.contains(":") || IPTools.isIPv6(address) else {
+                return "Для SSH нужен IP-адрес или имя узла, без схемы, пути и порта."
+            }
+            guard login.rangeOfCharacter(from: forbidden) == nil, !login.hasPrefix("-") else {
+                return "Укажи логин SSH без пробелов и служебных символов."
+            }
+        case .http:
+            guard let url = URLComponents(string: effectiveWebURL),
+                  let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                  let hostname = url.host, !hostname.isEmpty,
+                  hostname.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+                  url.port.map({ (1...65535).contains($0) }) ?? true else {
+                return "Укажи корректный HTTP- или HTTPS-адрес веб-панели."
+            }
+        }
+        return nil
+    }
+
     /// Локальная панель живёт по http, KeenDNS и любой внешний адрес — по https.
     static func looksLocal(_ host: String) -> Bool {
         if host.hasSuffix(".local") || host == "localhost" { return true }

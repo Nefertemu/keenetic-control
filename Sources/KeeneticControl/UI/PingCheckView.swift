@@ -119,7 +119,6 @@ struct PingCheckView: View {
                 if let victim = confirmDelete {
                     plan = PingCheckParser.planDelete(victim, usedBy: users(of: victim))
                         .forRouter(session.router)
-                        .forRouter(session.router)
                 }
                 confirmDelete = nil
             }
@@ -281,14 +280,14 @@ struct PingCheckView: View {
                 }
             }
 
-            ScrollView(.horizontal, showsIndicators: false) {
+            AdaptiveHorizontalContent(minContentWidth: 860) {
                 VStack(spacing: 0) {
                     HStack(spacing: 10) {
-                        Text("Интерфейс").frame(width: 250, alignment: .leading)
+                        Text("Интерфейс").frame(minWidth: 250, maxWidth: .infinity, alignment: .leading)
                         Text("Профиль").frame(width: 190, alignment: .leading)
                         Text("Перезапуск").frame(width: 110, alignment: .leading)
                         Text("Сейчас").frame(width: 150, alignment: .leading)
-                        Spacer()
+                        Color.clear.frame(width: 90, height: 1)
                     }
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
@@ -301,7 +300,6 @@ struct PingCheckView: View {
                         if item.id != interfaces.last?.id { Divider() }
                     }
                 }
-                .frame(minWidth: 760, alignment: .leading)
             }
             .padding(.horizontal, 12)
             .inset()
@@ -349,7 +347,7 @@ struct PingCheckView: View {
                     }
                 }
             }
-            .frame(width: 250, alignment: .leading)
+            .frame(minWidth: 250, maxWidth: .infinity, alignment: .leading)
             .help(item.displayName)
 
             Picker("", selection: Binding(
@@ -359,7 +357,7 @@ struct PingCheckView: View {
                 ForEach(profiles) { Text($0.name).tag($0.name) }
             }
             .labelsHidden()
-            .frame(width: 190)
+            .frame(width: 190, alignment: .leading)
 
             Toggle("", isOn: Binding(
                 get: { current.restart },
@@ -382,8 +380,10 @@ struct PingCheckView: View {
             .frame(width: 150, alignment: .leading)
             .help(check.explanation)
 
-            if dirty { StatusPill(text: "изменено", tint: Palette.warning) }
-            Spacer(minLength: 0)
+            ZStack {
+                if dirty { StatusPill(text: "изменено", tint: Palette.warning) }
+            }
+            .frame(width: 90)
         }
         .padding(.vertical, 8)
     }

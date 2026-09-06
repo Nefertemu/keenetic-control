@@ -558,9 +558,13 @@ struct RootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        ZStack(alignment: .top) {
-            Palette.canvas.ignoresSafeArea()
-
+        RouterDetailLayout {
+            RouterUpdateBanners(release: appUpdates.available, finding: updater.finding,
+                                activeRouterID: session.router.id,
+                                onDismissRelease: { appUpdates.dismiss() },
+                                onDismissFinding: { updater.dismissFinding() },
+                                onViewPlan: { plan = $0 })
+        } content: {
             Group {
                 switch section {
                 case .overview:      OverviewView(alert: $alert, section: $section)
@@ -576,11 +580,8 @@ struct RootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-            VStack(spacing: 8) {
-                if let release = appUpdates.available { releaseBanner(release) }
-                if let found = updater.finding { updateBanner(found) }
-            }
         }
+        .background(Palette.canvas)
         .navigationTitle(section.title)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -594,90 +595,6 @@ struct RootView: View {
                 .help("Перечитать конфигурацию роутера (⌘R)")
             }
         }
-    }
-
-    /// Вышла новая версия приложения. Ничего не скачиваем сами — только
-    /// говорим и открываем страницу релиза.
-    private func releaseBanner(_ release: AvailableUpdate) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "arrow.down.circle")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Palette.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Вышла версия \(release.version)")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("У тебя \(Bundle.appVersion). Приложение ничего не скачивает само.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 8)
-            Button("Открыть релиз") { NSWorkspace.shared.open(release.pageURL) }
-                .buttonStyle(PrimaryButtonStyle())
-            Button {
-                appUpdates.dismiss()
-            } label: {
-                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Скрыть до следующей версии")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Palette.surface))
-        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
-            .strokeBorder(Palette.accent.opacity(0.5), lineWidth: 1)
-            .allowsHitTesting(false))
-        .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
-        .padding(.horizontal, 20)
-        .padding(.top, 12)
-    }
-
-    /// Фоновая сверка что-то нашла. Полоса поверх содержимого, а не
-    /// уведомление в никуда: план уже собран, его можно посмотреть сразу.
-    private func updateBanner(_ found: AutoUpdater.Finding) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Palette.warning)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Источники разошлись с «\(found.routerName)»")
-                    .font(.system(size: 12, weight: .semibold))
-                Text(found.plan.summary.joined(separator: " · "))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 8)
-
-            if found.routerID == session.router.id {
-                Button("Посмотреть план") { plan = found.plan }
-                    .buttonStyle(PrimaryButtonStyle(tint: Palette.warning))
-            } else {
-                Text("проверялся другой роутер")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-
-            Button {
-                updater.dismissFinding()
-            } label: {
-                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Скрыть до следующей проверки")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 11, style: .continuous)
-            .fill(Palette.surface))
-        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
-            .strokeBorder(Palette.warning.opacity(0.5), lineWidth: 1)
-            .allowsHitTesting(false))
-        .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
-        .padding(.horizontal, 20)
-        .padding(.top, 12)
     }
 
     // MARK: - Действия

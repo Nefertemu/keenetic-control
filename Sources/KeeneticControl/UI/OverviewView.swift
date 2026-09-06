@@ -231,7 +231,7 @@ struct OverviewView: View {
                 }
             }
 
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4), spacing: 12) {
                 MetricTile(value: String(state.groups.count), label: "Списков FQDN",
                            icon: "list.bullet.rectangle")
                 MetricTile(value: String(state.totalDomains), label: "Доменов в списках",

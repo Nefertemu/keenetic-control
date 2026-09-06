@@ -94,6 +94,12 @@ struct DnsRoutesView: View {
             if let wanted = Navigator.shared.takeListQuery() { query = wanted }
         }
         .onChange(of: session.state?.readAt) { _, _ in pickDefaultInterface() }
+        .onReceive(Navigator.shared.$listQuery) { wanted in
+            guard let wanted else { return }
+            Navigator.shared.listQuery = nil
+            filter = .all
+            query = wanted
+        }
         .onChange(of: interfaceIdent) { _, newIdent in
             // В обычном (одноинтерфейсном) сценарии выбор сверху остаётся
             // единственной целью. Когда в редакторе уже собрана цепочка из
@@ -512,7 +518,7 @@ struct DnsRoutesView: View {
                           message: "Подключись и нажми «Обновить» — списки появятся здесь.")
             } else if groups.isEmpty {
                 EmptyHint(icon: "tray", title: "Ничего не нашлось",
-                          message: "Поменяй фильтр или залей списки на вкладке «Списки FQDN».")
+                          message: "Поменяй фильтр или загрузи списки на вкладке «Источники».")
             } else {
                 // 478 занимают фиксированные колонки со списком,
                 // идентификатором и счётчиком; на три ярлыка маршрутов

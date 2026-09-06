@@ -211,8 +211,13 @@ KC_SIGN_IDENTITY="Apple Development: ..." ./build.sh
 ## Проверка
 
 ```bash
-swiftc -O Sources/KeeneticControl/{Core,Model,Crypto}/*.swift \
-       Tools/SelfTest/main.swift -o .build/selftest && .build/selftest
+./Tools/test.sh
+
+# Отдельные сценарии:
+./Tools/test.sh --filter RegressionTests/testWireGuard
+./Tools/test.sh --filter RouterConnectionTests
+./Tools/test.sh --filter RouterPlanTests
+./Tools/test.sh --filter UIRegressionTests
 ```
 
 Проверяются: punycode, нормализация доменов, разбор `running-config` (в том
@@ -228,3 +233,29 @@ RFC 9106; строгая проверка порядка и флагов failove
 отбрасывание частичной загрузки подсетей, ошибки битого JSON RCI и AES-GCM
 контейнеры резервных копий. С `SELFTEST_NETWORK=1` дополнительно скачиваются
 все восемь источников.
+
+Тесты — стандартный target Swift Package (`swift test`). Скрипт выбирает полный
+Xcode, если активны только Command Line Tools. Требуются macOS 14+ и Xcode;
+UI-проверки создают временные окна SwiftUI в графической сессии macOS.
+
+`RegressionTests` сохраняет все 417 проверок прежнего самотеста. Транспортные
+тесты используют подставные соединения и управляемые задержки: отмена ожидания,
+смена роутера и адреса, повторное подключение, запрет повторной записи,
+резервное копирование и сохранение проверяются без настоящего роутера.
+Настройки, кэш и журнал XCTest находятся во временной папке процесса.
+
+`UIRegressionTests` отрисовывает настоящие экраны обзора, доменных и статических
+маршрутов, Ping-Check: 500 маршрутов, 80 списков, 12 интерфейсов, длинные имена
+и два баннера одновременно. Проверяются светлая и тёмная темы, ширина области
+содержимого 788 и 1220 точек. Проверки измеряют границы блоков, распознают
+видимые кнопки баннеров встроенным Vision и проверяют прокрутку длинной таблицы.
+PNG сохраняются в `.build/ui-snapshots/`; в CI они прикладываются к запуску.
+Это проверки геометрии и содержимого снимков, без хрупкого побитового сравнения
+шрифтов разных версий macOS. Внешние источники проверяются отдельно:
+`SELFTEST_NETWORK=1 ./Tools/test.sh --filter RegressionTests/testLiveSourceDownloads`.
+
+`RouterSession` связывает состояние с SwiftUI. `RouterConnectionManager`
+владеет пулом соединений и поколениями операций; `RouterPlanExecutor` выполняет
+резервное копирование, команды, сохранение и проверку результата. Зависимости
+транспорта, пароля, повторных попыток и копий передаются через
+`RouterSessionDependencies`.

@@ -14,7 +14,7 @@ struct TunnelStatusView: View {
     /// должен сбрасываться.
     @Binding var interfaceIdent: String
 
-    @State private var interfaceName = ""
+    @State private var nameDraft = TextDraft()
     @State private var namePlan: Plan?
     @State private var pingRefreshing = false
     @State private var pingUpdatedAt: Date?
@@ -47,6 +47,11 @@ struct TunnelStatusView: View {
                 interfaceIdent = wanted
             }
         }
+        .onReceive(Navigator.shared.$interfaceIdent) { wanted in
+            guard let wanted, interfaces.contains(wanted) else { return }
+            Navigator.shared.interfaceIdent = nil
+            interfaceIdent = wanted
+        }
         .onChange(of: session.state?.readAt) { _, _ in
             // Live Ping-Check обновляет readAt каждые несколько секунд. Не
             // сбрасываем из-за этого время последней проверки и её ошибку —
@@ -54,7 +59,7 @@ struct TunnelStatusView: View {
             if interfaceIdent.isEmpty || !interfaces.contains(interfaceIdent) {
                 pickDefault()
             } else {
-                syncInterfaceName()
+                nameDraft.receive(savedInterfaceName)
             }
         }
         .onChange(of: interfaceIdent) { _, _ in
@@ -66,7 +71,7 @@ struct TunnelStatusView: View {
             // Черновик имени относится к старому роутеру — не даём случайно
             // применить его после переключения.
             namePlan = nil
-            interfaceName = ""
+            nameDraft.reset(to: "")
             pickDefault()
         }
         // Ping-Check и статистика WireGuard живут в статусе интерфейса, а не
@@ -160,7 +165,7 @@ struct TunnelStatusView: View {
                 HStack(spacing: 10) {
                     CardHeader(icon: "waveform.path.ecg",
                                title: "Встроенный Ping-Check",
-                               subtitle: "Решение роутера: рабочий интерфейс или нет; RTT измеряется выше")
+                               subtitle: "Решение роутера: рабочий интерфейс или нет; задержки — в блоке ниже")
                     Spacer(minLength: 8)
                     livePingStatus(check)
                 }
@@ -296,7 +301,7 @@ struct TunnelStatusView: View {
             livePingCard
 
             if let live = liveState {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4), spacing: 12) {
                     MetricTile(value: live.isUp ? "включён" : "выключен",
                                label: "Состояние", icon: "power",
                                tint: live.isUp ? Palette.success : Palette.warning)
@@ -367,8 +372,8 @@ struct TunnelStatusView: View {
                      ? "WireGuard / AmneziaWG"
                      : (session.state?.shortLabel(for: interfaceIdent) ?? interfaceIdent),
                    subtitle: interfaceIdent.isEmpty
-                     ? "Безопасное обновление с бэкапом и автоматическим откатом"
-                     : "\(interfaceIdent) · безопасное обновление с бэкапом и откатом")
+                     ? "Состояние интерфейса, проверка связи и статистика"
+                     : "\(interfaceIdent) · проверка связи и статистика")
     }
 
 
@@ -398,7 +403,7 @@ struct TunnelStatusView: View {
             Text("Имя интерфейса")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
-            TextField("Например, Hetzner FIN", text: $interfaceName)
+            TextField("Например, Hetzner FIN", text: $nameDraft.text)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 300)
             Text("Это подпись/description в Keenetic; WireguardN остаётся техническим идентификатором.")
@@ -414,7 +419,7 @@ struct TunnelStatusView: View {
         Button("Сохранить имя") { buildNamePlan(current: saved) }
             .buttonStyle(SubtleButtonStyle())
             .disabled(interfaceIdent.isEmpty
-                      || interfaceName.trimmingCharacters(in: .whitespacesAndNewlines) == saved
+                      || nameDraft.text.trimmingCharacters(in: .whitespacesAndNewlines) == saved
                       || session.progress != nil)
     }
 
@@ -422,7 +427,7 @@ struct TunnelStatusView: View {
     /// Пиры с живой статистикой: рукопожатие и трафик отличают рабочий
     /// туннель от повисшего, чего «включён» сам по себе не говорит.
     private var peerTable: some View {
-        ScrollView(.horizontal) {
+        AdaptiveHorizontalContent(minContentWidth: 880) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 10) {
                     Text("Пир").frame(maxWidth: .infinity, alignment: .leading)
@@ -442,7 +447,6 @@ struct TunnelStatusView: View {
                     if peer.publicKey != peers.last?.publicKey { Divider() }
                 }
             }
-            .frame(minWidth: 760, alignment: .leading)
             .padding(.horizontal, 12)
         }
         .inset()
@@ -580,16 +584,19 @@ struct TunnelStatusView: View {
     }
 
 
+    private var savedInterfaceName: String {
+        session.state?.interfaces[interfaceIdent]?.descriptionText ?? ""
+    }
+
     private func syncInterfaceName() {
-        guard !interfaceIdent.isEmpty else { interfaceName = ""; return }
-        interfaceName = session.state?.interfaces[interfaceIdent]?.descriptionText ?? ""
+        nameDraft.reset(to: savedInterfaceName)
     }
 
 
     private func buildNamePlan(current: String) {
         do {
             let built = try WireGuardPlanner.planRename(
-                interface: interfaceIdent, current: current, desired: interfaceName)
+                interface: interfaceIdent, current: current, desired: nameDraft.text)
             guard !built.isEmpty else {
                 alert = AlertPayload(title: "Имя уже такое", message: "Изменений не требуется.", isError: false)
                 return
