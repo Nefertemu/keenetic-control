@@ -31,18 +31,20 @@ struct BackupsView: View {
     @State private var loadingPreview = false
     @State private var onlyThisRouter = true
     @State private var comparison: ComparisonResult?
-    @State private var comparing = false
+    @State private var comparisonID: UUID?
+    @State private var takingSnapshot = false
+    private var comparing: Bool { comparisonID != nil }
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
 
     private var selected: Snapshot? {
         guard let selection else { return nil }
-        return files.first { $0.url == selection }
+        return visible.first { $0.url == selection }
     }
 
     private var visible: [Snapshot] {
         guard onlyThisRouter else { return files }
-        let mine = Backups.safeHost(session.router.host)
+        let mine = Backups.safeHost(session.router.backupHost)
         return files.filter { $0.host == mine }
     }
 
@@ -91,16 +93,14 @@ struct BackupsView: View {
         .sheet(item: Binding(get: { outcome.map(OutcomeBox.init) }, set: { outcome = $0?.outcome })) { box in
             OutcomeSheet(title: "Возврат к резервной копии", outcome: box.outcome) { outcome = nil }
         }
-        .onChange(of: session.router.id) { _, _ in
-            // Снимки лежат вперемешку, и выделенный принадлежал прошлому
-            // роутеру — под фильтром «только этот» он просто исчезал бы.
-            if onlyThisRouter, let selection,
-               !visible.contains(where: { $0.url == selection }) { clearSelection() }
-            if let comparison,
-               comparison.operation.routerID != session.activeRouterID
-                   || !session.isCurrent(comparison.operation) {
-                self.comparison = nil
-            }
+        .onChange(of: onlyThisRouter) { _, _ in reconcileSelection() }
+        .onDisappear { comparisonID = nil }
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
+            reconcileSelection()
+            comparisonID = nil
+            comparison = nil
+            plan = nil
+            outcome = nil
         }
     }
 
@@ -120,9 +120,11 @@ struct BackupsView: View {
             }
 
             HStack(spacing: 8) {
-                Button("Снять копию сейчас") { Task { await snapshot() } }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(session.progress != nil)
+                Button(takingSnapshot ? "Снимаю копию…" : "Снять копию сейчас") {
+                    Task { await snapshot() }
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(takingSnapshot || session.progress != nil)
                 Button("Обновить") { reload() }
                     .buttonStyle(SubtleButtonStyle())
             }
@@ -130,6 +132,8 @@ struct BackupsView: View {
             Toggle(isOn: $onlyThisRouter) {
                 Text("Только «\(session.router.name)»")
                     .font(.system(size: 11))
+                    .lineLimit(2)
+                    .help(session.router.name)
             }
             .toggleStyle(.checkbox)
             .help("Снимки всех роутеров лежат в одной папке — фильтр оставляет только этот")
@@ -189,9 +193,13 @@ struct BackupsView: View {
                 NSPasteboard.general.setString(item.url.path, forType: .string)
             }
             Button("Удалить", role: .destructive) {
-                try? FileManager.default.removeItem(at: item.url)
-                if selection == item.url { clearSelection() }
-                reload()
+                do {
+                    try FileManager.default.removeItem(at: item.url)
+                    if selection == item.url { clearSelection() }
+                    reload()
+                } catch {
+                    alert = AlertPayload(title: "Копия не удалена", message: error.localizedDescription)
+                }
             }
         }
     }
@@ -279,17 +287,25 @@ struct BackupsView: View {
                             size: values?.fileSize ?? 0,
                             host: Backups.host(of: url))
         }
-        if let selection, !files.contains(where: { $0.url == selection }) { clearSelection() }
+        reconcileSelection()
+    }
+
+    private func reconcileSelection() {
+        if let selection, !visible.contains(where: { $0.url == selection }) { clearSelection() }
     }
 
     private func clearSelection() {
         selection = nil
+        comparisonID = nil
+        comparison = nil
         preview = ""
         loadingPreview = false
     }
 
     /// Конфигурация бывает и на мегабайт — читаем её не на главном потоке.
     private func select(_ url: URL) {
+        comparisonID = nil
+        comparison = nil
         selection = url
         preview = ""
         loadingPreview = true
@@ -305,24 +321,23 @@ struct BackupsView: View {
 
     /// Сверка снимка с тем, что на роутере сейчас.
     private func compare() async {
-        guard let url = selection else { return }
+        guard let url = selected?.url, comparisonID == nil else { return }
         let operation = session.beginOperation()
-        comparing = true
-        defer { comparing = false }
+        let requestID = UUID()
+        comparisonID = requestID
+        defer { if comparisonID == requestID { comparisonID = nil } }
+        func isRelevant() -> Bool {
+            comparisonID == requestID && selection == url
+                && session.activeRouterID == operation.routerID && session.isCurrent(operation)
+        }
         do {
             let backup = try await Task.detached {
                 try Backups.read(url)
             }.value
+            guard isRelevant() else { return }
             let current = try await session.readConfigText(operation: operation)
             let found = Restore.compare(backup: backup, current: current)
-            guard session.isCurrent(operation),
-                  session.activeRouterID == operation.routerID else {
-                alert = AlertPayload(
-                    title: "Роутер переключён",
-                    message: "Сверка относилась к другому роутеру и была отменена. Выбери снимок и повтори её.",
-                    isError: false)
-                return
-            }
+            guard isRelevant() else { return }
             if found.isEmpty {
                 alert = AlertPayload(
                     title: "Расхождений нет",
@@ -333,26 +348,33 @@ struct BackupsView: View {
             }
             comparison = ComparisonResult(operation: operation, snapshot: url, difference: found)
         } catch {
+            guard isRelevant() else { return }
             alert = AlertPayload(title: "Не удалось сверить", message: session.describe(error))
         }
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {
+        let context = RouterPresentationContext(session.router)
         do {
             let result = try await session.apply(plan: plan, dryRun: dryRun,
                                                  saveConfig: Store.shared.settings.saveConfigAfterApply)
+            guard context == RouterPresentationContext(session.router) else { return }
             if result.applied { outcome = result }
         } catch {
+            guard context == RouterPresentationContext(session.router) else { return }
             alert = AlertPayload(title: "Возврат не удался", message: session.describe(error))
         }
     }
 
     private func snapshot() async {
+        guard !takingSnapshot else { return }
+        takingSnapshot = true
+        defer { takingSnapshot = false }
         let operation = session.beginOperation()
         let profile = session.router
         do {
             let text = try await session.readConfigText(operation: operation)
-            let url = Backups.saveRunningConfig(host: profile.host, text: text,
+            let url = Backups.saveRunningConfig(host: profile.backupHost, text: text,
                                                 keep: Store.shared.settings.keepBackups)
             guard let url else {
                 throw TransportError(
@@ -361,8 +383,11 @@ struct BackupsView: View {
             }
             log(.ok, "Защищённая копия конфигурации: \(url.lastPathComponent)")
             reload()
-            if session.isCurrent(operation) { select(url) }
+            if session.isCurrent(operation), session.activeRouterID == operation.routerID {
+                select(url)
+            }
         } catch {
+            guard session.activeRouterID == operation.routerID, session.isCurrent(operation) else { return }
             alert = AlertPayload(title: "Не удалось снять копию", message: session.describe(error))
         }
     }

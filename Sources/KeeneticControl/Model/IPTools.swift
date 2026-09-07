@@ -64,7 +64,7 @@ enum IPTools {
 
     /// Keenetic в `ip route` ждёт адрес и маску, а не длину префикса.
     static func ipv4CIDRToAddressMask(_ cidr: String) -> (address: String, mask: String)? {
-        let parts = cidr.split(separator: "/", maxSplits: 1)
+        let parts = cidr.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2, let prefix = Int(parts[1]), (0...32).contains(prefix),
               let value = parseIPv4(String(parts[0])) else { return nil }
         let mask: UInt32 = prefix == 0 ? 0 : ~UInt32(0) << (32 - UInt32(prefix))

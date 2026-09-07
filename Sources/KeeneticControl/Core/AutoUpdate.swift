@@ -29,7 +29,13 @@ final class AutoUpdater: ObservableObject {
     private weak var session: RouterSession?
     private var notificationsAsked = false
 
-    private init() {}
+    private let sourceLoader: (RouterSession, SourceSpec) async throws -> SourceData
+
+    init(sourceLoader: @escaping (RouterSession, SourceSpec) async throws -> SourceData = {
+        try await $0.loadSource($1, forceRefresh: true)
+    }) {
+        self.sourceLoader = sourceLoader
+    }
 
     func attach(session: RouterSession) {
         self.session = session
@@ -69,10 +75,13 @@ final class AutoUpdater: ObservableObject {
         checking = true
         defer { checking = false }
 
+        if finding?.routerID == session.router.id { finding = nil }
         let store = Store.shared
-        let chosen = store.settings.autoUpdateSources
-        let sources = store.allSources.filter { chosen.isEmpty || chosen.contains($0.key) }
-        let conflicts = CustomSource.conflictingSourceTitles(store.allSources)
+        let settings = store.settings
+        let chosen = settings.autoUpdateSources
+        let catalog = store.allSources
+        let sources = catalog.filter { chosen.isEmpty || chosen.contains($0.key) }
+        let conflicts = CustomSource.conflictingSourceTitles(catalog)
         guard conflicts.isEmpty else {
             lastMessage = "Сверка остановлена: источники спорят за один список."
             log(.warn, lastMessage! + " " + conflicts.joined(separator: "; "))
@@ -99,33 +108,46 @@ final class AutoUpdater: ObservableObject {
         var plans: [Plan] = []
         var reserved = Set(state.groups.keys)
         var failures: [String] = []
+        // isCurrent проверяет соединение владельца, но разрешает переключение
+        // UI. Фоновый план относится и к выбранному роутеру, и к снимку списков.
+        func contextIsCurrent() -> Bool {
+            !Task.isCancelled && session.router.id == routerID
+                && session.isCurrent(operation) && session.state?.groups == state.groups
+                && store.allSources == catalog
+                && store.settings.autoUpdateSources == chosen
+                && store.settings.chunkSize == settings.chunkSize
+                && store.settings.removeStaleByDefault == settings.removeStaleByDefault
+        }
 
         for spec in sources {
             // Пока источник скачивался, человек мог выбрать другой роутер.
             // Не продолжаем строить и тем более показывать устаревший план.
-            guard session.isCurrent(operation) else {
-                lastMessage = "Сверка отменена: выбран другой роутер."
+            guard contextIsCurrent() else {
+                lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
                 return
             }
             do {
-                let data = try await session.loadSource(spec, forceRefresh: true)
-                guard session.isCurrent(operation) else {
-                    lastMessage = "Сверка отменена: выбран другой роутер."
+                let data = try await sourceLoader(session, spec)
+                guard contextIsCurrent() else {
+                    lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
                     return
                 }
                 plans.append(Planner.planImport(
                     groups: state.groups,
                     data: data,
-                    chunkSize: store.settings.chunkSize,
-                    removeStale: store.settings.removeStaleByDefault,
+                    chunkSize: settings.chunkSize,
+                    removeStale: settings.removeStaleByDefault,
                     reservedIDs: &reserved))
+            } catch is CancellationError {
+                lastMessage = "Сверка отменена."
+                return
             } catch {
                 failures.append("\(spec.title): \(session.describe(error))")
             }
         }
 
-        guard session.isCurrent(operation) else {
-            lastMessage = "Сверка отменена: выбран другой роутер."
+        guard contextIsCurrent() else {
+            lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
             return
         }
         lastCheck = Date()
@@ -135,14 +157,17 @@ final class AutoUpdater: ObservableObject {
         // у соседа значат другое. Привязываем, чтобы применение к чужому
         // роутеру отсеклось до отправки команд.
         let merged = Planner.merge(title: "Обновление списков от \(Format.humanDate(Date()))",
-                                   plans: plans).forRouter(session.router)
-            .forRouter(profile)
+                                   plans: plans).forRouter(profile)
 
         if !failures.isEmpty {
             log(.warn, "Сверка источников: не загрузились — " + failures.joined(separator: "; "))
         }
 
         guard !merged.isEmpty else {
+            if !failures.isEmpty {
+                lastMessage = "Сверка не завершена: не удалось загрузить источники (\(failures.count))."
+                return
+            }
             // Молчим в журнале, когда всё совпало: смысл фоновой проверки в
             // том, чтобы напоминать о себе только когда есть что сказать.
             lastMessage = "Расхождений нет · проверено \(Format.age(lastCheck!))"
@@ -151,10 +176,11 @@ final class AutoUpdater: ObservableObject {
         }
 
         let summary = merged.summary.joined(separator: ", ")
-        lastMessage = summary
+        lastMessage = failures.isEmpty ? summary
+            : "Частичная сверка: \(summary). Не загружено источников: \(failures.count)."
         finding = Finding(plan: merged, routerID: routerID, routerName: routerName, found: Date())
         log(.warn, "Источники разошлись с «\(routerName)»: \(summary). "
-            + "План готов — открой «Списки FQDN».")
+            + "План готов — открой «Списки доменов».")
         notify(router: routerName, summary: summary)
     }
 

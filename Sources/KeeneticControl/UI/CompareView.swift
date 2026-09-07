@@ -40,19 +40,19 @@ struct CompareView: View {
     }
 
     /// Что должно измениться, чтобы пересчитать разницу.
-    private var comparisonKey: String {
+    private var comparisonKey: ComparisonKey? {
         guard let reference,
               let theirs = session.readState(for: reference.id),
-              let ours = session.state else { return "" }
-        return "\(reference.id)|\(ours.readAt.timeIntervalSince1970)"
-             + "|\(theirs.readAt.timeIntervalSince1970)"
+              let ours = session.state else { return nil }
+        return ComparisonKey(active: session.router, reference: reference,
+                             activeReadAt: ours.readAt, referenceReadAt: theirs.readAt)
     }
 
     private func rebuildComparison() {
         guard let reference,
               let theirs = session.readState(for: reference.id),
               let ours = session.state else { comparison = nil; return }
-        comparison = Comparison(reference: reference, theirs: theirs, ours: ours)
+        comparison = Comparison(active: session.router, reference: reference, theirs: theirs, ours: ours)
     }
 
     var body: some View {
@@ -64,7 +64,7 @@ struct CompareView: View {
                     notRead
                 } else if candidates.isEmpty {
                     needSecondRouter
-                } else if let comparison {
+                } else if let comparison, comparison.key == comparisonKey {
                     picker(comparison)
                     summary(comparison)
                     details(comparison)
@@ -75,6 +75,10 @@ struct CompareView: View {
             .padding(20)
         }
         .task(id: comparisonKey) { rebuildComparison() }
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
+            plan = nil
+            outcome = nil
+        }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, applyTitle: "Перенести", state: session.state) { dryRun in
                 plan = nil
@@ -177,6 +181,8 @@ struct CompareView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(name).font(.system(size: 13, weight: .semibold))
+                    .lineLimit(2)
+                    .help(name)
                 StatusPill(text: role, tint: tint)
             }
             Text("\(Format.lists(lists)) · \(Format.domains(domains))")
@@ -300,6 +306,7 @@ struct CompareView: View {
     // MARK: - Действия
 
     private func buildPlan(_ comparison: Comparison) {
+        guard comparison.key == comparisonKey else { rebuildComparison(); return }
         var reserved = Set(comparison.ours.groups.keys)
         let built = Planner.planSync(reference: comparison.theirs.groups,
                                      current: comparison.ours.groups,
@@ -315,11 +322,14 @@ struct CompareView: View {
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {
+        let context = RouterPresentationContext(session.router)
         do {
             let result = try await session.apply(plan: plan, dryRun: dryRun,
                                                  saveConfig: store.settings.saveConfigAfterApply)
+            guard context == RouterPresentationContext(session.router) else { return }
             if result.applied { outcome = result }
         } catch {
+            guard context == RouterPresentationContext(session.router) else { return }
             alert = AlertPayload(title: "Не удалось перенести", message: session.describe(error))
         }
     }
@@ -328,7 +338,15 @@ struct CompareView: View {
 /// Разница между двумя прочитанными роутерами. Считается один раз при
 /// создании: тут тысячи доменов, и пересчёт на каждое обращение из body
 /// заметно тормозил бы отрисовку.
+private struct ComparisonKey: Hashable {
+    let active: RouterProfile
+    let reference: RouterProfile
+    let activeReadAt: Date
+    let referenceReadAt: Date
+}
+
 private struct Comparison {
+    let key: ComparisonKey
     let reference: RouterProfile
     let theirs: RouterState
     let ours: RouterState
@@ -336,7 +354,9 @@ private struct Comparison {
     let extraHere: [String]
     let shared: Int
 
-    init(reference: RouterProfile, theirs: RouterState, ours: RouterState) {
+    init(active: RouterProfile, reference: RouterProfile, theirs: RouterState, ours: RouterState) {
+        key = ComparisonKey(active: active, reference: reference,
+                            activeReadAt: ours.readAt, referenceReadAt: theirs.readAt)
         self.reference = reference
         self.theirs = theirs
         self.ours = ours

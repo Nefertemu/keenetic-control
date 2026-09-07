@@ -11,7 +11,8 @@ struct FqdnView: View {
     @State private var loaded: [String: SourceData] = [:]
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
-    @State private var working = false
+    @State private var preparationID: UUID?
+    private var working: Bool { preparationID != nil }
     @State private var editingSource: CustomSource?
     @State private var manualListEditor = false
     @State private var planApplyTitle = "Загрузить на роутер"
@@ -28,6 +29,19 @@ struct FqdnView: View {
             }
             .padding(20)
         }
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
+            preparationID = nil
+            plan = nil
+            outcome = nil
+            manualListEditor = false
+        }
+        .onChange(of: store.allSources) { _, sources in
+            preparationID = nil
+            let available = Set(sources.map(\.key))
+            selected.formIntersection(available)
+            loaded = loaded.filter { sources.contains($0.value.spec) }
+        }
+        .onDisappear { preparationID = nil }
         .sheet(item: $editingSource) { source in
             SourceEditor(source: source, existing: store.customSources) { saved in
                 editingSource = nil
@@ -44,30 +58,25 @@ struct FqdnView: View {
         }
         .sheet(isPresented: $manualListEditor) {
             ManualListEditor { ident, description, entries in
-                do {
-                    guard let state = session.state else {
-                        throw TransportError("Сначала прочитай конфигурацию роутера.",
-                                             hint: "Так приложение сможет проверить, что имя списка ещё свободно.")
-                    }
-                    let cleanIdent = ident.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !state.groups.keys.contains(where: {
-                        $0.caseInsensitiveCompare(cleanIdent) == .orderedSame
-                    }) else {
-                        throw TransportError("Список «\(cleanIdent)» уже есть на роутере.",
-                                             hint: "Выбери другое имя или управляй существующим списком на вкладке «Маршруты».")
-                    }
-                    let built = try ManualFqdnPlanner.plan(
-                        ident: cleanIdent, description: description, entriesText: entries)
-                    planApplyTitle = "Создать список"
-                    plan = built.forRouter(session.router)
-                    // Закрываем редактор только после успешной проверки.
-                    // При ошибке человек остаётся в форме и может исправить
-                    // одну строку, не вводя весь список заново.
-                    manualListEditor = false
-                } catch {
-                    alert = AlertPayload(title: "Список не создан",
-                                         message: session.describe(error))
+                guard let state = session.state else {
+                    throw TransportError("Сначала прочитай конфигурацию роутера.",
+                                         hint: "Так приложение сможет проверить, что имя списка ещё свободно.")
                 }
+                let cleanIdent = ident.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !state.groups.keys.contains(where: {
+                    $0.caseInsensitiveCompare(cleanIdent) == .orderedSame
+                }) else {
+                    throw TransportError("Список «\(cleanIdent)» уже есть на роутере.",
+                                         hint: "Выбери другое имя или управляй существующим списком на вкладке «Маршруты».")
+                }
+                let built = try ManualFqdnPlanner.plan(
+                    ident: cleanIdent, description: description, entriesText: entries)
+                planApplyTitle = "Создать список"
+                plan = built.forRouter(session.router)
+                // Закрываем редактор только после успешной проверки.
+                // При ошибке человек остаётся в форме и может исправить
+                // одну строку, не вводя весь список заново.
+                manualListEditor = false
             } onCancel: { manualListEditor = false }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
@@ -203,6 +212,8 @@ struct FqdnView: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(spec.title).font(.system(size: 13, weight: .semibold))
+                        .lineLimit(2)
+                        .help(spec.title)
                     Text(spec.subtitle)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
@@ -225,12 +236,10 @@ struct FqdnView: View {
             }
 
             if let data {
-                HStack(spacing: 6) {
-                    StatusPill(text: "\(data.entries.count) записей", tint: Palette.success)
-                    if data.subnetCount > 0 {
-                        StatusPill(text: "\(data.subnetCount) подсетей", tint: Palette.accent)
-                    }
-                    StatusPill(text: data.freshness, tint: .secondary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) { sourceDataBadges(data) }
+                        .fixedSize(horizontal: true, vertical: false)
+                    VStack(alignment: .leading, spacing: 6) { sourceDataBadges(data) }
                 }
             } else if !spec.subnetURLs.isEmpty {
                 StatusPill(text: "домены + подсети", tint: .secondary)
@@ -264,6 +273,15 @@ struct FqdnView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func sourceDataBadges(_ data: SourceData) -> some View {
+        StatusPill(text: "\(data.entries.count) записей", tint: Palette.success)
+        if data.subnetCount > 0 {
+            StatusPill(text: "\(data.subnetCount) подсетей", tint: Palette.accent)
+        }
+        StatusPill(text: data.freshness, tint: .secondary)
     }
 
     /// Свой ли это источник — по нему доступны правка и удаление.
@@ -352,11 +370,22 @@ struct FqdnView: View {
     // MARK: - Действия
 
     private func buildPlan() async {
-        working = true
-        defer { working = false }
+        guard preparationID == nil else { return }
+        let requestID = UUID()
+        preparationID = requestID
+        defer { if preparationID == requestID { preparationID = nil } }
         planApplyTitle = "Загрузить на роутер"
         let operation = session.beginOperation()
         let profile = session.router
+        let sources = store.allSources.filter { selected.contains($0.key) }
+        let settings = store.settings
+        let removeStale = removeStale
+        let forceRefresh = forceRefresh
+        func isRelevant() -> Bool {
+            preparationID == requestID && session.activeRouterID == operation.routerID
+                && session.isCurrent(operation)
+        }
+        guard !sources.isEmpty else { return }
         let conflicts = CustomSource.conflictingSourceTitles(store.allSources)
         guard conflicts.isEmpty else {
             alert = AlertPayload(
@@ -379,23 +408,22 @@ struct FqdnView: View {
             var reserved = Set(state.groups.keys)
             var fetched: [String: SourceData] = loaded
 
-            for spec in store.allSources where selected.contains(spec.key) {
-                guard session.isCurrent(operation) else {
-                    throw TransportError("Профиль роутера изменился во время подготовки плана.",
-                                         hint: "Повтори загрузку для обновлённого профиля.")
-                }
+            for spec in sources {
+                guard isRelevant() else { return }
                 let data = try await session.loadSource(spec, forceRefresh: forceRefresh)
+                guard isRelevant() else { return }
                 fetched[spec.key] = data
                 log(.info, "\(spec.title): \(data.entries.count) записей, \(data.freshness).")
 
                 plans.append(Planner.planImport(
                     groups: state.groups,
                     data: data,
-                    chunkSize: store.settings.chunkSize,
+                    chunkSize: settings.chunkSize,
                     removeStale: removeStale,
                     reservedIDs: &reserved))
             }
 
+            guard isRelevant() else { return }
             loaded = fetched
 
             let merged = Planner.merge(
@@ -409,25 +437,22 @@ struct FqdnView: View {
                     isError: false)
                 return
             }
-            guard session.isCurrent(operation) else {
-                alert = AlertPayload(
-                    title: "Роутер переключён",
-                    message: "План был рассчитан по конфигурации другого роутера. Выбери источники и составь его заново.",
-                    isError: false)
-                return
-            }
             plan = merged.forRouter(profile)
         } catch {
+            guard isRelevant() else { return }
             alert = AlertPayload(title: "Не удалось составить план", message: session.describe(error))
         }
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {
+        let context = RouterPresentationContext(session.router)
         do {
             let result = try await session.apply(plan: plan, dryRun: dryRun,
                                                  saveConfig: store.settings.saveConfigAfterApply)
+            guard context == RouterPresentationContext(session.router) else { return }
             if result.applied { outcome = result }
         } catch {
+            guard context == RouterPresentationContext(session.router) else { return }
             alert = AlertPayload(title: "Не удалось применить план", message: session.describe(error))
         }
     }
@@ -579,8 +604,9 @@ struct ManualListEditor: View {
     @State private var ident = "test"
     @State private var description = "test"
     @State private var entries = "2ip.io\nwhoer.net"
+    @State private var error: String?
 
-    var onSave: (_ ident: String, _ description: String, _ entries: String) -> Void
+    var onSave: (_ ident: String, _ description: String, _ entries: String) throws -> Void
     var onCancel: () -> Void
 
     var body: some View {
@@ -615,13 +641,24 @@ struct ManualListEditor: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if let error {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Button("Отмена", action: onCancel)
                     .buttonStyle(SubtleButtonStyle())
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Показать план") {
-                    onSave(ident, description, entries)
+                    do {
+                        try onSave(ident, description, entries)
+                    } catch {
+                        self.error = (error as? TransportError)?.message ?? error.localizedDescription
+                    }
                 }
                 .buttonStyle(PrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)

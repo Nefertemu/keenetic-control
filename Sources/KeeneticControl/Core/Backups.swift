@@ -7,7 +7,7 @@ enum Backups {
     }
 
     private static let namePattern = try! NSRegularExpression(
-        pattern: "^(.+)_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}_running-config$")
+        pattern: "^(.+)_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}(?:_[A-Fa-f0-9-]{36})?_running-config$")
 
     /// Чей это снимок. Снимки всех роутеров лежат в одной папке, и без
     /// разбора имени их не отфильтровать.
@@ -16,12 +16,17 @@ enum Backups {
         return RouterConfigParser.capture(namePattern, in: name, group: 1) ?? ""
     }
 
+    /// Два плана могут создать снимки в одну секунду. Идентификатор не даёт
+    /// второму снимку затереть первый, включая одновременные подключения.
+    static func runningConfigFilename(host: String, date: Date = Date(),
+                                      identifier: UUID = UUID()) -> String {
+        "\(safeHost(host))_\(Format.stamp(date))_\(identifier.uuidString)_running-config.\(SecureBackup.pathExtension)"
+    }
+
     @discardableResult
     static func saveRunningConfig(host: String, text: String, keep: Int) -> URL? {
         let safeHost = safeHost(host)
-        let url = AppPaths.backups
-            .appendingPathComponent("\(safeHost)_\(Format.stamp())_running-config")
-            .appendingPathExtension(SecureBackup.pathExtension)
+        let url = AppPaths.backups.appendingPathComponent(runningConfigFilename(host: host))
 
         do { try SecureBackup.write(text, to: url) }
         catch {

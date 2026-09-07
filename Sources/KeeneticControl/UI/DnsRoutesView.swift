@@ -20,11 +20,7 @@ struct DnsRoutesView: View {
     @State private var selection: Set<String> = []
     @State private var filter: Filter = .all
     @State private var query = ""
-    @State private var interfaceIdent = ""
-    /// Интерфейсы для резервирования — порядок массива равен порядку
-    /// маршрутов в итоговом плане.
-    @State private var interfaceOrder: [String] = []
-    @State private var addInterfaceIdent = ""
+    @State private var interfaces = FailoverInterfaceDraft()
     @State private var useAuto = Store.shared.settings.defaultAuto
     @State private var useReject = Store.shared.settings.defaultReject
     @State private var plan: Plan?
@@ -45,16 +41,16 @@ struct DnsRoutesView: View {
                 // «Без маршрута» означает отсутствие именно на выбранном
                 // интерфейсе. Раньше список исчезал только когда у него не
                 // было маршрутов вообще, что мешало строить резервирование.
-                matchesFilter = interfaceIdent.isEmpty
+                matchesFilter = interfaces.selected.isEmpty
                     ? group.routeLines.isEmpty
-                    : !group.isRouted(to: interfaceIdent)
+                    : !group.isRouted(to: interfaces.selected)
             case .routed:
                 // Симметрично с «Нет на интерфейсе»: когда интерфейс выбран,
                 // показываем только списки, у которых маршрут есть именно на
                 // нём, а не любой маршрут на роутере.
-                matchesFilter = interfaceIdent.isEmpty
+                matchesFilter = interfaces.selected.isEmpty
                     ? !group.routeLines.isEmpty
-                    : group.isRouted(to: interfaceIdent)
+                    : group.isRouted(to: interfaces.selected)
             }
             let matchesQuery = query.isEmpty
                 || group.ident.localizedCaseInsensitiveContains(query)
@@ -100,28 +96,20 @@ struct DnsRoutesView: View {
             filter = .all
             query = wanted
         }
-        .onChange(of: interfaceIdent) { _, newIdent in
-            // В обычном (одноинтерфейсном) сценарии выбор сверху остаётся
-            // единственной целью. Когда в редакторе уже собрана цепочка из
-            // нескольких интерфейсов, не переписываем её случайной сменой
-            // фильтра.
-            if interfaceOrder.count <= 1 {
-                interfaceOrder = newIdent.isEmpty ? [] : [newIdent]
-            }
-        }
-        .onChange(of: session.router.id) { _, _ in
-            // Идентификаторы списков у роутеров свои: чужое выделение
-            // здесь ничего не значит и только вводит в заблуждение.
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
             selection.removeAll()
             query = ""
-            interfaceOrder.removeAll()
-            addInterfaceIdent = ""
+            interfaces = FailoverInterfaceDraft()
+            savingProfile = false
+            confirmDelete = false
+            plan = nil
+            outcome = nil
             pickDefaultInterface()
         }
         .sheet(isPresented: $savingProfile) {
             VStack(alignment: .leading, spacing: 14) {
                 CardHeader(icon: "bookmark", title: "Сохранить порядок",
-                           subtitle: interfaceOrder.map(interfaceShortLabel)
+                           subtitle: interfaces.order.map(interfaceShortLabel)
                                .joined(separator: " → "))
                 TextField("например, основная цепочка", text: $profileName)
                     .textFieldStyle(.roundedBorder)
@@ -211,7 +199,7 @@ struct DnsRoutesView: View {
         VStack(alignment: .leading, spacing: 5) {
             Text("Показывать маршруты для")
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-            Picker("", selection: $interfaceIdent) {
+            Picker("", selection: Binding(get: { interfaces.selected }, set: { interfaces.select($0) })) {
                 Text("— выбери —").tag("")
                 ForEach(session.state?.candidates ?? []) { item in
                     Text(item.displayName + (item.isUp ? " ✓" : "")).tag(item.ident)
@@ -262,14 +250,14 @@ struct DnsRoutesView: View {
     private var assignRoutesButton: some View {
         Button("Назначить по порядку") { buildRoutePlan() }
             .buttonStyle(PrimaryButtonStyle())
-            .disabled(selectedGroups.isEmpty || (interfaceOrder.isEmpty && interfaceIdent.isEmpty)
+            .disabled(selectedGroups.isEmpty || interfaces.order.isEmpty
                       || session.progress != nil)
     }
 
     private var unrouteButton: some View {
         Button("Снять") { buildUnroutePlan() }
             .buttonStyle(SubtleButtonStyle())
-            .disabled(selectedGroups.isEmpty || interfaceIdent.isEmpty
+            .disabled(selectedGroups.isEmpty || interfaces.selected.isEmpty
                       || session.progress != nil)
     }
 
@@ -298,12 +286,12 @@ struct DnsRoutesView: View {
                 }
             }
 
-            if interfaceOrder.isEmpty {
+            if interfaces.order.isEmpty {
                 Text("Добавь один или несколько интерфейсов. Первый в списке будет основным, остальные — резервными.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 0) {
-                    ForEach(Array(interfaceOrder.enumerated()), id: \.element) { index, ident in
+                    ForEach(Array(interfaces.order.enumerated()), id: \.element) { index, ident in
                         HStack(spacing: 8) {
                             Text(String(index + 1))
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -328,12 +316,12 @@ struct DnsRoutesView: View {
                                 Image(systemName: "chevron.down")
                             }
                             .buttonStyle(.plain)
-                            .foregroundStyle(index == interfaceOrder.count - 1
+                            .foregroundStyle(index == interfaces.order.count - 1
                                               ? Color.secondary.opacity(0.35) : Palette.accent)
-                            .disabled(index == interfaceOrder.count - 1)
+                            .disabled(index == interfaces.order.count - 1)
                             .help("Опустить ниже")
                             Button {
-                                interfaceOrder.remove(at: index)
+                                interfaces.order.remove(at: index)
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
                             }
@@ -342,7 +330,7 @@ struct DnsRoutesView: View {
                             .help("Убрать из порядка")
                         }
                         .padding(.vertical, 6)
-                        if index < interfaceOrder.count - 1 { Divider() }
+                        if index < interfaces.order.count - 1 { Divider() }
                     }
                 }
                 .padding(.horizontal, 10)
@@ -350,7 +338,7 @@ struct DnsRoutesView: View {
             }
 
             HStack(spacing: 8) {
-                Picker("", selection: $addInterfaceIdent) {
+                Picker("", selection: $interfaces.pending) {
                     Text("Добавить интерфейс…").tag("")
                     ForEach(availableInterfaces) { item in
                         Text(item.displayName).tag(item.ident)
@@ -359,12 +347,10 @@ struct DnsRoutesView: View {
                 .labelsHidden()
                 .frame(minWidth: 180, idealWidth: 280, maxWidth: 320)
                 Button("Добавить") {
-                    guard !addInterfaceIdent.isEmpty else { return }
-                    interfaceOrder.append(addInterfaceIdent)
-                    addInterfaceIdent = ""
+                    interfaces.appendPending(available: availableInterfaces.map(\.ident))
                 }
                 .buttonStyle(SubtleButtonStyle())
-                .disabled(addInterfaceIdent.isEmpty)
+                .disabled(interfaces.pending.isEmpty)
                 Spacer()
             }
         }
@@ -400,7 +386,7 @@ struct DnsRoutesView: View {
                 Divider()
             }
             Button("Сохранить текущий порядок…") { profileName = ""; savingProfile = true }
-                .disabled(interfaceOrder.isEmpty)
+                .disabled(interfaces.order.isEmpty)
         } label: {
             Label("Профили", systemImage: "bookmark")
         }
@@ -423,9 +409,7 @@ struct DnsRoutesView: View {
     private func applyProfile(_ profile: FailoverProfile) {
         let available = (session.state?.candidates ?? []).map(\.ident)
         let resolved = profile.resolve(against: available)
-        interfaceOrder = resolved.present
-        if let first = resolved.present.first { interfaceIdent = first }
-        addInterfaceIdent = ""
+        interfaces.apply(resolved.present)
         if !resolved.missing.isEmpty {
             alert = AlertPayload(
                 title: "Профиль применён не полностью",
@@ -438,7 +422,7 @@ struct DnsRoutesView: View {
     private func saveCurrentProfile() {
         let profile = FailoverProfile(name: profileName.trimmingCharacters(in: .whitespaces),
                                       routerID: session.router.id,
-                                      interfaces: interfaceOrder)
+                                      interfaces: interfaces.order)
         do {
             try FailoverProfile.validate(profile, existing: store.failoverProfiles)
             store.saveFailover(profile)
@@ -451,8 +435,8 @@ struct DnsRoutesView: View {
 
     @ViewBuilder
     private var failoverSummary: some View {
-        if !interfaceOrder.isEmpty {
-            Text(interfaceOrder.map(interfaceShortLabel).joined(separator: " → "))
+        if !interfaces.order.isEmpty {
+            Text(interfaces.order.map(interfaceShortLabel).joined(separator: " → "))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Palette.accent)
                 .lineLimit(1)
@@ -461,7 +445,7 @@ struct DnsRoutesView: View {
     }
 
     private var availableInterfaces: [KeeneticInterface] {
-        (session.state?.candidates ?? []).filter { !interfaceOrder.contains($0.ident) }
+        (session.state?.candidates ?? []).filter { !interfaces.order.contains($0.ident) }
     }
 
     private func interfaceLabel(_ ident: String) -> String {
@@ -474,8 +458,8 @@ struct DnsRoutesView: View {
 
     private func moveInterface(at index: Int, by offset: Int) {
         let target = index + offset
-        guard interfaceOrder.indices.contains(index), interfaceOrder.indices.contains(target) else { return }
-        interfaceOrder.swapAt(index, target)
+        guard interfaces.order.indices.contains(index), interfaces.order.indices.contains(target) else { return }
+        interfaces.order.swapAt(index, target)
     }
 
     private func resetScrollPosition(_ proxy: ScrollViewProxy) {
@@ -630,7 +614,10 @@ struct DnsRoutesView: View {
             Text(group.ident)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
                 .frame(width: 130, alignment: .leading)
+                .help(group.ident)
 
             Text(String(group.count))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -645,7 +632,7 @@ struct DnsRoutesView: View {
                     // «Dataforest · Wireguard0» — в подсказке.
                     ForEach(group.routedInterfaces.prefix(3), id: \.self) { target in
                         StatusPill(text: session.state?.shortLabel(for: target) ?? target,
-                                   tint: target == interfaceIdent ? Palette.success : Palette.accent)
+                                   tint: target == interfaces.selected ? Palette.success : Palette.accent)
                             .help(session.state?.label(for: target) ?? target)
                     }
                     if group.routedInterfaces.count > 3 {
@@ -668,24 +655,15 @@ struct DnsRoutesView: View {
 
     private func pickDefaultInterface() {
         let candidates = session.state?.candidates ?? []
-        if !interfaceIdent.isEmpty && candidates.contains(where: { $0.ident == interfaceIdent }) {
-            interfaceOrder = interfaceOrder.filter { orderedIdent in
-                candidates.contains { candidate in candidate.ident == orderedIdent }
-            }
-            if interfaceOrder.isEmpty { interfaceOrder = [interfaceIdent] }
-            return
-        }
-        // По умолчанию — первый VPN-интерфейс: чаще всего маршруты нужны именно туда.
-        interfaceIdent = candidates.first(where: { $0.isVPN })?.ident
-            ?? candidates.first?.ident
-            ?? ""
-        interfaceOrder = interfaceIdent.isEmpty ? [] : [interfaceIdent]
-        addInterfaceIdent = ""
+        interfaces.reconcile(available: candidates.map(\.ident),
+                             preferred: candidates.first(where: { $0.isVPN })?.ident
+                                 ?? candidates.first?.ident)
+        selection.formIntersection(Set(session.state?.groups.keys.map { $0 } ?? []))
     }
 
     private func buildRoutePlan() {
-        let ordered = interfaceOrder.isEmpty && !interfaceIdent.isEmpty
-            ? [interfaceIdent] : interfaceOrder
+        let ordered = interfaces.order
+        guard !ordered.isEmpty else { return }
         // Кнопка одна и называется «по порядку», значит и смысл у неё один:
         // список направляется РОВНО на перечисленные интерфейсы. Раньше при
         // единственном интерфейсе она молча переключалась на «добавить к
@@ -703,10 +681,10 @@ struct DnsRoutesView: View {
     }
 
     private func buildUnroutePlan() {
-        let built = Planner.planUnroute(groups: selectedGroups, interface: interfaceIdent)
+        let built = Planner.planUnroute(groups: selectedGroups, interface: interfaces.selected)
         if built.isEmpty {
             alert = AlertPayload(title: "Снимать нечего",
-                                 message: "Ни один из выбранных списков не направлен на \(interfaceIdent).",
+                                 message: "Ни один из выбранных списков не направлен на \(interfaces.selected).",
                                  isError: false)
             return
         }
@@ -714,14 +692,17 @@ struct DnsRoutesView: View {
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {
+        let context = RouterPresentationContext(session.router)
         do {
             let result = try await session.apply(plan: plan, dryRun: dryRun,
                                                  saveConfig: store.settings.saveConfigAfterApply)
+            guard context == RouterPresentationContext(session.router) else { return }
             if result.applied {
                 outcome = result
                 selection.removeAll()
             }
         } catch {
+            guard context == RouterPresentationContext(session.router) else { return }
             alert = AlertPayload(title: "Не удалось применить", message: session.describe(error))
         }
     }

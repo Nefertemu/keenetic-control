@@ -61,6 +61,8 @@ struct PlanSheet: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(plan.title).font(.system(size: 15, weight: .semibold))
+                    .lineLimit(2)
+                    .help(plan.title)
                 Text("Будет отправлено \(Format.commands(plan.commands.count))")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -79,14 +81,15 @@ struct PlanSheet: View {
     /// это можно, но никто не станет — а именно эта разница и есть то,
     /// ради чего план открывают.
     private var changesCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let rows = changes
+        return VStack(alignment: .leading, spacing: 10) {
             CardHeader(icon: "arrow.left.arrow.right", title: "Что изменится",
                        subtitle: "Состояние списков до и после применения")
 
             VStack(spacing: 0) {
-                ForEach(changes) { row in
+                ForEach(rows) { row in
                     changeRow(row)
-                    if row.id != changes.last?.id { Divider() }
+                    if row.id != rows.last?.id { Divider() }
                 }
             }
             .padding(.horizontal, 12)
@@ -108,6 +111,8 @@ struct PlanSheet: View {
                 Text(row.ident)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .help(row.ident)
             }
 
             if row.domainsChanged {
@@ -215,7 +220,7 @@ struct PlanSheet: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 2) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(Array(visibleCommands.enumerated()), id: \.offset) { index, command in
                     HStack(spacing: 8) {
                         Text(String(index + 1))
@@ -333,6 +338,8 @@ struct OutcomeSheet: View {
                     Text(isClean ? "Готово" : "Применено с замечаниями")
                         .font(.system(size: 16, weight: .semibold))
                     Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .help(title)
                 }
                 Spacer()
             }
@@ -348,11 +355,21 @@ struct OutcomeSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Проверка нашла расхождения")
                         .font(.system(size: 12, weight: .semibold))
-                    ForEach(Array(outcome.problems.enumerated()), id: \.offset) { _, problem in
-                        Text("• " + problem)
-                            .font(.system(size: 11, design: .monospaced))
-                            .fixedSize(horizontal: false, vertical: true)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(outcome.problems.enumerated()), id: \.offset) { _, problem in
+                                Text("• " + problem)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
                     }
+                    .frame(height: min(280, max(90, CGFloat(outcome.problems.count) * 48)))
+                    // AppKit can redraw a scrolled LazyVStack outside its
+                    // viewport, covering the sheet header and footer.
+                    .clipped()
                 }
                 .padding(12)
                 .inset()

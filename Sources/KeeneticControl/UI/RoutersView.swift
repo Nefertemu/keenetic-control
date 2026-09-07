@@ -13,6 +13,8 @@ struct RoutersView: View {
     /// nil — ещё не спрашивали: пока проверка идёт, писать «нет пароля»
     /// нельзя, это выглядит как поломка на ровном месте.
     @State private var havePassword: Set<UUID>?
+    @State private var passwordCheckID: UUID?
+    @State private var savingProfiles: Set<UUID> = []
     @ObservedObject private var updater = AutoUpdater.shared
     @ObservedObject private var appUpdates = UpdateChecker.shared
 
@@ -30,6 +32,7 @@ struct RoutersView: View {
         .sheet(item: $editing) { profile in
             RouterEditor(profile: profile) { updated, password in
                 let activeBeforeSave = session.activeRouterID
+                savingProfiles.insert(updated.id)
                 editing = nil
                 if store.routers.contains(where: { $0.id == updated.id }) {
                     store.update(updated)
@@ -42,6 +45,7 @@ struct RoutersView: View {
                 // ключей, чтобы команды не ушли по прежнему адресу.
                 session.profileDidChange(updated)
                 Task {
+                    defer { savingProfiles.remove(updated.id) }
                     if let password {
                         await Task.detached { updated.password = password }.value
                         // Учётные данные поменялись — открытая сессия держит
@@ -128,10 +132,13 @@ struct RoutersView: View {
 
     private func refreshPasswordFlags() {
         let known = store.routers
+        let requestID = UUID()
+        passwordCheckID = requestID
         Task {
             let ids = await Task.detached {
                 Set(known.filter { $0.password?.isEmpty == false }.map(\.id))
             }.value
+            guard passwordCheckID == requestID else { return }
             havePassword = ids
         }
     }
@@ -227,6 +234,7 @@ struct RoutersView: View {
             .foregroundStyle(Palette.danger)
             .disabled(store.routers.count <= 1)
         }
+        .disabled(savingProfiles.contains(router.id))
     }
 
     // MARK: - Настройки

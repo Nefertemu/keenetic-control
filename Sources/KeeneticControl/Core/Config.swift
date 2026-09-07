@@ -109,6 +109,22 @@ struct RouterProfile: Identifiable, Codable, Hashable {
         }
     }
 
+    /// Адрес владельца резервной копии. У RCI поле host может оставаться
+    /// старым SSH-адресом: фактический роутер определяется адресом веб-панели.
+    /// Для SSH и RCI на том же адресе сохраняем прежний префикс файлов.
+    var backupHost: String {
+        guard transport == .http,
+              let components = URLComponents(string: effectiveWebURL),
+              var address = components.host, !address.isEmpty else { return host }
+        if address.hasPrefix("["), address.hasSuffix("]") {
+            address = String(address.dropFirst().dropLast())
+        }
+        if address.caseInsensitiveCompare(host) == .orderedSame { address = host }
+        let defaultPort = components.scheme?.lowercased() == "https" ? 443 : 80
+        if let port = components.port, port != defaultPort { return "\(address):\(port)" }
+        return address
+    }
+
     /// По чему судим, что профиль изменился настолько, что старое
     /// соединение к нему уже не относится.
     var connectionKey: String {

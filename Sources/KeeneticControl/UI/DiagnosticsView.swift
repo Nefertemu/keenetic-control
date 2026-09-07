@@ -2,21 +2,22 @@ import SwiftUI
 
 struct DiagnosticsView: View {
     @EnvironmentObject private var session: RouterSession
+    @Environment(\.liveRouterReadsEnabled) private var liveReadsEnabled
     @Binding var alert: AlertPayload?
 
     @State private var interfaceIdent = ""
     @State private var target = ""
-    @State private var report: RouterDiagnosticsReport?
-    @State private var running = false
-    @State private var lastError: String?
+    @StateObject private var reading = LatestReadController<DiagnosticsInput, DiagnosticsReadResult>()
 
-    private var interfaces: [String] {
-        session.state?.wireguardInterfaces ?? []
-    }
-
-    /// Что должно измениться, чтобы проверка запустилась заново.
-    private var autoRunKey: String {
-        "\(session.router.id.uuidString)|\(interfaceIdent)|\(target.trimmingCharacters(in: .whitespacesAndNewlines))"
+    private var report: RouterDiagnosticsReport? { reading.value?.report }
+    private var running: Bool { reading.isRunning }
+    private var lastError: String? { reading.error ?? reading.value?.warning }
+    private var interfaces: [String] { session.state?.wireguardInterfaces ?? [] }
+    private var input: DiagnosticsInput {
+        DiagnosticsInput(router: RouterPresentationContext(session.router),
+                         interface: interfaceIdent,
+                         target: target.trimmingCharacters(in: .whitespacesAndNewlines),
+                         configText: session.state?.configText ?? "")
     }
 
     var body: some View {
@@ -38,6 +39,9 @@ struct DiagnosticsView: View {
                     controls
                     if let report {
                         reportCard(report)
+                    } else if let lastError {
+                        EmptyHint(icon: "exclamationmark.triangle", title: "Проверка не завершилась",
+                                  message: lastError).card(padding: 24)
                     } else {
                         EmptyHint(icon: "waveform.path.ecg",
                                   title: "Проверка ещё не запускалась",
@@ -53,8 +57,8 @@ struct DiagnosticsView: View {
         // интерфейса или цели. Раньше результат приходилось выбивать кнопкой,
         // а первый клик после ввода уходил на снятие фокуса с поля — и на
         // экране оставался отчёт по ПРЕДЫДУЩЕЙ цели, выглядевший свежим.
-        .task(id: autoRunKey) {
-            guard !interfaceIdent.isEmpty, !target.isEmpty, session.state != nil else { return }
+        .task(id: input) {
+            guard !interfaceIdent.isEmpty, session.state != nil else { return }
             do { try await Task.sleep(nanoseconds: 700_000_000) } catch { return }
             guard !Task.isCancelled else { return }
             await run()
@@ -63,22 +67,13 @@ struct DiagnosticsView: View {
             if !interfaces.contains(interfaceIdent) { syncDefaults(force: true) }
             else if target.isEmpty { syncTarget() }
         }
-        .onChange(of: interfaceIdent) { _, _ in
-            report = nil
-            lastError = nil
-            syncTarget()
-        }
-        .onChange(of: session.router.id) { _, _ in
-            report = nil
-            lastError = nil
+        .onChange(of: interfaceIdent) { _, _ in syncTarget() }
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
+            reading.reset()
             syncDefaults(force: true)
         }
-        .alert(item: Binding(get: {
-            lastError.map { AlertPayload(title: "Диагностика не завершилась", message: $0) }
-        }, set: { _ in lastError = nil })) { payload in
-            Alert(title: Text(payload.title), message: Text(payload.message),
-                  dismissButton: .default(Text("Понятно")))
-        }
+        .onChange(of: input) { _, current in reading.invalidate(for: current) }
+        .onDisappear { reading.reset() }
     }
 
     private var controls: some View {
@@ -116,6 +111,7 @@ struct DiagnosticsView: View {
                     Text(session.state?.label(for: ident) ?? ident).tag(ident)
                 }
             }
+            .labelsHidden()
             .frame(minWidth: 190, idealWidth: 250, maxWidth: 320)
         }
     }
@@ -194,12 +190,12 @@ struct DiagnosticsView: View {
         guard let first = interfaces.first else {
             interfaceIdent = ""
             target = ""
-            report = nil
+            reading.reset()
             return
         }
         if force || !interfaces.contains(interfaceIdent) { interfaceIdent = first }
         syncTarget()
-        if force { report = nil }
+        if force { reading.reset() }
     }
 
     private func syncTarget() {
@@ -213,32 +209,34 @@ struct DiagnosticsView: View {
     }
 
     private func run() async {
-        let selectedInterface = interfaceIdent
-        guard !selectedInterface.isEmpty, session.state != nil else { return }
-        running = true
-        lastError = nil
-        defer { running = false }
-
-        if session.status.isOnline {
-            do {
-                _ = try await session.refreshLiveInterface(selectedInterface)
-            } catch is CancellationError {
-                return
-            } catch {
-                // Диагностика всё равно полезна по последнему снимку; ошибку
-                // показываем под результатом, не пряча уже собранные данные.
-                lastError = session.describe(error)
+        let request = input
+        guard !request.interface.isEmpty, session.state != nil, session.progress == nil else { return }
+        let operation = session.beginOperation()
+        await reading.load(for: request) {
+            var warning: String?
+            if session.status.isOnline && liveReadsEnabled {
+                do {
+                    _ = try await session.refreshLiveInterface(request.interface)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    warning = session.describe(error)
+                }
+            } else if !session.status.isOnline {
+                warning = "Роутер не подключён — показан последний прочитанный снимок."
+            } else {
+                warning = "Показан сохранённый снимок без сетевой проверки."
             }
-        } else {
-            lastError = "Роутер не подключён — показан последний прочитанный снимок."
+            try Task.checkCancellation()
+            guard session.isCurrent(operation), request == input,
+                  let state = session.state else { throw CancellationError() }
+            return DiagnosticsReadResult(
+                report: RouterDiagnosticsBuilder.build(state: state, interface: request.interface,
+                                                       target: request.target),
+                warning: warning)
         }
-
-        guard !Task.isCancelled, selectedInterface == interfaceIdent,
-              let state = session.state else { return }
-        report = RouterDiagnosticsBuilder.build(state: state,
-                                                interface: selectedInterface,
-                                                target: target)
     }
+
 }
 
 struct DiagnosticCheckCard: View {

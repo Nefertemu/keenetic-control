@@ -75,6 +75,10 @@ final class RouterSession: ObservableObject {
     func apply(plan: Plan, dryRun: Bool, saveConfig: Bool) async throws -> ApplyOutcome {
         try await executor.apply(plan: plan, dryRun: dryRun, saveConfig: saveConfig)
     }
+    func withExclusiveWriteOperation<T>(operation: RouterOperation,
+                                        _ body: @MainActor () async throws -> T) async throws -> T {
+        try await executor.withExclusiveWriteOperation(operation: operation, body)
+    }
     @discardableResult
     func runCommands(_ commands: [String], title: String, saveConfig: Bool = true) async throws -> String {
         try await executor.runCommands(commands, title: title, saveConfig: saveConfig)

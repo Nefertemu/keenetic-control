@@ -35,11 +35,18 @@ struct StaticRoutesView: View {
             table
         }
         .padding(20)
-        .onChange(of: session.router.id) { _, _ in
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
             // Маршруты у роутеров разные — чужое выделение здесь ничего
             // не значит, а кнопка «Удалить выбранные» выглядела активной.
             selection.removeAll()
             query = ""
+            showAdd = false
+            showImport = false
+            plan = nil
+            outcome = nil
+        }
+        .onChange(of: session.state?.readAt) { _, _ in
+            selection.formIntersection(Set(session.state?.staticRoutes.map(\.id) ?? []))
         }
         .sheet(isPresented: $showAdd) {
             RouteEditor(interfaces: session.state?.candidates ?? []) { route in
@@ -166,6 +173,7 @@ struct StaticRoutesView: View {
         HStack(spacing: 10) {
             Button("Импорт из BAT/TXT…") { importFile() }
                 .buttonStyle(SubtleButtonStyle())
+                .disabled(session.state == nil || session.progress != nil)
 
             Menu(selectedRoutes.isEmpty ? "Экспорт" : "Экспорт выбранных") {
                 Button("В BAT для Windows…") { export(bat: true) }
@@ -298,6 +306,7 @@ struct StaticRoutesView: View {
                 built.commands = [route.deleteCommand]
                 plan = built.forRouter(session.router)
             }
+            .disabled(session.progress != nil)
         }
     }
 
@@ -377,14 +386,17 @@ struct StaticRoutesView: View {
     }
 
     private func apply(_ plan: Plan, dryRun: Bool) async {
+        let context = RouterPresentationContext(session.router)
         do {
             let result = try await session.apply(plan: plan, dryRun: dryRun,
                                                  saveConfig: store.settings.saveConfigAfterApply)
+            guard context == RouterPresentationContext(session.router) else { return }
             if result.applied {
                 outcome = result
                 selection.removeAll()
             }
         } catch {
+            guard context == RouterPresentationContext(session.router) else { return }
             alert = AlertPayload(title: "Не удалось применить", message: session.describe(error))
         }
     }

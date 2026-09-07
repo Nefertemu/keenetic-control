@@ -160,4 +160,155 @@ final class RouterPlanTests: XCTestCase {
         XCTAssertEqual(transport.commands, ["show running-config"])
     }
 
+    func testProfileChangePreventsQueuedWriteFromCallingOldTransport() async throws {
+        let gate = TransportGate(), transport = FakeTransport()
+        transport.onRead = { try gate.wait(); return "old configuration" }
+        let fixture = SessionFixture(transport), session = fixture.session()
+        defer { gate.release(); session.disconnectAll() }
+        let read = Task { try await session.readConfigText() }
+        await fulfillment(of: [gate.started], timeout: 2)
+        let queued = expectation(description: "Write enqueued")
+        let write = Task {
+            queued.fulfill()
+            return try await session.runCommands(["must not run"], title: "Old profile")
+        }
+        await fulfillment(of: [queued], timeout: 2)
+        var edited = fixture.profile
+        edited.host = "new.invalid"
+        session.profileDidChange(edited)
+        gate.release()
+        do { _ = try await read.value; XCTFail("Stale read succeeded") } catch {}
+        do { _ = try await write.value; XCTFail("Stale write succeeded") } catch {}
+        XCTAssertEqual(transport.commands, ["show running-config"])
+        XCTAssertEqual(fixture.opened.count, 1)
+    }
+
+    func testBackupAlwaysReadsCurrentConfiguration() async throws {
+        let transport = FakeTransport(), fixture = SessionFixture(transport)
+        transport.onRead = { "hostname changed-in-web-panel" }
+        let session = fixture.session()
+        defer { session.disconnectAll() }
+        session.connections.store(state: RouterState(configText: "hostname cached", readAt: Date()),
+                                  owner: fixture.profile.id)
+        var plan = Plan(title: "Change")
+        plan.commands = ["hostname next"]
+
+        _ = try await session.apply(plan: plan, dryRun: false, saveConfig: false)
+
+        XCTAssertEqual(fixture.backups, ["hostname changed-in-web-panel"])
+        XCTAssertEqual(transport.commands, ["show running-config", "hostname next", "show running-config"])
+    }
+
+    func testEmptyOrRejectedConfigurationPreventsBackupAndWrite() async throws {
+        for invalid in ["", " \n\t", "error: command failed",
+                        "Command::Base error[7405600]: no such command"] {
+            let transport = FakeTransport(), fixture = SessionFixture(transport)
+            transport.onRead = { invalid }
+            let session = fixture.session()
+            defer { session.disconnectAll() }
+            var plan = Plan(title: "Change")
+            plan.commands = ["hostname next"]
+            do {
+                _ = try await session.apply(plan: plan, dryRun: false, saveConfig: true)
+                XCTFail("Invalid backup input allowed a write: \(invalid)")
+            } catch {}
+            XCTAssertTrue(fixture.backups.isEmpty)
+            XCTAssertEqual(transport.commands, ["show running-config"])
+        }
+    }
+
+    func testBackupAcceptsErrorWordsInsideConfigurationValues() async throws {
+        let transport = FakeTransport(), fixture = SessionFixture(transport)
+        let config = "hostname router\ninterface Wireguard0\n description error: резервный туннель\n"
+        transport.onRead = { config }
+        let session = fixture.session()
+        defer { session.disconnectAll() }
+        var plan = Plan(title: "Change")
+        plan.commands = ["hostname next"]
+
+        _ = try await session.apply(plan: plan, dryRun: false, saveConfig: false)
+
+        XCTAssertEqual(fixture.backups, [config])
+        XCTAssertEqual(transport.commands, ["show running-config", "hostname next", "show running-config"])
+    }
+
+    func testExclusiveOperationKeepsWriteLeaseBetweenStages() async throws {
+        let gate = OperationGate(), transport = FakeTransport()
+        let fixture = SessionFixture(transport), session = fixture.session()
+        let operation = session.beginOperation()
+        defer { gate.release(); session.disconnectAll() }
+        let update = Task {
+            try await session.withExclusiveWriteOperation(operation: operation) {
+                _ = try await session.runCommands(["stage one"], title: "Stage one",
+                                                  saveConfig: false, operation: operation)
+                await gate.wait()
+                _ = try await session.runCommands(["stage two"], title: "Stage two",
+                                                  saveConfig: false, operation: operation)
+            }
+        }
+        await fulfillment(of: [gate.started], timeout: 2)
+        XCTAssertNil(session.progress)
+        XCTAssertTrue(session.isBusy(fixture.profile.id), "Lease must stay visible between stages")
+        do {
+            _ = try await session.runCommands(["unrelated"], title: "Unrelated", saveConfig: false)
+            XCTFail("Another writer entered a multi-stage operation")
+        } catch {}
+        gate.release()
+        try await update.value
+        XCTAssertEqual(transport.commands, ["stage one", "stage two"])
+        XCTAssertFalse(session.isBusy(fixture.profile.id))
+        _ = try await session.runCommands(["next"], title: "Next", saveConfig: false)
+        XCTAssertEqual(transport.commands.last, "next")
+    }
+
+    func testCancelledExclusiveOperationReleasesLeaseAndStopsNextStage() async throws {
+        let gate = OperationGate(), transport = FakeTransport()
+        let fixture = SessionFixture(transport), session = fixture.session()
+        let operation = session.beginOperation()
+        defer { gate.release(); session.disconnectAll() }
+        let update = Task {
+            try await session.withExclusiveWriteOperation(operation: operation) {
+                _ = try await session.runCommands(["stage one"], title: "Stage one",
+                                                  saveConfig: false, operation: operation)
+                await gate.wait()
+                _ = try await session.runCommands(["must not run"], title: "Stage two",
+                                                  saveConfig: false, operation: operation)
+            }
+        }
+        await fulfillment(of: [gate.started], timeout: 2)
+        update.cancel()
+        gate.release()
+        do { try await update.value; XCTFail("Cancelled transaction succeeded") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(transport.commands, ["stage one"])
+        XCTAssertFalse(session.isBusy(fixture.profile.id))
+        _ = try await session.runCommands(["next"], title: "Next", saveConfig: false)
+        XCTAssertEqual(transport.commands.last, "next")
+    }
+
+    func testEditedProfileStopsNextStageOfExclusiveOperation() async throws {
+        let gate = OperationGate(), transport = FakeTransport()
+        let fixture = SessionFixture(transport), session = fixture.session()
+        let operation = session.beginOperation()
+        defer { gate.release(); session.disconnectAll() }
+        let update = Task {
+            try await session.withExclusiveWriteOperation(operation: operation) {
+                _ = try await session.runCommands(["stage one"], title: "Stage one",
+                                                  saveConfig: false, operation: operation)
+                await gate.wait()
+                _ = try await session.runCommands(["must not run"], title: "Stage two",
+                                                  saveConfig: false, operation: operation)
+            }
+        }
+        await fulfillment(of: [gate.started], timeout: 2)
+        var edited = fixture.profile
+        edited.host = "new.invalid"
+        session.profileDidChange(edited)
+        gate.release()
+        do { try await update.value; XCTFail("Stale transaction succeeded") } catch {}
+        XCTAssertEqual(transport.commands, ["stage one"])
+        XCTAssertEqual(fixture.opened.count, 1)
+        XCTAssertFalse(session.isBusy(fixture.profile.id))
+    }
+
 }

@@ -91,6 +91,11 @@ enum SecureBackup {
         if isEncrypted(data) {
             return try open(data, keyData: encryptionKey())
         }
+        // Повреждённый заголовок контейнера нельзя читать как legacy-текст:
+        // короткий ASCII-фрагмент иначе выглядит как пустая конфигурация.
+        guard url.pathExtension.lowercased() != pathExtension else {
+            throw SecureBackupError.invalidContainer
+        }
         guard let text = String(data: data, encoding: .utf8) else {
             throw SecureBackupError.unreadableText
         }

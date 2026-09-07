@@ -20,6 +20,17 @@ enum WireGuardService {
     static func safeUpdate(session: RouterSession,
                            interface: String,
                            config: WireGuardConfig) async throws -> WireGuardUpdateResult {
+        let operation = session.beginOperation()
+        let router = session.router
+        return try await session.withExclusiveWriteOperation(operation: operation) {
+            try await safeUpdate(session: session, interface: interface, config: config,
+                                 operation: operation, router: router)
+        }
+    }
+
+    private static func safeUpdate(session: RouterSession, interface: String,
+                                   config: WireGuardConfig, operation: RouterOperation,
+                                   router: RouterProfile) async throws -> WireGuardUpdateResult {
         guard config.peers.count == 1 else {
             throw TransportError(
                 "Безопасное обновление WireGuard работает только с конфигом с одним [Peer].")
@@ -27,9 +38,7 @@ enum WireGuardService {
         var result = WireGuardUpdateResult(interface: interface)
         // Обновление длинное: если за это время переключат роутер, подпись
         // о ходе работы должна остаться у своего.
-        let operation = session.beginOperation()
         let owner = operation.routerID
-        let router = session.router
 
         // --- Снимок «до» -------------------------------------------------
         let configBefore: String
@@ -38,7 +47,7 @@ enum WireGuardService {
             defer { session.setActivity(nil, owner: owner) }
             configBefore = try await session.readConfigText(operation: operation)
             guard let protectedBackup = Backups.saveRunningConfig(
-                host: router.host, text: configBefore,
+                host: router.backupHost, text: configBefore,
                 keep: Store.shared.settings.keepBackups) else {
                 throw TransportError(
                     "Обновление отменено: защищённая резервная копия не создана.",
@@ -48,7 +57,7 @@ enum WireGuardService {
 
             if let startup = try? await session.readStartupConfig(operation: operation) {
                 let url = AppPaths.wireguard.appendingPathComponent(
-                    "\(interface)_\(Format.stamp())_startup-config")
+                    "\(Backups.safeHost(router.backupHost))_\(interface)_\(Format.stamp())_\(UUID().uuidString)_startup-config")
                     .appendingPathExtension(SecureBackup.pathExtension)
                 do {
                     try SecureBackup.write(startup, to: url)
@@ -166,7 +175,9 @@ enum WireGuardService {
     static func rollback(session: RouterSession, interface: String) async throws {
         let operation = session.beginOperation()
         let router = session.router
-        try await rollback(session: session, interface: interface, operation: operation, router: router)
+        try await session.withExclusiveWriteOperation(operation: operation) {
+            try await rollback(session: session, interface: interface, operation: operation, router: router)
+        }
     }
 
     /// Откат всегда возвращает состояние тому же роутеру, на котором началась
@@ -182,7 +193,7 @@ enum WireGuardService {
         log(.warn, "WireGuard \(interface): откат на сохранённую rollback-базу.")
 
         let configBefore = try await session.readConfigText(operation: operation)
-        guard Backups.saveRunningConfig(host: router.host, text: configBefore,
+        guard Backups.saveRunningConfig(host: router.backupHost, text: configBefore,
                                         keep: Store.shared.settings.keepBackups) != nil else {
             throw TransportError(
                 "Откат остановлен: защищённая резервная копия текущего состояния не создана.",

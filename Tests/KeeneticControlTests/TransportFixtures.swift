@@ -28,6 +28,28 @@ final class TransportGate {
     }
 }
 
+/// Пауза между стадиями операции без блокировки очереди транспорта.
+@MainActor
+final class OperationGate {
+    let started = XCTestExpectation(description: "Operation paused between stages")
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation {
+            continuation = $0
+            started.fulfill()
+        }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 final class FakeTransport: KeeneticTransport {
     let kind: TransportKind = .ssh
     private let lock = NSLock()

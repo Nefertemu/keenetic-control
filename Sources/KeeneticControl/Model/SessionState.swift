@@ -188,11 +188,14 @@ struct RouterChange {
                           + " \(Format.lists(difference.missingGroups.count))"
                           + namesSuffix(difference.missingGroups.map(\.ident)))
         }
-        if !difference.extraRouteLines.isEmpty {
-            result.append("назначено маршрутов списков: \(difference.extraRouteLines.count)")
+        if difference.extraRouteCount > 0 {
+            result.append("назначено маршрутов списков: \(difference.extraRouteCount)")
         }
-        if !difference.missingRouteLines.isEmpty {
-            result.append("снято маршрутов списков: \(difference.missingRouteLines.count)")
+        if difference.missingRouteCount > 0 {
+            result.append("снято маршрутов списков: \(difference.missingRouteCount)")
+        }
+        if !difference.reorderedRouteGroups.isEmpty {
+            result.append("изменён порядок маршрутов" + namesSuffix(difference.reorderedRouteGroups))
         }
         if !difference.extraRoutes.isEmpty {
             result.append(Format.agree(difference.extraRoutes.count, "добавлен", "добавлено")
@@ -251,4 +254,3 @@ struct RouterOperation: Equatable {
     let connectionKey: String
     let generation: Int
 }
-

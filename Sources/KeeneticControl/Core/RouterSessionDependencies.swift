@@ -23,7 +23,7 @@ struct RouterSessionDependencies {
             retryDelay: { try await Task.sleep(nanoseconds: 1_500_000_000) },
             settings: { Store.shared.settings },
             backup: { profile, text, keep in
-                Backups.saveRunningConfig(host: profile.host, text: text, keep: keep)
+                Backups.saveRunningConfig(host: profile.backupHost, text: text, keep: keep)
             })
     }
 }

@@ -8,6 +8,7 @@ import SwiftUI
 /// своим состоянием и своим циклом опроса.
 struct TunnelProbeView: View {
     @EnvironmentObject private var session: RouterSession
+    @Environment(\.liveRouterReadsEnabled) private var liveReadsEnabled
     @Binding var alert: AlertPayload?
 
     @State private var probeTarget = "1.1.1.1"
@@ -15,6 +16,7 @@ struct TunnelProbeView: View {
     @State private var probePort = "443"
     @State private var probeResults: [String: InterfacePingResult] = [:]
     @State private var probeRunning = false
+    @State private var requestID = UUID()
     @State private var probeUpdatedAt: Date?
     @State private var probeError: String?
     @ObservedObject private var healthStore = TunnelHealthStore.shared
@@ -29,17 +31,25 @@ struct TunnelProbeView: View {
                               target: probeTarget,
                               refreshSeconds: probeRefreshSeconds)
         }
-        .onChange(of: session.router.id) { _, _ in resetProbe() }
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in resetProbe() }
         .onChange(of: probeTarget) { _, _ in resetProbe() }
         .onChange(of: probeMethod) { _, method in
             probePort = method.usesPort ? String(method.defaultPort) : ""
             resetProbe()
         }
         .onChange(of: probePort) { _, _ in resetProbe() }
-        .task(id: interfaceProbeMonitorID) { await monitorInterfacePings() }
+        .onChange(of: interfaces) { _, _ in resetProbe() }
+        .task(id: probeInput) {
+            guard liveReadsEnabled else { return }
+            do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+            await monitorInterfacePings()
+        }
+        .onDisappear { resetProbe() }
     }
 
     private func resetProbe() {
+        requestID = UUID()
+        probeRunning = false
         probeResults.removeAll()
         probeUpdatedAt = nil
         probeError = nil
@@ -264,19 +274,21 @@ struct TunnelProbeView: View {
     }
 
     private func runInterfacePings() async {
-        guard !probeRunning, session.status.isOnline else { return }
+        guard liveReadsEnabled, !probeRunning, session.status.isOnline, !interfaces.isEmpty else { return }
+        let input = probeInput
+        let operation = session.beginOperation()
         let cleanTarget: String
         do {
             cleanTarget = try InterfacePingProbe.validate(
-                interface: interfaces.first ?? "Wireguard0", target: probeTarget).1
+                interface: input.interfaces.first ?? "Wireguard0", target: input.target).1
         } catch {
             probeError = session.describe(error)
             return
         }
 
         let checkedPort: Int?
-        if probeMethod.usesPort {
-            guard let value = Int(probePort), (1...65535).contains(value) else {
+        if input.method.usesPort {
+            guard let value = Int(input.port), (1...65535).contains(value) else {
                 probeError = "Порт должен быть числом от 1 до 65535."
                 return
             }
@@ -285,44 +297,50 @@ struct TunnelProbeView: View {
             checkedPort = nil
         }
 
-        let owner = session.router.id
-        let targets = interfaces
+        let owner = operation.routerID
+        let request = UUID()
+        requestID = request
         probeRunning = true
         probeError = nil
-        defer { probeRunning = false }
+        defer { if requestID == request { probeRunning = false } }
+        func current() -> Bool {
+            !Task.isCancelled && requestID == request && input == probeInput
+                && session.isCurrent(operation)
+        }
 
-        for ident in targets {
-            guard !Task.isCancelled, owner == session.router.id else { return }
+        for ident in input.interfaces {
+            guard current() else { return }
             do {
                 let result = try await session.ping(interface: ident, target: cleanTarget, count: 1,
-                                                    method: probeMethod, port: checkedPort)
-                guard !Task.isCancelled, owner == session.router.id,
-                      cleanTarget == probeTarget.trimmingCharacters(in: .whitespacesAndNewlines)
-                else { return }
+                                                    method: input.method, port: checkedPort)
+                guard current() else { return }
                 probeResults[ident] = result
                 healthStore.record(routerID: owner, result: result)
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled, owner == session.router.id else { return }
+                guard current() else { return }
                 let failed = InterfacePingResult(
                     interface: ident, target: cleanTarget,
-                    method: probeMethod, port: checkedPort, source: nil,
+                    method: input.method, port: checkedPort, source: nil,
                     transmitted: 0, received: 0, rtt: [], checkedAt: Date(),
                     error: session.describe(error))
                 probeResults[ident] = failed
                 healthStore.record(routerID: owner, result: failed)
             }
         }
-        probeUpdatedAt = Date()
+        if current() { probeUpdatedAt = Date() }
     }
 
     private var probeRefreshSeconds: Int {
         min(300, max(3, store.settings.wireGuardProbeIntervalSeconds))
     }
 
-    private var interfaceProbeMonitorID: String {
-        "\(session.router.id.uuidString)|\(interfaces.joined(separator: ","))|\(probeMethod.rawValue)|\(probeRefreshSeconds)"
+    private var probeInput: TunnelProbeInput {
+        TunnelProbeInput(router: RouterPresentationContext(session.router), interfaces: interfaces,
+                         target: probeTarget.trimmingCharacters(in: .whitespacesAndNewlines),
+                         method: probeMethod, port: probeMethod.usesPort ? probePort : "",
+                         interval: probeRefreshSeconds)
     }
 
     private var latencySeries: [TunnelLatencySeries] {
@@ -331,7 +349,9 @@ struct TunnelProbeView: View {
                                 label: session.state?.shortLabel(for: ident) ?? ident,
                                 colorIndex: index,
                                 samples: healthStore.latencySamples(
-                                    routerID: session.router.id, interface: ident))
+                                    routerID: session.router.id, interface: ident,
+                                    target: probeInput.target, method: probeMethod,
+                                    port: probeMethod.usesPort ? Int(probePort) : nil))
         }
     }
 }

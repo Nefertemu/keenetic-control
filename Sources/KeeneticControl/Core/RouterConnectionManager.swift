@@ -3,21 +3,64 @@ import SwiftUI
 
 /// Отмена может прийти, пока блок ещё ждёт свою очередь. Проверяем её
 /// также внутри очереди, чтобы отменённая запись вообще не вызывала транспорт.
-private final class OperationCancellation {
+/// Все изменяемые поля доступны только под lock; переданные замыкания и
+/// результат perform не сохраняются в объекте. perform вызывается один раз
+/// очередью операции, cancel может приходить с любого потока.
+final class OperationCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var failure: Error?
     private var started = false
+    private var finished = false
 
     /// Не прерываем чужую операцию, если наша ещё ждёт в очереди.
-    func cancel(_ error: Error = CancellationError()) -> Bool {
-        lock.withLock { failure = error; return started }
-    }
-    func begin() throws {
-        try lock.withLock {
-            if let failure { throw failure }
-            started = true
+    @discardableResult
+    func cancel(_ error: Error = CancellationError(), abort: () -> Void) -> Bool {
+        lock.withLock {
+            guard !finished else { return false }
+            if failure == nil { failure = error }
+            // finish и abort защищены одним lock: очередь не начнёт следующую
+            // команду между решением прервать эту операцию и самим abort().
+            if started { abort() }
+            return true
         }
     }
+
+    func perform<T>(_ body: () throws -> T) throws -> T {
+        try lock.withLock {
+            if let failure { finished = true; throw failure }
+            started = true
+        }
+        let result = Result { try body() }
+        return try lock.withLock {
+            finished = true
+            // Транспорт может вернуть частичный ответ даже после abort().
+            // Он не превращает уже наступивший тайм-аут в успешный запрос.
+            if let failure { throw failure }
+            return try result.get()
+        }
+    }
+}
+
+/// Проверяется на очереди непосредственно перед сетевым вызовом. Профиль
+/// могли удалить или изменить, пока операция ждала завершения другой команды.
+/// Единственное изменяемое поле current всегда читается и пишется под lock.
+fileprivate final class ConnectionGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = true
+
+    func invalidate() { lock.withLock { current = false } }
+
+    func requireCurrent() throws {
+        try lock.withLock {
+            guard current else {
+                throw TransportError("Параметры подключения изменились во время операции.")
+            }
+        }
+    }
+}
+
+struct OperationTimeout: LocalizedError {
+    var errorDescription: String? { "Превышено время ожидания операции." }
 }
 
 /// Живое соединение с одним роутером. Переключение между роутерами их не
@@ -47,7 +90,13 @@ final class RouterSlot {
     var connectionKey: String
     /// Меняется при отмене или изменении профиля. Запоздавшая задача
     /// подключения не сможет положить старый транспорт обратно в слот.
-    var connectionGeneration = 0
+    var connectionGeneration = 0 {
+        didSet {
+            generationValidity.invalidate()
+            generationValidity = ConnectionGeneration()
+        }
+    }
+    fileprivate var generationValidity = ConnectionGeneration()
     let queue: DispatchQueue
 
     init(profile: RouterProfile) {
@@ -85,6 +134,7 @@ final class RouterConnectionManager: ObservableObject {
         didSet { slots[router.id]?.transport = transport }
     }
     private var slots: [UUID: RouterSlot] = [:]
+    private var writingOwners: Set<UUID> = []
 
     /// Операция может завершаться уже после удаления её роутера из списка.
     /// В таком случае ей нельзя занимать очередь текущего, совсем другого
@@ -212,7 +262,14 @@ final class RouterConnectionManager: ObservableObject {
     /// блокировались только у него.
     func isBusy(_ id: UUID) -> Bool {
         connectionStatus(for: id).isBusy
+            || writingOwners.contains(id)
             || (id == router.id ? progress : slots[id]?.progress) != nil
+    }
+
+    func setWriting(_ writing: Bool, owner: UUID) {
+        objectWillChange.send()
+        if writing { writingOwners.insert(owner) }
+        else { writingOwners.remove(owner) }
     }
 
     /// Сменили адрес, порт или транспорт — старое соединение уже не про этот роутер.
@@ -406,10 +463,15 @@ final class RouterConnectionManager: ObservableObject {
     /// connect() читал только активные свойства и после переключения не мог
     /// продолжить составную операцию для прежнего роутера.
     func connect(to profile: RouterProfile) async throws {
+        try Task.checkCancellation()
         if let message = profile.validationError { throw TransportError(message) }
         let slot = slot(for: profile)
         dropIfProfileChanged(profile)
-        if slot.status.isOnline, slot.transport != nil { return }
+        if slot.status.isOnline, let current = slot.transport {
+            if current.isAlive { return }
+            current.abort()
+            store(transport: nil, status: .offline, owner: profile.id)
+        }
 
         // Пароль уже отвергли. Каждая новая попытка — ещё одна отметка в
         // счётчике защиты роутера, а не шанс на успех.
@@ -518,19 +580,22 @@ final class RouterConnectionManager: ObservableObject {
                           _ body: @escaping () throws -> T) async throws -> T {
         try Task.checkCancellation()
         let cancellation = OperationCancellation()
+        let generation = slots[owner]?.generationValidity
         let watchdog = Task {
             try await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
-            if cancellation.cancel(TransportError("Превышено время ожидания операции.")) {
-                transport.abort()
+            if cancellation.cancel(OperationTimeout(),
+                                   abort: { transport.abort() }) {
+                log(.warn, "Операция превысила \(Int(budget)) с — ожидание остановлено.")
             }
-            log(.warn, "Операция превысила \(Int(budget)) с — соединение оборвано.")
         }
         defer { watchdog.cancel() }
         return try await withTaskCancellationHandler(operation: {
             do {
                 let result = try await background(owner: owner) {
-                    try cancellation.begin()
-                    return try body()
+                    try cancellation.perform {
+                        try generation?.requireCurrent()
+                        return try body()
+                    }
                 }
                 try Task.checkCancellation()
                 return result
@@ -541,7 +606,7 @@ final class RouterConnectionManager: ObservableObject {
         }, onCancel: {
             // `background` ждёт блокирующий SSH/HTTP-вызов. Отмена Swift-задачи
             // сама его не прерывает, а abort() разбудит ожидание немедленно.
-            if cancellation.cancel() { transport.abort() }
+            cancellation.cancel(abort: { transport.abort() })
         })
     }
 
@@ -567,6 +632,11 @@ final class RouterConnectionManager: ObservableObject {
             return result
         } catch {
             guard isCurrent(operation) else { throw error }
+            if (error is CancellationError || error is OperationTimeout), active.isAlive {
+                // Отмена/тайм-аут в очереди не затрагивают уже работающий
+                // запрос. Не выбрасываем его здоровое соединение из пула.
+                throw error
+            }
             if !Task.isCancelled,
                (error as? TransportError)?.isSessionFailure == true {
                 // Роутер закрыл давно простаивавшую сессию между isAlive и
@@ -592,6 +662,13 @@ final class RouterConnectionManager: ObservableObject {
                     return result
                 } catch {
                     guard isCurrent(operation), slots[operation.routerID]?.transport === active else { throw error }
+                    if (error is CancellationError || error is OperationTimeout), active.isAlive {
+                        throw error
+                    }
+                    if preserveConnectionOnFailure,
+                       (error as? TransportError)?.isSessionFailure != true, active.isAlive {
+                        throw error
+                    }
                     active.abort()
                     store(transport: nil, status: .failed(describe(error)),
                           owner: operation.routerID)
@@ -605,6 +682,7 @@ final class RouterConnectionManager: ObservableObject {
             if !preserveConnectionOnFailure {
                 let slot = slots[operation.routerID]
                 if transport === active || slot?.transport === active {
+                    active.abort()
                     store(transport: nil, status: .failed(describe(error)), owner: operation.routerID)
                 }
             } else {
@@ -623,12 +701,14 @@ final class RouterConnectionManager: ObservableObject {
     func monitorConnections() async {
         while !Task.isCancelled {
             let connected = slots.compactMap { owner, slot -> (UUID, KeeneticTransport)? in
-                guard slot.status.isOnline, slot.progress == nil, let transport = slot.transport
+                guard slot.status.isOnline, slot.progress == nil, !writingOwners.contains(owner),
+                      let transport = slot.transport
                 else { return nil }
                 return (owner, transport)
             }
             for (owner, candidate) in connected {
-                guard !Task.isCancelled, slots[owner]?.transport === candidate else { continue }
+                guard !Task.isCancelled, !isBusy(owner),
+                      slots[owner]?.transport === candidate else { continue }
                 do {
                     _ = try await background(owner: owner) {
                         try candidate.run("show version", timeout: 12)
@@ -637,6 +717,7 @@ final class RouterConnectionManager: ObservableObject {
                         throw TransportError("Сессия закрыта роутером.", isSessionFailure: true)
                     }
                 } catch {
+                    if Task.isCancelled { return }
                     guard slots[owner]?.transport === candidate else { continue }
                     candidate.abort()
                     store(transport: nil,
@@ -810,8 +891,8 @@ final class RouterConnectionManager: ObservableObject {
         let readProfile = slots[owner]?.profile ?? router
 
         let fresh: RouterState = try await guarded(operation: operation, budget: 200) { transport in
-            let configText = try transport.fetchText("show running-config", timeout: 180,
-                                                     quiet: quiet)
+            let configText = try ConfigurationText.validated(
+                transport.fetchText("show running-config", timeout: 180, quiet: quiet))
 
             var statusInterfaces: [String: KeeneticInterface] = [:]
             if let rci = transport as? RCITransport {
@@ -974,7 +1055,14 @@ final class RouterConnectionManager: ObservableObject {
             return nil
         }
 
-        var updated = snapshot
+        return mergeLiveInterface(incoming, ident: trimmed, owner: owner)
+    }
+
+    /// За время сетевой проверки полный refresh или apply мог опубликовать
+    /// новый конфиг. Обновляем только интерфейс в последнем состоянии.
+    func mergeLiveInterface(_ incoming: KeeneticInterface, ident trimmed: String,
+                            owner: UUID) -> KeeneticInterface? {
+        guard var updated = readState(for: owner) else { return nil }
         var merged = updated.interfaces[trimmed] ?? KeeneticInterface(ident: trimmed)
         if !incoming.descriptionText.isEmpty { merged.descriptionText = incoming.descriptionText }
         if !incoming.type.isEmpty { merged.type = incoming.type }
@@ -1055,9 +1143,10 @@ final class RouterConnectionManager: ObservableObject {
     }
 
     func readConfigText(operation: RouterOperation) async throws -> String {
-        try await guarded(operation: operation, budget: 200) { transport in
+        let text = try await guarded(operation: operation, budget: 200) { transport in
             try transport.fetchText("show running-config", timeout: 180)
         }
+        return try ConfigurationText.validated(text)
     }
 
     func readStartupConfig() async throws -> String {
@@ -1074,7 +1163,7 @@ final class RouterConnectionManager: ObservableObject {
             try transport.fetchText("show startup-config", timeout: 180)
         }
         try requireCurrent(operation)
-        return text
+        return try ConfigurationText.validated(text)
     }
 
     // MARK: - Загрузка списков доменов
@@ -1109,12 +1198,27 @@ final class RouterConnectionManager: ObservableObject {
 
     /// Блокирующая работа уходит с главного потока, интерфейс остаётся живым.
     private func background<T>(owner: UUID, _ body: @escaping () throws -> T) async throws -> T {
+        try Task.checkCancellation()
         let targetQueue = slots[owner]?.queue ?? Self.orphanedOperationQueue
-        return try await withCheckedThrowingContinuation { continuation in
-            targetQueue.async {
-                do { continuation.resume(returning: try body()) }
-                catch { continuation.resume(throwing: error) }
+        let generation = slots[owner]?.generationValidity
+        let cancellation = OperationCancellation()
+        return try await withTaskCancellationHandler {
+            let result: T = try await withCheckedThrowingContinuation { continuation in
+                targetQueue.async {
+                    do {
+                        continuation.resume(returning: try cancellation.perform {
+                            try generation?.requireCurrent()
+                            return try body()
+                        })
+                    } catch { continuation.resume(throwing: error) }
+                }
             }
+            try Task.checkCancellation()
+            return result
+        } onCancel: {
+            // У диагностического запроса может быть отдельный транспорт.
+            // Отмена запрещает его запуск из очереди, но не рвёт основной.
+            cancellation.cancel(abort: {})
         }
     }
 

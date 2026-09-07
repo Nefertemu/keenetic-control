@@ -5,12 +5,40 @@ import Foundation
 @MainActor
 final class RouterPlanExecutor {
     private let connections: RouterConnectionManager
-    private var writing: Set<UUID> = []
+    private var writing: [UUID: UUID] = [:]
+    @TaskLocal private static var inheritedWriteLease: UUID?
 
-    private func beginWriting(_ owner: UUID) throws {
-        guard writing.insert(owner).inserted else {
-            throw TransportError("На этом роутере уже выполняется изменение.",
-                                 hint: "Дождись завершения текущего плана.")
+    /// true означает, что именно этот вызов должен освободить блокировку.
+    private func beginWriting(_ owner: UUID) throws -> Bool {
+        if let lease = writing[owner] {
+            guard lease == Self.inheritedWriteLease else {
+                throw TransportError("На этом роутере уже выполняется изменение.",
+                                     hint: "Дождись завершения текущего плана.")
+            }
+            return false
+        }
+        writing[owner] = UUID()
+        connections.setWriting(true, owner: owner)
+        return true
+    }
+
+    private func finishWriting(_ owner: UUID, acquired: Bool) {
+        guard acquired else { return }
+        writing.removeValue(forKey: owner)
+        connections.setWriting(false, owner: owner)
+    }
+
+    /// Удерживает право записи и между стадиями составного обновления:
+    /// чтением, проверкой нового пира, применением и возможным откатом.
+    func withExclusiveWriteOperation<T>(operation: RouterOperation,
+                                        _ body: @MainActor () async throws -> T) async throws -> T {
+        try connections.requireCurrent(operation)
+        let owner = operation.routerID
+        let acquired = try beginWriting(owner)
+        defer { finishWriting(owner, acquired: acquired) }
+        let lease = writing[owner]!
+        return try await Self.$inheritedWriteLease.withValue(lease) {
+            try await body()
         }
     }
 
@@ -41,25 +69,21 @@ final class RouterPlanExecutor {
             log(.info, "Предпросмотр «\(plan.title)»: \(Format.commands(plan.commands.count)), на роутер ничего не ушло.")
             return ApplyOutcome(applied: false)
         }
-        try beginWriting(owner)
+        let acquired = try beginWriting(owner)
         defer {
-            writing.remove(owner)
+            finishWriting(owner, acquired: acquired)
             if connections.isCurrent(operation) { connections.store(activity: nil, owner: owner) }
         }
 
         let transport = try await connections.transport(for: operation)
-        // Бэкап должен отражать то, что на роутере сейчас, а не час назад.
-        let configText: String
-        if let current = connections.readState(for: owner), !current.configText.isEmpty,
-           Date().timeIntervalSince(current.readAt) < 300 {
-            configText = current.configText
-        } else {
-            connections.store(activity: "Читаю конфигурацию перед изменением…", owner: owner)
-            configText = try await connections.watch(transport, budget: 200, owner: owner) {
-                try transport.fetchText("show running-config", timeout: 180)
-            }
+        // Даже свежий кэш мог устареть после правки в веб-панели или прямых
+        // команд WireGuard. Копия должна содержать состояние перед записью.
+        connections.store(activity: "Читаю конфигурацию перед изменением…", owner: owner)
+        let rawConfigText = try await connections.watch(transport, budget: 200, owner: owner) {
+            try transport.fetchText("show running-config", timeout: 180)
         }
         try connections.requireCurrent(operation)
+        let configText = try ConfigurationText.validated(rawConfigText)
 
         guard let backupURL = connections.dependencies.backup(
             profile, configText, connections.dependencies.settings().keepBackups) else {
@@ -180,7 +204,7 @@ final class RouterPlanExecutor {
         let owner = operation.routerID
         try connections.requireCurrent(operation)
         let configText = try await connections.watch(transport, budget: 200, owner: owner) {
-            try transport.fetchText("show running-config", timeout: 180)
+            try ConfigurationText.validated(transport.fetchText("show running-config", timeout: 180))
         }
         try connections.requireCurrent(operation)
         let groups = RouterConfigParser.parseFqdnGroups(configText)
@@ -228,8 +252,8 @@ final class RouterPlanExecutor {
         guard !commands.isEmpty else { return "" }
         try connections.requireCurrent(operation)
         let owner = operation.routerID
-        try beginWriting(owner)
-        defer { writing.remove(owner) }
+        let acquired = try beginWriting(owner)
+        defer { finishWriting(owner, acquired: acquired) }
         let transport = try await connections.transport(for: operation)
 
         connections.store(progress: ProgressInfo(label: title, done: 0,

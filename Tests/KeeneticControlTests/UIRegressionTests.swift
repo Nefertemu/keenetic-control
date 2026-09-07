@@ -5,7 +5,7 @@ import Vision
 @testable import KeeneticControl
 
 private enum UIScenario: String, CaseIterable {
-    case overview, routes, pingCheck, domains
+    case overview, routes, pingCheck, domains, diagnostics, tunnels
 }
 
 private struct LayoutFrames: PreferenceKey {
@@ -31,6 +31,7 @@ private struct UIScenarioView: View {
     @State private var alert: AlertPayload?
     @State private var section: AppSection = .overview
     @State private var tab: DomainsTab = .routes
+    @State private var interface = ""
 
     var body: some View {
         RouterDetailLayout {
@@ -50,11 +51,14 @@ private struct UIScenarioView: View {
                 case .routes: StaticRoutesView(alert: $alert)
                 case .pingCheck: PingCheckView(alert: $alert)
                 case .domains: DomainsView(alert: $alert, tab: $tab)
+                case .diagnostics: DiagnosticsView(alert: $alert)
+                case .tunnels: TunnelStatusView(alert: $alert, interfaceIdent: $interface)
                 }
             }
             .measured("content")
         }
         .environmentObject(session)
+        .environment(\.liveRouterReadsEnabled, false)
         .coordinateSpace(name: "fixture")
         .onPreferenceChange(LayoutFrames.self, perform: onLayout)
     }
@@ -109,6 +113,9 @@ final class UIRegressionTests: XCTestCase {
     func testLongPingCheckNamesThemesAndWidths() async throws { try await check(.pingCheck) }
     func testEightyDomainGroupsThemesAndWidths() async throws { try await check(.domains) }
 
+    func testDiagnosticsThemesAndWidths() async throws { try await check(.diagnostics) }
+    func testTunnelStatusThemesAndWidths() async throws { try await check(.tunnels) }
+
     private func check(_ scenario: UIScenario) async throws {
         XCTAssertTrue(AppPaths.support.lastPathComponent.hasPrefix("KeeneticControl-tests-"))
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -137,6 +144,10 @@ final class UIRegressionTests: XCTestCase {
                     hosting.layoutSubtreeIfNeeded()
                     try await Task.sleep(nanoseconds: 50_000_000)
                 }
+                if scenario == .diagnostics {
+                    try await Task.sleep(nanoseconds: 800_000_000)
+                    hosting.layoutSubtreeIfNeeded()
+                }
                 let banners = try XCTUnwrap(frames["banners"])
                 let content = try XCTUnwrap(frames["content"])
                 XCTAssertGreaterThanOrEqual(banners.minY, -1)
@@ -164,6 +175,13 @@ final class UIRegressionTests: XCTestCase {
                                              "Banner action missing from render: \(title)")
                     XCTAssertGreaterThan(label.frame.minX, 0)
                     XCTAssertLessThan(label.frame.maxX, 1)
+                }
+                if scenario == .diagnostics {
+                    let contentLabels = try recognize(XCTUnwrap(NSBitmapImageRep(data: png)))
+                    XCTAssertTrue(contentLabels.contains { $0.text.contains("Результат проверки") },
+                                  "Diagnostics did not finish for the captured configuration")
+                    XCTAssertTrue(contentLabels.contains { $0.text.contains("Проверить сейчас") },
+                                  "Diagnostics action is outside the visible controls")
                 }
                 if scenario == .routes || scenario == .pingCheck {
                     XCTAssertEqual(session.state?.staticRoutes.count, 500)

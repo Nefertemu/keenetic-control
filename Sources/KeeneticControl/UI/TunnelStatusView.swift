@@ -9,6 +9,7 @@ import SwiftUI
 /// заходят просто посмотреть.
 struct TunnelStatusView: View {
     @EnvironmentObject private var session: RouterSession
+    @Environment(\.liveRouterReadsEnabled) private var liveReadsEnabled
     @Binding var alert: AlertPayload?
     /// Выбранный туннель принадлежит разделу: между вкладками он не
     /// должен сбрасываться.
@@ -17,6 +18,7 @@ struct TunnelStatusView: View {
     @State private var nameDraft = TextDraft()
     @State private var namePlan: Plan?
     @State private var pingRefreshing = false
+    @State private var pingRequestID = UUID()
     @State private var pingUpdatedAt: Date?
     @State private var pingError: String?
     @ObservedObject private var healthStore = TunnelHealthStore.shared
@@ -64,19 +66,19 @@ struct TunnelStatusView: View {
         }
         .onChange(of: interfaceIdent) { _, _ in
             syncInterfaceName()
-            pingUpdatedAt = nil
-            pingError = nil
         }
-        .onChange(of: session.router.id) { _, _ in
+        .onChange(of: RouterPresentationContext(session.router)) { _, _ in
             // Черновик имени относится к старому роутеру — не даём случайно
             // применить его после переключения.
             namePlan = nil
             nameDraft.reset(to: "")
             pickDefault()
         }
+        .onChange(of: liveInput) { _, _ in resetLiveRead() }
         // Ping-Check и статистика WireGuard живут в статусе интерфейса, а не
         // в running-config. Обновляем их отдельно, пока открыт этот экран.
-        .task(id: liveMonitorID) { await monitorLiveInterface() }
+        .task(id: liveInput) { if liveReadsEnabled { await monitorLiveInterface() } }
+        .onDisappear { resetLiveRead() }
         .sheet(item: Binding(get: { namePlan.map(PlanBox.init) }, set: { namePlan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, applyTitle: "Сохранить имя", state: session.state) { dryRun in
                 namePlan = nil
@@ -104,13 +106,10 @@ struct TunnelStatusView: View {
     }
 
 
-    private var liveMonitorID: String {
-        let binding = session.state?.pingCheckBindings[interfaceIdent]?.profile ?? ""
-        // Перезапускаем сторожа после смены роутера, интерфейса или профиля,
-        // но не при кратком переходе online → offline во время восстановления
-        // SSH: смена статуса иначе отменяет текущий запрос и тут же обрывает
-        // только что поднятую сессию.
-        return "\(session.router.id.uuidString)|\(interfaceIdent)|\(binding)"
+    private var liveInput: TunnelStatusInput {
+        // Статус подключения и readAt сюда не входят: переподключение и
+        // обычное обновление счётчиков не должны отменять текущую проверку.
+        TunnelStatusInput(router: session.router, interface: interfaceIdent, state: session.state)
     }
 
 
@@ -540,20 +539,35 @@ struct TunnelStatusView: View {
     }
 
 
+    private func resetLiveRead() {
+        pingRequestID = UUID()
+        pingRefreshing = false
+        pingUpdatedAt = nil
+        pingError = nil
+    }
+
     private func updateLiveInterface(ident: String? = nil) async {
         let target = ident ?? interfaceIdent
-        guard !target.isEmpty,
+        let context = liveInput
+        guard liveReadsEnabled, !target.isEmpty, target == context.interface,
               session.state?.hasPingCheck(target) == true,
               session.status.isOnline else { return }
         // Ручная кнопка и фоновый цикл используют один запрос: не запускаем
         // два `show interface` одновременно на одной CLI-очереди.
         guard !pingRefreshing else { return }
+        let operation = session.beginOperation()
+        let request = UUID()
+        pingRequestID = request
         pingRefreshing = true
-        defer { pingRefreshing = false }
+        defer { if pingRequestID == request { pingRefreshing = false } }
+        func current() -> Bool {
+            !Task.isCancelled && pingRequestID == request && context == liveInput
+                && session.isCurrent(operation)
+        }
 
         do {
             let result = try await session.refreshLiveInterface(target)
-            guard !Task.isCancelled, target == interfaceIdent else { return }
+            guard current() else { return }
             if result == nil {
                 pingError = "Роутер не вернул состояние интерфейса \(target)."
             } else {
@@ -561,7 +575,7 @@ struct TunnelStatusView: View {
                 pingError = nil
                 if let result {
                     let configured = session.state?.hasPingCheck(target) == true
-                    healthStore.record(routerID: session.router.id,
+                    healthStore.record(routerID: operation.routerID,
                                        interface: target,
                                        ping: result.pingCheck(configured: configured),
                                        interfaceUp: result.isUp,
@@ -578,7 +592,7 @@ struct TunnelStatusView: View {
         } catch is CancellationError {
             return
         } catch {
-            guard !Task.isCancelled, target == interfaceIdent else { return }
+            guard current() else { return }
             pingError = session.describe(error)
         }
     }

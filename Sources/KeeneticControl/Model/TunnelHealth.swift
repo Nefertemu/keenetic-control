@@ -34,11 +34,12 @@ struct TunnelHealthSample: Codable, Hashable, Identifiable {
     var lossPercent: Double?
     var probeTarget: String?
     var probeMethod: String?
+    var probePort: Int?
 
     init(id: UUID = UUID(), timestamp: Date = Date(), state: TunnelHealthState,
          interfaceUp: Bool, handshakeFresh: Bool, pingStatus: String?,
          latencyMS: Double? = nil, lossPercent: Double? = nil,
-         probeTarget: String? = nil, probeMethod: String? = nil) {
+         probeTarget: String? = nil, probeMethod: String? = nil, probePort: Int? = nil) {
         self.id = id
         self.timestamp = timestamp
         self.state = state
@@ -49,6 +50,7 @@ struct TunnelHealthSample: Codable, Hashable, Identifiable {
         self.lossPercent = lossPercent
         self.probeTarget = probeTarget
         self.probeMethod = probeMethod
+        self.probePort = probePort
     }
 }
 
@@ -160,17 +162,23 @@ final class TunnelHealthStore: ObservableObject {
             latencyMS: result.averageRTT,
             lossPercent: result.lossPercent,
             probeTarget: result.target,
-            probeMethod: result.method.rawValue))
+            probeMethod: result.method.rawValue, probePort: result.port))
         trim(&samples, now: timestamp)
         records[recordKey] = samples
         scheduleSave(immediate: samples.dropLast().last?.state != state)
     }
 
     func latencySamples(routerID: UUID, interface: String,
+                        target: String? = nil, method: InterfaceProbeMethod? = nil, port: Int? = nil,
                         since: TimeInterval = 24 * 60 * 60,
                         now: Date = Date()) -> [TunnelHealthSample] {
         samples(routerID: routerID, interface: interface, since: since, now: now)
-            .filter { $0.latencyMS != nil || $0.lossPercent != nil }
+            .filter { sample in
+                (sample.latencyMS != nil || sample.lossPercent != nil)
+                    && (target == nil || sample.probeTarget == target)
+                    && (method == nil || sample.probeMethod == method?.rawValue)
+                    && (method?.usesPort != true || sample.probePort == port)
+            }
     }
 
     func samples(routerID: UUID, interface: String,

@@ -443,10 +443,10 @@ final class RegressionTests: XCTestCase {
     func testBATExport() throws {
         // «routes» разобраны выше из sampleConfig: ipv4+auto, default, ipv6 и reject.
         let unsupported = StaticRouteParser.batUnsupported(routes)
-        check("непереносимое посчитано", String(unsupported.count), "3")
+        check("непереносимое посчитано", String(unsupported.count), "4")
         let batOut = StaticRouteParser.exportBAT(routes)
-        check("переносимый маршрут выгружен",
-              batOut.contains("route -p add 10.50.0.0 mask 255.255.0.0 Wireguard0"))
+        check("интерфейс Keenetic нельзя передать как шлюз Windows",
+              batOut.contains("rem не переносится в Windows: ip route 10.50.0.0 255.255.0.0 Wireguard0"))
         check("ipv6 не выброшен, а помечен", batOut.contains("rem не переносится в Windows: ipv6 route"))
         check("default помечен", batOut.contains("rem не переносится в Windows: ip route default"))
         check("reject помечен", batOut.contains("rem не переносится в Windows: ip route 203.0.113.77 ISP reject"))

@@ -86,7 +86,7 @@ struct StaticRoute: Identifiable, Hashable {
             }
         } else {
             if destination.contains("/") {
-                let parts = destination.split(separator: "/", maxSplits: 1)
+                let parts = destination.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
                 guard parts.count == 2, IPTools.isIPv6(String(parts[0])),
                       let prefix = Int(parts[1]), (0...128).contains(prefix) else {
                     throw TransportError("Некорректный IPv6/CIDR: \(destination)")
@@ -118,7 +118,7 @@ enum StaticRouteParser {
         // цепляло бы оба сразу.
         var seen = Set<String>()
 
-        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        for raw in CLI.normalizeNewlines(text).split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw)
             guard !line.isEmpty, !(line.first?.isWhitespace ?? false) else { continue }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -132,10 +132,10 @@ enum StaticRouteParser {
         var text = line.trimmingCharacters(in: .whitespaces)
 
         let family: StaticRoute.Family
-        if text.hasPrefix("ip route ") {
+        if text.lowercased().hasPrefix("ip route ") {
             family = .ipv4
             text = String(text.dropFirst("ip route ".count))
-        } else if text.hasPrefix("ipv6 route ") {
+        } else if text.lowercased().hasPrefix("ipv6 route ") {
             family = .ipv6
             text = String(text.dropFirst("ipv6 route ".count))
         } else {
@@ -202,12 +202,14 @@ enum StaticRouteParser {
         var skipped: [String] = []
         var seen = Set<String>()
 
-        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        for raw in CLI.normalizeNewlines(text).split(separator: "\n", omittingEmptySubsequences: false) {
             var line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty { continue }
             if line.lowercased().hasPrefix("@echo") || line.lowercased().hasPrefix("rem ")
                 || line.hasPrefix("::") || line.hasPrefix("#") { continue }
             if line.lowercased().hasPrefix("chcp") || line.lowercased() == "pause" { continue }
+            if line.lowercased() == "setlocal disabledelayedexpansion"
+                || line.lowercased() == "endlocal" { continue }
 
             var route: StaticRoute?
 
@@ -255,28 +257,59 @@ enum StaticRouteParser {
         }
 
         var mask: String?
+        var hasInterface = false
+        var hasPersistent = false
         var index = 0
         while index < tokens.count {
             let token = tokens[index].lowercased()
-            if token == "mask", index + 1 < tokens.count {
+            if token == "mask" {
+                guard mask == nil, route.family == .ipv4, index + 1 < tokens.count,
+                      IPTools.ipv4MaskToPrefix(tokens[index + 1]) != nil else { return nil }
                 mask = tokens[index + 1]
                 index += 2
                 continue
             }
-            if token == "metric", index + 1 < tokens.count {
-                guard let metric = Int(tokens[index + 1]), metric >= 0 else { return nil }
+            if token == "metric" {
+                guard route.metric == nil, index + 1 < tokens.count,
+                      let metric = Int(tokens[index + 1]), metric >= 0 else { return nil }
                 route.metric = metric
                 index += 2
                 continue
             }
-            if token == "if" { index += 2; continue }
-            if token == "-p" { index += 1; continue }
-            if route.via.isEmpty { route.via = tokens[index] }
+            if token == "if" {
+                // Индекс сетевой карты Windows не является именем интерфейса
+                // Keenetic, но неполную или ошибочную запись принимать нельзя.
+                guard !hasInterface, index + 1 < tokens.count,
+                      let value = Int(tokens[index + 1]), value > 0 else { return nil }
+                hasInterface = true
+                index += 2
+                continue
+            }
+            if token == "-p" {
+                guard !hasPersistent else { return nil }
+                hasPersistent = true
+                index += 1
+                continue
+            }
+            // Старые версии приложения дописывали rem в конец команды.
+            // Сохраняем возможность импортировать такие выгрузки.
+            if token == "rem", !route.via.isEmpty {
+                route.comment = tokens.dropFirst(index + 1).joined(separator: " ")
+                break
+            }
+            guard route.via.isEmpty else { return nil }
+            route.via = tokens[index]
             index += 1
         }
 
-        if let mask, let prefix = IPTools.ipv4MaskToPrefix(mask), !route.destination.contains("/") {
-            route.destination = prefix == 32 ? route.destination : "\(route.destination)/\(prefix)"
+        if let mask, let prefix = IPTools.ipv4MaskToPrefix(mask) {
+            if route.destination.contains("/") {
+                guard let cidr = IPTools.ipv4CIDRToAddressMask(route.destination), cidr.mask == mask else {
+                    return nil
+                }
+            } else {
+                route.destination = prefix == 32 ? route.destination : "\(route.destination)/\(prefix)"
+            }
         }
 
         guard !route.via.isEmpty else { return nil }
@@ -286,15 +319,19 @@ enum StaticRouteParser {
         return route
     }
 
-    /// Что Windows не умеет: IPv6, запрещающие маршруты и маршрут по умолчанию.
+    /// В Windows вместо интерфейса Keenetic нужен IPv4-адрес шлюза.
     /// Раньше такие строки просто исчезали из выгрузки — без единого слова.
     static func batUnsupported(_ routes: [StaticRoute]) -> [StaticRoute] {
-        routes.filter { $0.family != .ipv4 || $0.reject || $0.destination.lowercased() == "default" }
+        routes.filter {
+            $0.family != .ipv4 || $0.reject || $0.destination.lowercased() == "default"
+                || !IPTools.isIPv4($0.via)
+        }
     }
 
     /// Экспорт в BAT — так же, как это делает windows-версия.
     static func exportBAT(_ routes: [StaticRoute]) -> String {
-        var lines = ["@echo off", "chcp 65001 > nul", "rem Экспорт маршрутов Keenetic — \(Format.humanDate(Date()))", ""]
+        var lines = ["@echo off", "setlocal DisableDelayedExpansion", "chcp 65001 > nul",
+                     "rem Экспорт маршрутов Keenetic — \(Format.humanDate(Date()))", ""]
 
         let unsupported = Set(batUnsupported(routes).map(\.id))
         for route in routes {
@@ -302,7 +339,7 @@ enum StaticRouteParser {
             // ничего не пропадает молча.
             guard !unsupported.contains(route.id) else {
                 lines.append("rem не переносится в Windows: "
-                             + (route.rawLine.isEmpty ? route.command : route.rawLine))
+                             + batComment(route.rawLine.isEmpty ? route.command : route.rawLine))
                 continue
             }
             let destination = route.destination
@@ -319,13 +356,25 @@ enum StaticRouteParser {
 
             var line = "route -p add \(address) mask \(mask) \(route.via)"
             if let metric = route.metric { line += " metric \(metric)" }
-            if !route.comment.isEmpty { line += "  rem \(route.comment)" }
+            if !route.comment.isEmpty { lines.append("rem " + batComment(route.comment)) }
             lines.append(line)
         }
 
         lines.append("")
+        lines.append("endlocal")
         lines.append("pause")
         return lines.joined(separator: "\r\n")
+    }
+
+    /// REM — отдельная команда cmd.exe; метасимволы даже в комментарии
+    /// способны перенаправить вывод или запустить следующую команду.
+    private static func batComment(_ text: String) -> String {
+        text.map { character -> String in
+            if character.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) { return " " }
+            if character == "%" { return "%%" }
+            if "^&|<>()\"".contains(character) { return "^" + String(character) }
+            return String(character)
+        }.joined()
     }
 
     /// Экспорт в формате команд Keenetic — чтобы залить на другой роутер.

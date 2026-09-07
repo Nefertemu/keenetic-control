@@ -21,15 +21,25 @@ enum Restore {
         var extraGroups: [FqdnGroup] = []
         /// Списки, бывшие в снимке и исчезнувшие, — создать заново.
         var missingGroups: [FqdnGroup] = []
-        /// Строки маршрутов dns-proxy: лишние и недостающие.
+        /// Строки dns-proxy, которые нужно снять и вернуть при восстановлении.
+        /// Здесь целые изменённые цепочки, включая неизменённые строки.
         var extraRouteLines: [String] = []
         var missingRouteLines: [String] = []
+        /// У существующих маршрутов изменился относительный порядок.
+        var reorderedRouteGroups: [String] = []
+        /// Полные цепочки после восстановления: порядок интерфейсов задаёт
+        /// приоритет резервирования и должен участвовать в проверке плана.
+        var exactRouteChains: [String: [DnsRouteAssignment]] = [:]
         /// Статические маршруты.
         var extraRoutes: [StaticRoute] = []
         var missingRoutes: [StaticRoute] = []
 
         var extraDomainCount: Int { extraDomains.values.reduce(0) { $0 + $1.count } }
         var missingDomainCount: Int { missingDomains.values.reduce(0) { $0 + $1.count } }
+        /// Реальные изменения между снимками, без временного снятия старых
+        /// строк ради восстановления порядка. Нужны сводке RouterChange.
+        var extraRouteCount: Int { Set(extraRouteLines).subtracting(missingRouteLines).count }
+        var missingRouteCount: Int { Set(missingRouteLines).subtracting(extraRouteLines).count }
 
         var isEmpty: Bool {
             extraDomains.isEmpty && missingDomains.isEmpty
@@ -58,9 +68,11 @@ enum Restore {
         let after = RouterConfigParser.parseFqdnGroups(CLI.normalizeNewlines(current))
         var difference = Difference()
 
-        for (ident, old) in before {
+        for ident in before.keys.sorted() {
+            guard let old = before[ident] else { continue }
             guard let new = after[ident] else {
                 difference.missingGroups.append(old)
+                difference.exactRouteChains[ident] = old.routeAssignments
                 continue
             }
             let gone = old.includes.subtracting(new.includes)
@@ -68,20 +80,25 @@ enum Restore {
             if !gone.isEmpty { difference.missingDomains[ident] = gone }
             if !added.isEmpty { difference.extraDomains[ident] = added }
         }
-        for (ident, new) in after where before[ident] == nil {
-            difference.extraGroups.append(new)
+        for ident in after.keys.sorted() where before[ident] == nil {
+            if let new = after[ident] { difference.extraGroups.append(new) }
         }
 
-        // Маршруты списков сверяем построчно: строка целиком и есть команда.
-        let oldRoutes = Set(before.values.flatMap(\.routeLines))
-        let newRoutes = Set(after.values.flatMap(\.routeLines))
-        // Списки, которые целиком уходят или приходят, уносят маршруты с собой.
-        let handled = Set(difference.extraGroups.flatMap(\.routeLines))
-            .union(difference.missingGroups.flatMap(\.routeLines))
-        difference.missingRouteLines = oldRoutes.subtracting(newRoutes)
-            .subtracting(handled).sorted()
-        difference.extraRouteLines = newRoutes.subtracting(oldRoutes)
-            .subtracting(handled).sorted()
+        // Удаление/добавление только различающихся строк не восстанавливает
+        // приоритет: недостающий первый маршрут оказался бы в конце цепочки.
+        // Для изменённого списка снимаем цепочку целиком и возвращаем порядок
+        // снимка. Неизменённые списки продолжают работать без перерыва.
+        for ident in before.keys.sorted() {
+            guard let old = before[ident], let new = after[ident],
+                  old.routeLines != new.routeLines else { continue }
+            difference.extraRouteLines.append(contentsOf: new.routeLines)
+            difference.missingRouteLines.append(contentsOf: old.routeLines)
+            difference.exactRouteChains[ident] = old.routeAssignments
+            let common = Set(old.routeLines).intersection(new.routeLines)
+            if old.routeLines.filter({ common.contains($0) }) != new.routeLines.filter({ common.contains($0) }) {
+                difference.reorderedRouteGroups.append(ident)
+            }
+        }
 
         let oldStatic = StaticRouteParser.parse(config: CLI.normalizeNewlines(backup))
         let newStatic = StaticRouteParser.parse(config: CLI.normalizeNewlines(current))
@@ -97,6 +114,7 @@ enum Restore {
     /// восстанавливаем недостающее, маршруты — после самих списков.
     static func plan(_ difference: Difference, chunkSize: Int, title: String) -> Plan {
         var plan = Plan(title: title)
+        plan.exactRouteChains = difference.exactRouteChains
 
         // 1. Маршруты, которых в снимке не было, — снять до правки списков.
         for line in difference.extraRouteLines {

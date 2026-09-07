@@ -157,4 +157,132 @@ final class RouterConnectionTests: XCTestCase {
     func testFilesAreIsolatedFromUserSettings() {
         XCTAssertTrue(AppPaths.support.lastPathComponent.hasPrefix("KeeneticControl-tests-"))
     }
+
+    func testWatchRejectsSuccessfulTransportResultAfterTimeout() async throws {
+        let gate = TransportGate(), transport = FakeTransport()
+        transport.onRun = { _ in try gate.wait(); return "partial response" }
+        transport.onAbort = { gate.release() }
+        let fixture = SessionFixture(transport), session = fixture.session()
+        defer { gate.release(); session.disconnectAll() }
+        try await session.connect()
+        do {
+            _ = try await session.connections.watch(transport, budget: 0.02,
+                                                     owner: fixture.profile.id) {
+                try transport.run("show version")
+            }
+            XCTFail("A response received after the deadline was accepted")
+        } catch { XCTAssertTrue(error is OperationTimeout, "\(error)") }
+        XCTAssertEqual(transport.abortCount, 1)
+    }
+
+    func testCompletedOperationCannotAbortFollowingWork() throws {
+        let cancellation = OperationCancellation()
+        XCTAssertEqual(try cancellation.perform { "complete" }, "complete")
+        var aborts = 0
+        XCTAssertFalse(cancellation.cancel(abort: { aborts += 1 }))
+        XCTAssertFalse(cancellation.cancel(OperationTimeout(), abort: { aborts += 1 }))
+        XCTAssertEqual(aborts, 0)
+    }
+
+    func testCancellingQueuedReadPreservesHealthyConnection() async throws {
+        let gate = TransportGate(), transport = FakeTransport()
+        transport.onRead = { try gate.wait(); return "configuration" }
+        transport.onAbort = { gate.release() }
+        let fixture = SessionFixture(transport), session = fixture.session()
+        defer { gate.release(); session.disconnectAll() }
+        let first = Task { try await session.readConfigText() }
+        await fulfillment(of: [gate.started], timeout: 2)
+        let queued = expectation(description: "Second read enqueued")
+        let second = Task {
+            queued.fulfill()
+            return try await session.readConfigText()
+        }
+        await fulfillment(of: [queued], timeout: 2)
+        second.cancel()
+        gate.release()
+        _ = try await first.value
+        do { _ = try await second.value; XCTFail("Cancelled read succeeded") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(session.status.isOnline)
+        XCTAssertTrue(transport.isAlive)
+        XCTAssertEqual(transport.abortCount, 0)
+        XCTAssertEqual(transport.commands, ["show running-config"])
+    }
+
+    func testConnectReplacesDeadTransport() async throws {
+        let stale = FakeTransport(), fresh = FakeTransport()
+        let fixture = SessionFixture(stale, fresh), session = fixture.session()
+        defer { session.disconnectAll() }
+        try await session.connect()
+        stale.abort()
+        try await session.connect()
+        XCTAssertEqual(fixture.opened.count, 2)
+        XCTAssertTrue(fresh.isAlive)
+        XCTAssertTrue(session.status.isOnline)
+    }
+
+    func testLateLiveStatusPreservesLatestConfiguration() {
+        let fixture = SessionFixture(), session = fixture.session()
+        var state = RouterState(configText: "latest configuration", readAt: Date(timeIntervalSince1970: 2))
+        state.interfaces["Wireguard0"] = KeeneticInterface(ident: "Wireguard0")
+        state.wireguardInterfaces = ["Wireguard0", "Wireguard1"]
+        session.connections.store(state: state, owner: fixture.profile.id)
+        var incoming = KeeneticInterface(ident: "Wireguard0")
+        incoming.pingCheckSuccessCount = 42
+
+        _ = session.connections.mergeLiveInterface(incoming, ident: "Wireguard0", owner: fixture.profile.id)
+
+        XCTAssertEqual(session.state?.configText, state.configText)
+        XCTAssertEqual(session.state?.readAt, state.readAt)
+        XCTAssertEqual(session.state?.wireguardInterfaces, state.wireguardInterfaces)
+        XCTAssertEqual(session.state?.interfaces["Wireguard0"]?.pingCheckSuccessCount, 42)
+    }
+
+    func testCancellingConnectionMonitorKeepsHealthySession() async throws {
+        let gate = TransportGate(), transport = FakeTransport()
+        transport.onRun = { _ in try gate.wait(); return "version" }
+        let fixture = SessionFixture(transport), session = fixture.session()
+        defer { gate.release(); session.disconnectAll() }
+        try await session.connect()
+        let monitor = Task { await session.monitorConnections() }
+        await fulfillment(of: [gate.started], timeout: 2)
+        monitor.cancel()
+        gate.release()
+        await monitor.value
+        XCTAssertTrue(session.status.isOnline)
+        XCTAssertTrue(transport.isAlive)
+        XCTAssertEqual(transport.abortCount, 0)
+    }
+
+    func testConfigurationReadsRejectEmptyAndCLIErrorReplies() async throws {
+        for reply in ["", " \r\n\t", "error: command failed", "unknown command",
+                      "Command::Base error[7405600]: no such command"] {
+            let transport = FakeTransport(), fixture = SessionFixture(transport)
+            transport.onRead = { reply }
+            let session = fixture.session()
+            defer { session.disconnectAll() }
+            do { _ = try await session.readConfigText(); XCTFail("Invalid running-config was accepted") }
+            catch { XCTAssertTrue(error is TransportError) }
+            do { _ = try await session.readStartupConfig(); XCTFail("Invalid startup-config was accepted") }
+            catch { XCTAssertTrue(error is TransportError) }
+            XCTAssertTrue(fixture.backups.isEmpty)
+            XCTAssertEqual(transport.commands, ["show running-config", "show startup-config"])
+        }
+    }
+
+    func testConfigurationReadsAcceptMinimalConfigAndErrorWordsInDescriptions() async throws {
+        for config in ["hostname router", "hostname error:example\ninterface Wireguard0\n"
+                       + " description error: резервный туннель\n"
+                       + " description \"Command::Base error[7405600]: example\"\n"
+                       + " description unknown command example\n"] {
+            let transport = FakeTransport(), fixture = SessionFixture(transport)
+            transport.onRead = { config }
+            let session = fixture.session()
+            defer { session.disconnectAll() }
+            let running = try await session.readConfigText()
+            let startup = try await session.readStartupConfig()
+            XCTAssertEqual(running, config)
+            XCTAssertEqual(startup, config)
+        }
+    }
 }
