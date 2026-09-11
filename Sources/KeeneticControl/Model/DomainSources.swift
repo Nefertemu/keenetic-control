@@ -188,12 +188,15 @@ enum SourceLoader {
 
     private static let subnetCachePrefix = "# keenetic-control-complete-subnets "
 
-    /// Скачивает список (с зеркалами), при неудаче честно берёт локальную копию.
-    static func load(_ spec: SourceSpec, ttlMinutes: Int, forceRefresh: Bool) throws -> SourceData {
+    /// Скачивает список с зеркалами. Обычный просмотр допускает локальную
+    /// копию, а обновление с удалением требует свежего и полного ответа.
+    static func load(_ spec: SourceSpec, ttlMinutes: Int, forceRefresh: Bool,
+                     requireFreshComplete: Bool = false) throws -> SourceData {
         // Подсети — не зеркала, а независимые обязательные компоненты (обычно
         // IPv4 и IPv6). Загружаем их до доменов: частичный набор не должен
         // дойти до Planner и удалить записи через removeStale.
-        let subnets = try loadSubnets(spec, ttlMinutes: ttlMinutes, forceRefresh: forceRefresh)
+        let subnets = try loadSubnets(spec, ttlMinutes: ttlMinutes, forceRefresh: forceRefresh,
+                                     requireFreshComplete: requireFreshComplete)
 
         func finish(_ parsed: Domains.ParseResult, fromCache: Bool, at moment: Date?) -> SourceData {
             var seen = Set(parsed.domains)
@@ -223,7 +226,7 @@ enum SourceLoader {
         let cacheFile = spec.cacheFile
         let cacheDate = (try? FileManager.default.attributesOfItem(atPath: cacheFile.path)[.modificationDate]) as? Date
 
-        if !forceRefresh, ttlMinutes > 0, let cacheDate,
+        if !requireFreshComplete, !forceRefresh, ttlMinutes > 0, let cacheDate,
            Date().timeIntervalSince(cacheDate) / 60 < Double(ttlMinutes),
            let text = try? String(contentsOf: cacheFile, encoding: .utf8) {
             let parsed = Domains.parseList(text)
@@ -237,7 +240,12 @@ enum SourceLoader {
             do {
                 let text = try fetch(url)
                 let parsed = Domains.parseList(text)
-                guard parsed.domains.count >= spec.minDomains else {
+                if requireFreshComplete, !parsed.skipped.isEmpty {
+                    errors.append("\(url): не удалось распознать \(parsed.skipped.count) строк")
+                    continue
+                }
+                let minimum = requireFreshComplete ? max(1, spec.minDomains) : spec.minDomains
+                guard parsed.domains.count >= minimum else {
                     errors.append("\(url): распознано только \(parsed.domains.count) записей")
                     continue
                 }
@@ -248,7 +256,7 @@ enum SourceLoader {
             }
         }
 
-        if let text = try? String(contentsOf: cacheFile, encoding: .utf8) {
+        if !requireFreshComplete, let text = try? String(contentsOf: cacheFile, encoding: .utf8) {
             let parsed = Domains.parseList(text)
             if parsed.domains.count >= spec.minDomains {
                 log(.warn, "\(spec.title): источник не ответил, беру локальную копию.")
@@ -257,16 +265,18 @@ enum SourceLoader {
         }
 
         throw TransportError(
-            "Не удалось загрузить «\(spec.title)», пригодной локальной копии нет.",
+            requireFreshComplete
+                ? "Не удалось полностью загрузить свежий список «\(spec.title)»."
+                : "Не удалось загрузить «\(spec.title)», пригодной локальной копии нет.",
             hint: errors.joined(separator: "\n"))
     }
 
     private static func loadSubnets(_ spec: SourceSpec, ttlMinutes: Int,
-                                    forceRefresh: Bool) throws -> SubnetData {
+                                    forceRefresh: Bool, requireFreshComplete: Bool) throws -> SubnetData {
         guard !spec.subnetURLs.isEmpty else { return .empty }
 
         let cached = readCompleteSubnetCache(spec)
-        if !forceRefresh, ttlMinutes > 0, let cached, let date = cached.fetchedAt,
+        if !requireFreshComplete, !forceRefresh, ttlMinutes > 0, let cached, let date = cached.fetchedAt,
            Date().timeIntervalSince(date) / 60 < Double(ttlMinutes) {
             return cached
         }
@@ -281,7 +291,11 @@ enum SourceLoader {
         for url in spec.rawSubnetURLs {
             do {
                 let text = try fetch(url)
-                let parsed = Domains.parseSubnets(text)
+                let parsed = Domains.parseSubnetsWithDiagnostics(text)
+                if requireFreshComplete, !parsed.skipped.isEmpty {
+                    errors.append("\(url): не удалось распознать \(parsed.skipped.count) строк подсетей")
+                    continue
+                }
                 guard !parsed.v4.isEmpty || !parsed.v6.isEmpty else {
                     errors.append("\(url): не распознано ни одной подсети")
                     continue
@@ -302,7 +316,7 @@ enum SourceLoader {
         // Любая неудачная часть запрещает использовать свежую склейку. Полный
         // старый кэш безопаснее: removeStale увидит целый набор, а не случайный
         // IPv4 без IPv6 (или наоборот).
-        if let cached {
+        if !requireFreshComplete, let cached {
             let details = errors.joined(separator: "; ")
             log(.warn, "\(spec.title): не загрузились все файлы подсетей; "
                 + "беру полную локальную копию. \(details)")
@@ -314,8 +328,10 @@ enum SourceLoader {
             : errors.joined(separator: "\n")
         throw TransportError(
             "Не удалось полностью загрузить подсети для «\(spec.title)».",
-            hint: details + "\nПолной локальной копии нет. Частичный результат отброшен, "
-                + "чтобы обновление не удалило отсутствующую часть списка.")
+            hint: details + (requireFreshComplete
+                ? "\nДля обновления с удалением нужны свежие данные из каждого файла. "
+                : "\nПолной локальной копии нет. ")
+                + "Частичный результат отброшен, чтобы обновление не удалило отсутствующую часть списка.")
     }
 
     /// Принимаем только кэш, который был создан после успешной загрузки всех

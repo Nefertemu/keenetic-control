@@ -158,6 +158,8 @@ final class UIRegressionTests: XCTestCase {
                 XCTAssertLessThanOrEqual(content.width, width + 1)
                 XCTAssertGreaterThan(content.height, 400, "Content was squeezed out")
                 XCTAssertEqual(hosting.bounds.width, width, accuracy: 1)
+                XCTAssertEqual(hosting.bounds.height, 760, accuracy: 1,
+                               "Content must not force the actual window taller than the viewport")
 
                 let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
                 hosting.cacheDisplay(in: hosting.bounds, to: bitmap)

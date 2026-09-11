@@ -14,7 +14,8 @@ enum Domains {
         let tokens = value.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
         guard let first = tokens.first else { return nil }
         // Формат hosts-файла: «0.0.0.0 example.com».
-        value = (tokens.count >= 2 && IPTools.isIP(first)) ? tokens[1] : first
+        let nameIndex = tokens.count >= 2 && IPTools.isIP(first) ? 1 : 0
+        value = tokens[nameIndex]
 
         if value.hasPrefix("||") { value = String(value.dropFirst(2)) }
         while value.hasSuffix("^") { value = String(value.dropLast()) }
@@ -44,7 +45,19 @@ enum Domains {
 
         guard value.count <= 253 else { return nil }
         let labels = value.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
-        guard labels.count >= 2 else { return nil }
+        // Списки могут содержать целую зону (.ua); Keenetic включает все
+        // поддомены указанного имени. Уже очищенное ua должно повторно
+        // нормализоваться так же при планировании, а случайное ERROR — нет.
+        if labels.count < 2 {
+            guard IanaTopLevelDomains.all.contains(value) else { return nil }
+            // network и page — настоящие TLD, но «network failure» и
+            // «page not found» не списки. После зоны допускается лишь
+            // комментарий; hosts-адрес уже отделён выше.
+            if let tail = tokens.dropFirst(nameIndex + 1).first,
+               !["#", "!", ";", "//"].contains(where: { tail.hasPrefix($0) }) {
+                return nil
+            }
+        }
         for label in labels {
             let range = NSRange(label.startIndex..., in: label)
             guard labelPattern.firstMatch(in: label, range: range) != nil else { return nil }
@@ -65,7 +78,7 @@ enum Domains {
         var result = ParseResult()
         var seen = Set<String>()
 
-        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        for raw in CLI.normalizeNewlines(text).split(separator: "\n", omittingEmptySubsequences: false) {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
             if trimmed.hasPrefix("#") || trimmed.hasPrefix("!")
@@ -86,13 +99,28 @@ enum Domains {
         return result
     }
 
+    struct SubnetParseResult {
+        var v4: [String]
+        var v6: [String]
+        var skipped: [String]
+    }
+
     /// Списки подсетей отдаются отдельными файлами по семействам адресов.
     static func parseSubnets(_ text: String) -> (v4: [String], v6: [String]) {
+        let parsed = parseSubnetsWithDiagnostics(text)
+        return (parsed.v4, parsed.v6)
+    }
+
+    /// Автоматическое удаление требует полного разбора каждого компонента.
+    /// Неверные строки сохраняем отдельно, чтобы отличить пустой комментарий
+    /// от повреждения, которое раньше могло незаметно обрезать набор подсетей.
+    static func parseSubnetsWithDiagnostics(_ text: String) -> SubnetParseResult {
         var v4: [String] = []
         var v6: [String] = []
+        var skipped: [String] = []
         var seen = Set<String>()
 
-        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        for raw in CLI.normalizeNewlines(text).split(separator: "\n", omittingEmptySubsequences: false) {
             var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if value.isEmpty { continue }
             for marker in ["#", "!", ";", "//"] where value.hasPrefix(marker) { value = "" }
@@ -108,11 +136,15 @@ enum Domains {
                 normalized = "\(IPTools.formatIPv6(ipv6))/128"
             }
 
-            guard let network = normalized, !seen.contains(network) else { continue }
+            guard let network = normalized else {
+                skipped.append(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+                continue
+            }
+            guard !seen.contains(network) else { continue }
             seen.insert(network)
             if network.contains(":") { v6.append(network) } else { v4.append(network) }
         }
 
-        return (v4, v6)
+        return SubnetParseResult(v4: v4, v6: v6, skipped: skipped)
     }
 }

@@ -8,6 +8,7 @@ final class RouterSession: ObservableObject {
     let connections: RouterConnectionManager
     private let executor: RouterPlanExecutor
     private var observation: AnyCancellable?
+    let domainListUpdater = DomainListUpdateController(catalogProvider: { Store.shared.allSources })
 
     init(router: RouterProfile, dependencies: RouterSessionDependencies = .live) {
         connections = RouterConnectionManager(router: router, dependencies: dependencies)
@@ -72,8 +73,10 @@ final class RouterSession: ObservableObject {
               method: InterfaceProbeMethod = .icmp, port: Int? = nil) async throws -> InterfacePingResult {
         try await connections.ping(interface: interface, target: target, count: count, method: method, port: port)
     }
-    func apply(plan: Plan, dryRun: Bool, saveConfig: Bool) async throws -> ApplyOutcome {
-        try await executor.apply(plan: plan, dryRun: dryRun, saveConfig: saveConfig)
+    func apply(plan: Plan, dryRun: Bool, saveConfig: Bool,
+               preWriteCheck: (() throws -> Void)? = nil) async throws -> ApplyOutcome {
+        try await executor.apply(plan: plan, dryRun: dryRun, saveConfig: saveConfig,
+                                 preWriteCheck: preWriteCheck)
     }
     func withExclusiveWriteOperation<T>(operation: RouterOperation,
                                         _ body: @MainActor () async throws -> T) async throws -> T {
@@ -102,8 +105,10 @@ final class RouterSession: ObservableObject {
     func readStartupConfig(operation: RouterOperation) async throws -> String {
         try await connections.readStartupConfig(operation: operation)
     }
-    func loadSource(_ spec: SourceSpec, forceRefresh: Bool) async throws -> SourceData {
-        try await connections.loadSource(spec, forceRefresh: forceRefresh)
+    func loadSource(_ spec: SourceSpec, forceRefresh: Bool,
+                    requireFreshComplete: Bool = false) async throws -> SourceData {
+        try await connections.loadSource(spec, forceRefresh: forceRefresh,
+                                         requireFreshComplete: requireFreshComplete)
     }
     func setActivity(_ text: String?, owner: UUID? = nil) { connections.setActivity(text, owner: owner) }
     func setProgress(_ info: ProgressInfo?, owner: UUID? = nil) { connections.setProgress(info, owner: owner) }

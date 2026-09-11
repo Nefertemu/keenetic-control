@@ -1168,15 +1168,30 @@ final class RouterConnectionManager: ObservableObject {
 
     // MARK: - Загрузка списков доменов
 
-    func loadSource(_ spec: SourceSpec, forceRefresh: Bool) async throws -> SourceData {
+    func loadSource(_ spec: SourceSpec, forceRefresh: Bool,
+                    requireFreshComplete: Bool = false) async throws -> SourceData {
         let ttl = dependencies.settings().cacheTTLMinutes
         let operation = beginOperation()
         let owner = operation.routerID
         store(activity: "Загружаю «\(spec.title)»…", owner: owner)
         defer { if isCurrent(operation) { clearActivity(owner: owner) } }
         return try await background(owner: owner) {
-            try SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh)
+            try SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh,
+                                  requireFreshComplete: requireFreshComplete)
         }
+    }
+
+    /// Используем уже прочитанный running-config, сохраняя живые счётчики.
+    func storeConfigurationSnapshot(_ text: String, owner: UUID) {
+        let previous = readState(for: owner)
+        let pingCheck = PingCheckParser.parse(config: text)
+        store(state: RouterState(
+            configText: text, groups: RouterConfigParser.parseFqdnGroups(text),
+            interfaces: previous?.interfaces ?? [:], candidates: previous?.candidates ?? [],
+            staticRoutes: StaticRouteParser.parse(config: text),
+            wireguardInterfaces: WireGuardState.interfaceNames(config: text),
+            pingCheckProfiles: pingCheck.profiles, pingCheckBindings: pingCheck.bindings,
+            readAt: Date()), owner: owner)
     }
 
     // MARK: - Инструменты

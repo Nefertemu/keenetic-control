@@ -1,5 +1,12 @@
 import Foundation
 
+/// Однокнопочное обновление показывает копию даже после частичной записи.
+struct DomainListApplicationError: LocalizedError {
+    let cause: Error
+    let backupURL: URL
+    var errorDescription: String? { RouterConnectionManager.describeError(cause) }
+}
+
 /// Выполнение планов: резервная копия, команды, сохранение и проверка.
 /// Пул соединений и поколения операций принадлежат только менеджеру.
 @MainActor
@@ -48,7 +55,8 @@ final class RouterPlanExecutor {
 
     // MARK: - Применение плана
 
-    func apply(plan: Plan, dryRun: Bool, saveConfig: Bool) async throws -> ApplyOutcome {
+    func apply(plan: Plan, dryRun: Bool, saveConfig: Bool,
+               preWriteCheck: (() throws -> Void)? = nil) async throws -> ApplyOutcome {
         guard !plan.isEmpty else { return ApplyOutcome(applied: true) }
         let profile = connections.router
         let operation = connections.beginOperation()
@@ -84,6 +92,14 @@ final class RouterPlanExecutor {
         }
         try connections.requireCurrent(operation)
         let configText = try ConfigurationText.validated(rawConfigText)
+        try preWriteCheck?()
+
+        let preconditions = PlanVerifier.preconditionProblems(
+            plan: plan, groups: RouterConfigParser.parseFqdnGroups(configText))
+        guard preconditions.isEmpty else {
+            throw TransportError("Списки изменились после сверки. Обновление остановлено до записи.",
+                                 hint: preconditions.joined(separator: "\n"))
+        }
 
         guard let backupURL = connections.dependencies.backup(
             profile, configText, connections.dependencies.settings().keepBackups) else {
@@ -103,16 +119,7 @@ final class RouterPlanExecutor {
 
         log(.info, "\(plan.title): отправляю \(Format.commands(plan.commands.count)).")
 
-        do {
-            try await execute(plan.commands, transport: transport, batchSize: batchSize,
-                              operation: operation)
-        } catch {
-            log(.error, "Выполнение остановлено: \(connections.describe(error))")
-            log(.warn, "Конфигурация НЕ сохранена. Часть команд могла примениться — проверь бэкап.")
-            throw error
-        }
-
-        if saveConfig {
+        func save() async throws {
             try connections.requireCurrent(operation)
             connections.store(activity: "Сохраняю конфигурацию роутера…", owner: owner)
             let output = try await connections.watch(transport, budget: 200, owner: owner) {
@@ -126,18 +133,35 @@ final class RouterPlanExecutor {
             log(.ok, "Конфигурация сохранена.")
         }
 
-        connections.store(activity: "Перечитываю конфигурацию для проверки…", owner: owner)
-        let problems = try await verify(plan: plan, transport: transport, limit: limit,
-                                        operation: operation)
+        do {
+            try await execute(plan.commands, transport: transport, batchSize: batchSize,
+                              operation: operation)
+            var problems: [String] = []
+            if plan.verifyBeforeSave {
+                connections.store(activity: "Перечитываю конфигурацию для проверки…", owner: owner)
+                problems = try await verify(plan: plan, transport: transport, limit: limit,
+                                            operation: operation)
+            }
+            if saveConfig && problems.isEmpty { try await save() }
+            if !plan.verifyBeforeSave {
+                connections.store(activity: "Перечитываю конфигурацию для проверки…", owner: owner)
+                problems = try await verify(plan: plan, transport: transport, limit: limit,
+                                            operation: operation)
+            }
 
-        let elapsed = Date().timeIntervalSince(started)
-        if problems.isEmpty {
-            log(.ok, "Готово за \(Format.duration(elapsed)): " + plan.summary.joined(separator: ", "))
-        } else {
-            for problem in problems { log(.warn, "Проверка: \(problem)") }
+            let elapsed = Date().timeIntervalSince(started)
+            if problems.isEmpty {
+                log(.ok, "Готово за \(Format.duration(elapsed)): " + plan.summary.joined(separator: ", "))
+            } else {
+                for problem in problems { log(.warn, "Проверка: \(problem)") }
+            }
+            return ApplyOutcome(applied: true, problems: problems, backupURL: backupURL, elapsed: elapsed)
+        } catch {
+            log(.error, "Выполнение остановлено: \(connections.describe(error))")
+            log(.warn, "Часть команд могла примениться — проверь резервную копию.")
+            if plan.verifyBeforeSave { throw DomainListApplicationError(cause: error, backupURL: backupURL) }
+            throw error
         }
-
-        return ApplyOutcome(applied: true, problems: problems, backupURL: backupURL, elapsed: elapsed)
     }
 
     /// Пакетная отправка: `include`-команды летят пачками, остальные по одной.
@@ -211,18 +235,7 @@ final class RouterPlanExecutor {
         let problems = PlanVerifier.problems(plan: plan, groups: groups, limit: limit)
 
         // Обновляем состояние из уже прочитанной конфигурации — лишний раз не ходим.
-        let previous = connections.readState(for: owner)
-        let pingCheck = PingCheckParser.parse(config: configText)
-        connections.store(state: RouterState(
-            configText: configText,
-            groups: groups,
-            interfaces: previous?.interfaces ?? [:],
-            candidates: previous?.candidates ?? [],
-            staticRoutes: StaticRouteParser.parse(config: configText),
-            wireguardInterfaces: WireGuardState.interfaceNames(config: configText),
-            pingCheckProfiles: pingCheck.profiles,
-            pingCheckBindings: pingCheck.bindings,
-            readAt: Date()), owner: owner)
+        connections.storeConfigurationSnapshot(configText, owner: owner)
 
         return problems
     }

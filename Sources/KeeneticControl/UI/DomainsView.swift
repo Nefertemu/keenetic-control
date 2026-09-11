@@ -13,6 +13,10 @@ struct DomainsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            DomainListUpdateSection(session: session)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+
             Picker("", selection: $tab) {
                 ForEach(DomainsTab.allCases) { item in
                     Text(item.title).tag(item)
@@ -54,9 +58,9 @@ enum DomainsTab: String, CaseIterable, Identifiable {
     var explanation: String {
         switch self {
         case .sources:
-            return "Шаг 1 — наполнить списки доменами. Маршруты при этом не меняются."
+            return "Добавить новые источники или создать список вручную."
         case .routes:
-            return "Шаг 2 — направить списки в туннели. Содержимое списков не меняется."
+            return "Выбрать туннели и порядок переключения для установленных списков."
         }
     }
 }

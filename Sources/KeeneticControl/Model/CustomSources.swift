@@ -59,11 +59,43 @@ struct CustomSource: Codable, Identifiable, Hashable {
     /// показаться «своим». Нужна не только редактору: старый файл настроек
     /// уже может содержать такую пару.
     static func conflictingSourceTitles(_ specs: [SourceSpec]) -> [String] {
-        Dictionary(grouping: specs, by: { canonicalPrefix($0.descriptionPrefix) })
-            .values
-            .filter { $0.count > 1 }
-            .map { $0.map(\.title).sorted().joined(separator: " / ") }
-            .sorted()
+        var visited = Set<Int>()
+        var conflicts: [String] = []
+        for index in specs.indices where !visited.contains(index) {
+            var component = [index]
+            visited.insert(index)
+            var cursor = 0
+            while cursor < component.count {
+                let current = component[cursor]
+                cursor += 1
+                for candidate in specs.indices where !visited.contains(candidate)
+                    && prefixesOverlap(specs[current], specs[candidate]) {
+                    visited.insert(candidate)
+                    component.append(candidate)
+                }
+            }
+            if component.count > 1 {
+                conflicts.append(component.map { specs[$0].title }.sorted().joined(separator: " / "))
+            }
+        }
+        return conflicts.sorted()
+    }
+
+    /// «Example 2» — одновременно первая часть одноимённого источника и
+    /// вторая часть «Example». Проверяем также будущие части, даже если
+    /// конфликтующего списка ещё нет на роутере.
+    private static func prefixesOverlap(_ lhs: SourceSpec, _ rhs: SourceSpec) -> Bool {
+        let left = canonicalPrefix(lhs.descriptionPrefix)
+        let right = canonicalPrefix(rhs.descriptionPrefix)
+        func isNumberedPart(_ description: String, of prefix: String) -> Bool {
+            let start = prefix + " "
+            guard description.hasPrefix(start) else { return false }
+            let suffix = description.dropFirst(start.count)
+            return !suffix.isEmpty && suffix.utf8.allSatisfy { (48...57).contains($0) }
+        }
+        // Канонизируем обе стороны: «my-list» и «my list 2» могут пересечься
+        // в описании «my-list 2», хотя исходные префиксы написаны по-разному.
+        return left == right || isNumberedPart(left, of: right) || isNumberedPart(right, of: left)
     }
 
     static func validate(_ source: CustomSource, existing: [CustomSource]) throws {
@@ -81,11 +113,11 @@ struct CustomSource: Codable, Identifiable, Hashable {
         }
         // Совпадение префикса означало бы, что два источника считают одни и те
         // же списки роутера своими и будут затирать записи друг друга.
-        let taken = SourceCatalog.all.map(\.descriptionPrefix)
-            + existing.filter { $0.id != source.id }.map(\.descriptionPrefix)
-        let canonical = canonicalPrefix(prefix)
-        guard !taken.contains(where: { canonicalPrefix($0) == canonical }) else {
-            throw TransportError("Префикс «\(prefix)» уже занят другим источником.",
+        let taken = SourceCatalog.all + existing.filter { $0.id != source.id }.map(\.spec)
+        var cleaned = source
+        cleaned.descriptionPrefix = prefix
+        guard !taken.contains(where: { prefixesOverlap(cleaned.spec, $0) }) else {
+            throw TransportError("Префикс «\(prefix)» совпадает с другим источником или номером его части.",
                                  hint: "Иначе два источника будут спорить за одни и те же "
                                      + "списки на роутере.")
         }

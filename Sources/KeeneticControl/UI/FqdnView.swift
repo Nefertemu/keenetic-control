@@ -96,11 +96,11 @@ struct FqdnView: View {
 
     private var intro: some View {
         VStack(alignment: .leading, spacing: 10) {
-            CardHeader(icon: "list.bullet.rectangle", title: "Загрузка списков доменов",
-                       subtitle: "Импорт наполняет object-group fqdn и НИКОГДА не трогает маршруты")
+            CardHeader(icon: "list.bullet.rectangle", title: "Добавление списков доменов",
+                       subtitle: "Первый импорт и ручная загрузка выбранных источников")
 
-            Text("Домены и подсети раскладываются по частям не больше \(store.settings.chunkSize) записей — "
-                 + "как того требует прошивка. Части нумеруются автоматически.")
+            Text("Ручной импорт делит списки на части до \(store.settings.chunkSize) записей и не меняет маршруты. "
+                 + "Новым частям назначь туннели на вкладке «Маршруты». Для регулярного обновления используй кнопку «Обновить списки» выше.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -151,7 +151,7 @@ struct FqdnView: View {
 
     private var sourcesHeader: some View {
         CardHeader(icon: "square.stack.3d.up", title: "Источники",
-                   subtitle: "Отметь то, что хочешь залить — можно несколько сразу")
+                   subtitle: "Выбери источники для ручного импорта — можно несколько сразу")
     }
 
     private var sourceActions: some View {
@@ -293,7 +293,8 @@ struct FqdnView: View {
 
     private var options: some View {
         VStack(alignment: .leading, spacing: 14) {
-            CardHeader(icon: "slider.horizontal.3", title: "Как загружать")
+            CardHeader(icon: "slider.horizontal.3", title: "Параметры ручного импорта",
+                       subtitle: "Эти параметры относятся к плану ниже. Обновление одной кнопкой всегда загружает свежие данные и убирает устаревшие записи.")
 
             Toggle(isOn: $removeStale) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -361,7 +362,7 @@ struct FqdnView: View {
     }
 
     private var safetyNote: some View {
-        Text("Ничего не уйдёт на роутер, пока ты не подтвердишь план.")
+        Text("Ручной импорт выполняется после подтверждения плана.")
             .font(.system(size: 11))
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)

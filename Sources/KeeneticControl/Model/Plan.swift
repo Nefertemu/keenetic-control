@@ -11,8 +11,15 @@ struct PlannedDnsRoute: Hashable {
     }
 }
 
-/// План изменений: сначала считаем всё на берегу, показываем — и только потом
-/// отправляем на роутер. Один движок на импорт списков и на маршруты.
+/// Снимок всех частей одного источника, на котором основано обновление.
+/// Сравнивается с новым running-config непосредственно перед записью.
+struct DomainListBaseline {
+    var spec: SourceSpec
+    var groups: [String: FqdnGroup]
+}
+
+/// План изменений рассчитывается до отправки команд. Ручные действия показывают
+/// предпросмотр, обновление источников применяет план с повторной проверкой.
 struct Plan: Identifiable {
     /// Стабильный идентификатор важен для SwiftUI: план показывается в sheet,
     /// и новый UUID при каждой перерисовке заставлял бы окно пересоздаваться.
@@ -40,6 +47,13 @@ struct Plan: Identifiable {
     /// последовательность строк определяет приоритет интерфейсов. Здесь
     /// хранится ожидаемая полная цепочка каждого изменяемого списка.
     var exactRouteChains: [String: [DnsRouteAssignment]] = [:]
+    /// Обновление источника проверяет весь итоговый набор, а не только
+    /// отправленные include/no include: лишние записи тоже означают ошибку.
+    var expectedGroupContents: [String: Set<String>] = [:]
+    var groupEntryLimit: Int?
+    var domainListBaselines: [DomainListBaseline] = []
+    /// Одно нажатие сохраняет обновление только после успешной проверки.
+    var verifyBeforeSave = false
     var notes: [String] = []
 
     var addCount: Int { adds.values.reduce(0) { $0 + $1.count } }
@@ -84,8 +98,54 @@ struct Plan: Identifiable {
 /// Проверка управляемой части конфигурации вынесена из сетевой сессии, чтобы
 /// одинаково строго проверять как реальный роутер, так и тестовые снимки.
 enum PlanVerifier {
+    static func preconditionProblems(plan: Plan, groups: [String: FqdnGroup]) -> [String] {
+        guard !plan.domainListBaselines.isEmpty else { return [] }
+        var problems: [String] = []
+        for baseline in plan.domainListBaselines {
+            let current = Dictionary(uniqueKeysWithValues:
+                Planner.managedGroups(groups, spec: baseline.spec).map { ($0.ident, $0) })
+            if current != baseline.groups {
+                problems.append("\(baseline.spec.title): списки или их маршруты изменились во время проверки. Повтори обновление.")
+            }
+        }
+        for group in plan.createdGroups where groups[group.ident] != nil {
+            problems.append("\(group.ident): имя новой части уже занято. Повтори обновление.")
+        }
+        return problems
+    }
+
     static func problems(plan: Plan, groups: [String: FqdnGroup], limit: Int) -> [String] {
         var problems: [String] = []
+
+        for (ident, expected) in plan.expectedGroupContents.sorted(by: { $0.key < $1.key }) {
+            guard let current = groups[ident] else {
+                problems.append("\(ident): список не найден после обновления")
+                continue
+            }
+            let missing = expected.subtracting(current.includes)
+            let unexpected = current.includes.subtracting(expected)
+            if !missing.isEmpty || !unexpected.isEmpty {
+                problems.append("\(ident): содержимое не совпало — отсутствует \(missing.count), лишних записей \(unexpected.count)")
+            }
+        }
+        if !plan.domainListBaselines.isEmpty {
+            let expectedGroups = plan.domainListBaselines.flatMap { $0.groups.values } + plan.createdGroups
+            for expected in expectedGroups {
+                if let actual = groups[expected.ident], actual.descriptionText != expected.descriptionText {
+                    problems.append("\(expected.ident): имя части изменилось — следующий запуск не сможет надёжно найти её")
+                }
+            }
+            for baseline in plan.domainListBaselines {
+                let createdIDs = plan.createdGroups.filter {
+                    Planner.sourceGroupNumber(description: $0.descriptionText, spec: baseline.spec) != nil
+                }.map(\.ident)
+                let expectedIDs = Set(baseline.groups.keys).union(createdIDs)
+                let actualIDs = Set(Planner.managedGroups(groups, spec: baseline.spec).map(\.ident))
+                if !actualIDs.subtracting(expectedIDs).isEmpty {
+                    problems.append("\(baseline.spec.title): во время обновления появились дополнительные части, повтори проверку")
+                }
+            }
+        }
 
         for (ident, domains) in plan.adds {
             let current = groups[ident]?.includes ?? []
@@ -128,9 +188,18 @@ enum PlanVerifier {
         // поэтому результат обязан совпасть полностью: и порядок, и флаги,
         // и отсутствие лишних строк.
         for (ident, expected) in plan.exactRouteChains.sorted(by: { $0.key < $1.key }) {
-            let group = groups[ident]
-            let actual = group?.routeAssignments ?? []
-            if let group, actual.count != group.routeLines.count {
+            guard let group = groups[ident] else {
+                if plan.expectedGroupContents[ident] == nil {
+                    problems.append("\(ident): список не найден после применения")
+                }
+                continue
+            }
+            let actual = group.routeAssignments
+            if !plan.domainListBaselines.isEmpty,
+               (try? DomainListSyncPlanner.validatedRouteChain(group, sourceTitle: ident)) == nil {
+                problems.append("\(ident): цепочка содержит неподдерживаемые или повторяющиеся маршруты")
+            }
+            if actual.count != group.routeLines.count {
                 problems.append("\(ident): часть строк маршрутов не распознана, "
                                 + "цепочка небезопасна для проверки")
             }
@@ -145,9 +214,10 @@ enum PlanVerifier {
                 problems.append("\(target.group): маршрут на \(target.interface) остался")
             }
         }
-        for ident in Set(plan.adds.keys).union(plan.removes.keys) {
-            if let group = groups[ident], group.includes.count > limit {
-                problems.append("\(ident): превышен лимит \(group.includes.count)/\(limit)")
+        let effectiveLimit = min(max(1, limit), plan.groupEntryLimit ?? max(1, limit))
+        for ident in Set(plan.adds.keys).union(plan.removes.keys).union(plan.expectedGroupContents.keys).sorted() {
+            if let group = groups[ident], group.includes.count > effectiveLimit {
+                problems.append("\(ident): превышен лимит \(group.includes.count)/\(effectiveLimit)")
             }
         }
         return problems
@@ -601,6 +671,14 @@ enum Planner {
             for (group, chain) in plan.exactRouteChains {
                 merged.exactRouteChains[group] = chain
             }
+            for (group, contents) in plan.expectedGroupContents {
+                merged.expectedGroupContents[group] = contents
+            }
+            if let limit = plan.groupEntryLimit {
+                merged.groupEntryLimit = min(merged.groupEntryLimit ?? limit, limit)
+            }
+            merged.domainListBaselines.append(contentsOf: plan.domainListBaselines)
+            merged.verifyBeforeSave = merged.verifyBeforeSave || plan.verifyBeforeSave
             merged.notes.append(contentsOf: plan.notes)
         }
 
