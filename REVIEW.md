@@ -283,4 +283,4 @@ macOS. Для проверки наполненных экранов прочи�
 интерфейса**. Все 8 источников загружены полностью без кэша. Подписанный архив
 распакован отдельно; строгая проверка подписи, версия и совпадение бинарного
 файла подтверждены. Логи: `.build/improvements-shipping-tests.log` и
-`.build/improvements-shipping-build.log`.
+`.build/improvements-release-final-build.log`.

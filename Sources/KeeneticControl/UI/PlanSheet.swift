@@ -356,7 +356,10 @@ struct OutcomeSheet: View {
                     Text("Проверка нашла расхождения")
                         .font(.system(size: 12, weight: .semibold))
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 6) {
+                        // The finished report is finite. Measure all rows so
+                        // AppKit always has their real positions when jumping
+                        // to the end, including on macOS 15.
+                        VStack(alignment: .leading, spacing: 6) {
                             ForEach(Array(outcome.problems.enumerated()), id: \.offset) { _, problem in
                                 Text("• " + problem)
                                     .font(.system(size: 11, design: .monospaced))
@@ -367,8 +370,8 @@ struct OutcomeSheet: View {
                         }
                     }
                     .frame(height: min(280, max(90, CGFloat(outcome.problems.count) * 48)))
-                    // AppKit can redraw a scrolled LazyVStack outside its
-                    // viewport, covering the sheet header and footer.
+                    // Long selectable rows must stay inside the viewport,
+                    // leaving the sheet header and close action visible.
                     .clipped()
                 }
                 .padding(12)

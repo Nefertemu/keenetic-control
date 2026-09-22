@@ -34,15 +34,30 @@ final class RouteExplanationUITests: XCTestCase {
             let window = makeWindow(hosting, width: 540, appearance: appearance)
             defer { window.orderOut(nil); window.close() }
             try await settle(hosting)
-            let text = try capture(hosting, name: "route-explanation-disabled-\(theme)-540")
+            let text = try capture(hosting, name: "route-explanation-disabled-\(theme)-540", technical: true)
             XCTAssertTrue(text.contains { $0.contains("Отключён") || $0.contains("Отключен") }, "\(text)")
-            XCTAssertTrue(text.contains { $0.contains("ip route disable") }, "\(text)")
+            let normalizedText = text.joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            XCTAssertTrue(normalizedText.contains("ip route disable"), "\(text)")
             XCTAssertFalse(text.contains { $0.contains("Наиболее точное правило") }, "\(text)")
         }
     }
 
     func testMalformedDisableBlocksImportInActualWindow() async throws {
         let parsed = StaticRouteParser.parseImport("ip route 203.0.113.10 Wireguard0\nipv6 route disable")
+        // Establish the button's actual geometry with an enabled control and
+        // prove that clicking it invokes the callback. The disabled label's
+        // low contrast must not determine whether the negative test can click.
+        var validAccepted = false
+        let validHosting = NSHostingView(rootView: ImportPreview(routes: parsed.routes, skipped: [],
+            onAccept: { _ in validAccepted = true }, onCancel: {}).environment(\.colorScheme, .light))
+        let validWindow = makeWindow(validHosting, width: 540, appearance: .aqua)
+        defer { validWindow.orderOut(nil); validWindow.close() }
+        try await settle(validHosting)
+        let buttonCenter = try NativeUIInteractions.center(of: "Составить план", in: validHosting)
+        try NativeUIInteractions.click(at: buttonCenter, in: validHosting, window: validWindow)
+        try await settle(validHosting)
+        XCTAssertTrue(validAccepted, "The control click must reach the enabled import button")
+        validWindow.orderOut(nil)
         var accepted = false
         let hosting = NSHostingView(rootView: ImportPreview(routes: parsed.routes, skipped: parsed.skipped,
             onAccept: { _ in accepted = true }, onCancel: {}).environment(\.colorScheme, .light))
@@ -51,7 +66,8 @@ final class RouteExplanationUITests: XCTestCase {
         try await settle(hosting)
         let text = try capture(hosting, name: "static-route-invalid-disable-light-540")
         XCTAssertTrue(text.contains { $0.contains("импорт заблокирован") }, "\(text)")
-        try NativeUIInteractions.click("Составить план", in: hosting, window: window)
+        XCTAssertEqual(hosting.bounds.size, validHosting.bounds.size)
+        try NativeUIInteractions.click(at: buttonCenter, in: hosting, window: window)
         try await settle(hosting)
         XCTAssertFalse(accepted, "A broken disable directive must never silently enable the preceding route")
     }
@@ -101,14 +117,16 @@ final class RouteExplanationUITests: XCTestCase {
                 XCTAssertEqual(hosting.bounds.width, width, accuracy: 1)
                 XCTAssertEqual(hosting.bounds.height, 760, accuracy: 1)
                 let stem = "route-explanation-\(name)-\(theme)-\(Int(width))"
-                let text = try capture(hosting, name: stem)
+                let text = try capture(hosting, name: stem, technical: true)
                 for expected in ["Поиск маршрута", "Найти маршрут"] + required {
                     XCTAssertTrue(text.contains { $0.contains(expected) }, "Missing \(expected): \(text)")
                 }
                 let scroll = try XCTUnwrap(descendants(hosting).compactMap { $0 as? NSScrollView }.first)
                 let document = try XCTUnwrap(scroll.documentView)
                 for _ in 0..<4 {
-                    document.scroll(NSPoint(x: 0, y: document.bounds.maxY))
+                    let bottomY = max(document.bounds.minY, document.bounds.maxY - scroll.contentView.bounds.height)
+                    document.scroll(NSPoint(x: 0, y: bottomY))
+                    scroll.reflectScrolledClipView(scroll.contentView)
                     try await settle(hosting)
                 }
                 XCTAssertGreaterThan(scroll.contentView.bounds.minY, 0)
@@ -141,15 +159,11 @@ final class RouteExplanationUITests: XCTestCase {
         hosting.layoutSubtreeIfNeeded()
     }
 
-    private func capture(_ hosting: NSView, name: String) throws -> [String] {
+    private func capture(_ hosting: NSView, name: String, technical: Bool = false) throws -> [String] {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let png = try NativeUIInteractions.renderedPNG(in: hosting)
         try png.write(to: outputDirectory.appendingPathComponent(name + ".png"))
-        let request = try NativeUIInteractions.recognitionRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["ru-RU", "en-US"]
-        try VNImageRequestHandler(data: png, options: [:]).perform([request])
-        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+        return try NativeUIInteractions.labels(in: png, includeTechnicalPass: technical)
     }
 
     private func descendants(_ view: NSView) -> [NSView] {

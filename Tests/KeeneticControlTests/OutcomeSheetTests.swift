@@ -17,8 +17,8 @@ final class OutcomeSheetTests: XCTestCase {
         _ = NSApplication.shared
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let problems = (1...100).map { index in
-            let start = index == 1 ? "FIRSTROW001\n" : ""
-            let end = index == 100 ? "\nLASTROW100" : ""
+            let start = index == 1 ? "ПЕРВАЯ ОШИБКА\n" : ""
+            let end = index == 100 ? "\nПОСЛЕДНЯЯ ОШИБКА" : ""
             return start + "Список \(index): маршрут на резервный интерфейс удалённого офиса "
                 + "не совпал с планом. Ожидалась цепочка Wireguard0, Wireguard1, Wireguard2; "
                 + "получено Wireguard0. Проверь порядок резервирования, доступность туннелей "
@@ -57,9 +57,9 @@ final class OutcomeSheetTests: XCTestCase {
         let initial = try capture(hosting, name: "outcome-\(theme)-640")
         let initialLabels = try labels(in: initial)
         let firstClose = try visibleClose(in: initialLabels)
-        XCTAssertTrue(initialLabels.contains { normalized($0.text).contains("FIRSTROW001") },
-                      "The first problem must be readable when the sheet opens")
-        XCTAssertFalse(initialLabels.contains { normalized($0.text).contains("LASTROW100") },
+        XCTAssertTrue(initialLabels.contains { normalized($0.text).contains(normalized("ПЕРВАЯ ОШИБКА")) },
+                      "The first problem must be readable when the sheet opens: \(initialLabels.map(\.text))")
+        XCTAssertFalse(initialLabels.contains { normalized($0.text).contains(normalized("ПОСЛЕДНЯЯ ОШИБКА")) },
                        "The large fixture must require scrolling")
 
         let scroll = try XCTUnwrap(subviews(hosting).compactMap { $0 as? NSScrollView }.max {
@@ -71,22 +71,19 @@ final class OutcomeSheetTests: XCTestCase {
         XCTAssertTrue(hosting.bounds.insetBy(dx: -1, dy: -1).contains(viewport),
                       "The problems viewport must stay inside the sheet")
 
-        // Place the *bottom* of the viewport at the document's end. Scrolling
-        // its top to maxY overshoots by a whole viewport on macOS 15 and makes
-        // LazyVStack display no rows. Repeat after estimates become exact.
-        for _ in 0..<4 {
-            let bottomOrigin = max(document.bounds.minY,
-                                   document.bounds.maxY - scroll.contentView.bounds.height)
-            document.scroll(NSPoint(x: document.bounds.minX, y: bottomOrigin))
-            scroll.reflectScrolledClipView(scroll.contentView)
-            await settle(hosting)
-        }
+        // Scroll directly to the final viewport. The complete report must
+        // already be laid out, so its last row needs no estimation retries.
+        let bottomOrigin = max(document.bounds.minY,
+                               document.bounds.maxY - scroll.contentView.bounds.height)
+        document.scroll(NSPoint(x: document.bounds.minX, y: bottomOrigin))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        await settle(hosting)
         XCTAssertGreaterThan(scroll.contentView.bounds.minY, 0)
         XCTAssertLessThanOrEqual(scroll.contentView.bounds.maxY, document.bounds.maxY + 1,
                                 "The test must not scroll past the document into a blank viewport")
         let bottom = try capture(hosting, name: "outcome-\(theme)-640-bottom")
         let bottomLabels = try labels(in: bottom)
-        XCTAssertTrue(bottomLabels.contains { normalized($0.text).contains("LASTROW100") },
+        XCTAssertTrue(bottomLabels.contains { normalized($0.text).contains(normalized("ПОСЛЕДНЯЯ ОШИБКА")) },
                       "The end of the final problem is clipped or unreachable: \(bottomLabels.map(\.text))")
         let lastClose = try visibleClose(in: bottomLabels)
         XCTAssertEqual(firstClose.minY, lastClose.minY, accuracy: 2,
@@ -113,7 +110,7 @@ final class OutcomeSheetTests: XCTestCase {
         let request = try NativeUIInteractions.recognitionRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["ru-RU", "en-US"]
-        request.customWords = ["FIRSTROW001", "LASTROW100", "Закрыть"]
+        request.customWords = ["ПЕРВАЯ ОШИБКА", "ПОСЛЕДНЯЯ ОШИБКА", "Закрыть"]
         try VNImageRequestHandler(cgImage: XCTUnwrap(bitmap.cgImage), options: [:]).perform([request])
         return (request.results ?? []).compactMap { observation in
             guard let text = observation.topCandidates(1).first?.string else { return nil }

@@ -169,14 +169,19 @@ final class DomainListUpdateUITests: XCTestCase {
                 }
                 if running {
                     XCTAssertTrue(text.contains { $0.contains("Загрузка источников") }, "Recognized: \(text)")
-                    XCTAssertTrue(text.contains { $0.filter { !$0.isWhitespace }.contains("4/8") },
+                    // Vision may omit a thin slash on a 1× display. Require
+                    // the progress caption and both values, not punctuation.
+                    XCTAssertTrue(text.contains {
+                        $0.localizedCaseInsensitiveContains("источник") && $0.filter(\.isNumber) == "48"
+                    },
                                   "Missing progress count. Recognized: \(text)")
                 }
                 if report != nil {
                     XCTAssertTrue(text.contains { $0.contains("Обновлено частично") })
                     XCTAssertTrue(text.contains { $0.contains("Источник недоступен") })
-                    XCTAssertTrue(text.contains { $0.contains("Резервная копия сохранена") },
-                                  "Backup action is missing. Recognized: \(text)")
+                    let backupText = try recognizeBackupCaption(png, firstPass: text)
+                    XCTAssertTrue(backupText.contains { $0.contains("Резервная копия сохранена") },
+                                  "Backup action is missing. Recognized: \(backupText)")
                     // The bounded result area scrolls independently from the
                     // routing controls below it, including the final source.
                     let scrolls = descendants(hosting).compactMap { $0 as? NSScrollView }
@@ -198,8 +203,9 @@ final class DomainListUpdateUITests: XCTestCase {
                     XCTAssertTrue(bottomText.contains { $0.contains("Последний источник") },
                                   "The final source cannot be reached. Recognized: \(bottomText)")
                     XCTAssertTrue(bottomText.contains { $0.contains("Обновить списки") })
-                    XCTAssertTrue(bottomText.contains { $0.contains("Резервная копия сохранена") },
-                                  "The backup action scrolled away with the source results")
+                    let bottomBackupText = try recognizeBackupCaption(bottom, firstPass: bottomText)
+                    XCTAssertTrue(bottomBackupText.contains { $0.contains("Резервная копия сохранена") },
+                                  "The backup action scrolled away with the source results: \(bottomBackupText)")
                 }
             }
         }
@@ -218,6 +224,14 @@ final class DomainListUpdateUITests: XCTestCase {
         request.recognitionLanguages = ["ru-RU", "en-US"]
         try VNImageRequestHandler(data: png, options: [:]).perform([request])
         return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+    }
+
+    private func recognizeBackupCaption(_ png: Data, firstPass: [String]) throws -> [String] {
+        guard !firstPass.contains(where: { $0.contains("Резервная копия сохранена") }) else { return firstPass }
+        // Retry this low-contrast caption from the same native screenshot,
+        // preserving strict wording and all other single-pass UI assertions.
+        return try NativeUIInteractions.observations(in: png, scale: 2)
+            .compactMap { $0.topCandidates(1).first?.string }
     }
 
     private func descendants(_ view: NSView) -> [NSView] {
