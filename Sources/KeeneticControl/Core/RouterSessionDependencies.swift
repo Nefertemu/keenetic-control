@@ -8,6 +8,7 @@ struct RouterSessionDependencies {
     var retryDelay: () async throws -> Void
     var settings: @MainActor () -> AppSettings
     var backup: (RouterProfile, String, Int) -> URL?
+    var operationHistory: @MainActor () -> OperationHistoryStore = { .shared }
 
     static var live: Self {
         Self(

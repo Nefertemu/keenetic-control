@@ -56,14 +56,17 @@ final class FakeTransport: KeeneticTransport {
     private var alive = false
     private var recorded: [String] = []
     private var aborts = 0
+    private var batches: [[String]] = []
     var onConnect: () throws -> Void = {}
     var onRead: () throws -> String = { RegressionFixtures.sampleConfig }
     var onRun: (String) throws -> String = { _ in "" }
     var onAbort: () -> Void = {}
+    var onBatch: (([String]) throws -> String)?
 
     var isAlive: Bool { lock.withLock { alive } }
     var commands: [String] { lock.withLock { recorded } }
     var abortCount: Int { lock.withLock { aborts } }
+    var batchCommands: [[String]] { lock.withLock { batches } }
 
     func connect() throws {
         try onConnect()
@@ -74,7 +77,12 @@ final class FakeTransport: KeeneticTransport {
         return try onRun(command)
     }
     func runBatch(_ commands: [String], timeout: TimeInterval) throws -> String {
-        try commands.map { try run($0, timeout: timeout) }.joined(separator: "\n")
+        lock.withLock { batches.append(commands) }
+        if let onBatch {
+            lock.withLock { recorded.append(contentsOf: commands) }
+            return try onBatch(commands)
+        }
+        return try commands.map { try run($0, timeout: timeout) }.joined(separator: "\n")
     }
     func fetchText(_ command: String, timeout: TimeInterval, quiet: Bool) throws -> String {
         lock.withLock { recorded.append(command) }
@@ -95,6 +103,10 @@ final class SessionFixture {
     private(set) var backups: [String] = []
     var backupSucceeds = true
     var settings = AppSettings.default
+    private let historyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("session-history-\(UUID())")
+    lazy var operationHistory = OperationHistoryStore(directory: historyDirectory)
+
+    deinit { try? FileManager.default.removeItem(at: historyDirectory) }
 
     init(_ transports: FakeTransport...) { self.transports = transports }
 
@@ -111,6 +123,6 @@ final class SessionFixture {
             backup: { [self] _, text, _ in
                 backups.append(text)
                 return backupSucceeds ? URL(fileURLWithPath: "/test/backup.kcb") : nil
-            }))
+            }, operationHistory: { [self] in operationHistory }))
     }
 }

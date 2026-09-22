@@ -15,10 +15,28 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - name: Проверить имя тега
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Ожидается существующий тег версии вида 1.2.3"
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Проверить коммит релиза
+        run: |
+          TAG_COMMIT=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$(git rev-parse HEAD)" != "$TAG_COMMIT" ]; then
+            echo "::error::Сборка должна выполняться из коммита указанного тега"
+            exit 1
+          fi
 
       # Макросы SwiftUI живут в Xcode, а не в Command Line Tools. На
       # раннере Xcode может лежать под версионным именем, поэтому берём
@@ -47,20 +65,18 @@ jobs:
 
       - name: Версия совпадает с тегом
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
             "dist/Keenetic Control.app/Contents/Info.plist")
-          echo "тег $TAG, в бандле $APP_VERSION"
-          if [ "$TAG" != "$APP_VERSION" ]; then
-            echo "::error::Версия в build.sh ($APP_VERSION) не совпадает с тегом ($TAG)"
+          echo "тег $RELEASE_TAG, в бандле $APP_VERSION"
+          if [ "$RELEASE_TAG" != "$APP_VERSION" ]; then
+            echo "::error::Версия в build.sh ($APP_VERSION) не совпадает с тегом ($RELEASE_TAG)"
             exit 1
           fi
 
       - name: Упаковать
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           ditto -c -k --sequesterRsrc --keepParent \
-            "dist/Keenetic Control.app" "dist/Keenetic-Control-$TAG.zip"
+            "dist/Keenetic Control.app" "dist/Keenetic-Control-$RELEASE_TAG.zip"
 
       # Сборка в CI подписана ад-хок: сертификата разработчика здесь нет.
       # Поэтому архив прикладывается ТОЛЬКО если релиз ещё пуст — чтобы не
@@ -69,13 +85,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "Keenetic Control $TAG" --generate-notes
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "Keenetic Control $RELEASE_TAG" --generate-notes
           fi
-          COUNT=$(gh release view "$TAG" --json assets --jq '.assets | length')
+          COUNT=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
           if [ "$COUNT" -gt 0 ]; then
             echo "У релиза уже есть вложения ($COUNT) — подписанную сборку не трогаем."
             exit 0
           fi
-          gh release upload "$TAG" "dist/Keenetic-Control-$TAG.zip"
+          gh release upload "$RELEASE_TAG" "dist/Keenetic-Control-$RELEASE_TAG.zip"

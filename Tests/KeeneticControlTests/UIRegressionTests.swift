@@ -217,7 +217,7 @@ final class UIRegressionTests: XCTestCase {
 
     private func recognize(_ bitmap: NSBitmapImageRep, topHeight: CGFloat? = nil) throws
         -> [(text: String, frame: CGRect)] {
-        let request = VNRecognizeTextRequest()
+        let request = try NativeUIInteractions.recognitionRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["ru-RU", "en-US"]
         if let topHeight {

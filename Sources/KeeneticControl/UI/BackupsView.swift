@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct BackupsView: View {
     @EnvironmentObject private var session: RouterSession
@@ -36,6 +37,7 @@ struct BackupsView: View {
     private var comparing: Bool { comparisonID != nil }
     @State private var plan: Plan?
     @State private var outcome: ApplyOutcome?
+    @State private var portableRequest: PortableBackupRequest?
 
     private var selected: Snapshot? {
         guard let selection else { return nil }
@@ -69,7 +71,7 @@ struct BackupsView: View {
         .padding(20)
         .onAppear(perform: reload)
         .sheet(item: $comparison) { result in
-            RestorePreview(difference: result.difference, snapshot: result.snapshot.lastPathComponent) {
+            RestorePreview(difference: result.difference, snapshot: result.snapshot.lastPathComponent) { chosen in
                 comparison = nil
                 guard session.isCurrent(result.operation),
                       session.activeRouterID == result.operation.routerID else {
@@ -79,9 +81,12 @@ struct BackupsView: View {
                         isError: false)
                     return
                 }
-                plan = Restore.plan(result.difference, chunkSize: Store.shared.settings.chunkSize,
-                                    title: "Возврат к копии")
-                    .forRouter(session.router)
+                do {
+                    plan = try Restore.validatedPlan(chosen,
+                        chunkSize: Store.shared.settings.chunkSize,
+                        title: "Возврат к копии", verificationLimit: Store.shared.settings.maxDomainsPerList)
+                        .forRouter(session.router)
+                } catch { alert = AlertPayload(title: "Не удалось собрать план", message: session.describe(error)) }
             } onCancel: { comparison = nil }
         }
         .sheet(item: Binding(get: { plan.map(PlanBox.init) }, set: { plan = $0?.plan })) { box in
@@ -92,6 +97,13 @@ struct BackupsView: View {
         }
         .sheet(item: Binding(get: { outcome.map(OutcomeBox.init) }, set: { outcome = $0?.outcome })) { box in
             OutcomeSheet(title: "Возврат к резервной копии", outcome: box.outcome) { outcome = nil }
+        }
+        .sheet(item: $portableRequest) { request in
+            PortableBackupSheet(request: request) { imported in
+                portableRequest = nil
+                reload()
+                if let imported { onlyThisRouter = false; select(imported) }
+            } onCancel: { portableRequest = nil }
         }
         .onChange(of: onlyThisRouter) { _, _ in reconcileSelection() }
         .onDisappear { comparisonID = nil }
@@ -128,6 +140,10 @@ struct BackupsView: View {
                 Button("Обновить") { reload() }
                     .buttonStyle(SubtleButtonStyle())
             }
+
+            Button("Импорт копии с паролем…", action: importPortable)
+                .buttonStyle(SubtleButtonStyle())
+                .help("Открыть переносимую копию, в том числе созданную на другом Mac")
 
             Toggle(isOn: $onlyThisRouter) {
                 Text("Только «\(session.router.name)»")
@@ -269,6 +285,11 @@ struct BackupsView: View {
                 .help("Показать, чем текущая конфигурация отличается от снимка, "
                       + "и собрать план возврата")
             }
+            if selected != nil {
+                Button("Экспорт с паролем…", action: exportPortable)
+                    .buttonStyle(SubtleButtonStyle())
+                    .disabled(loadingPreview)
+            }
             if !preview.isEmpty {
                 Button("Копировать") {
                     NSPasteboard.general.clearContents()
@@ -277,6 +298,26 @@ struct BackupsView: View {
                 .buttonStyle(SubtleButtonStyle())
             }
         }
+    }
+
+    private func importPortable() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: PortableBackup.pathExtension) ?? .data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Переносимая копия с паролем"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        portableRequest = PortableBackupRequest(mode: .importFile(url), host: session.router.backupHost)
+    }
+
+    private func exportPortable() {
+        guard let source = selected?.url else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: PortableBackup.pathExtension) ?? .data]
+        panel.nameFieldStringValue = source.deletingPathExtension().lastPathComponent + "." + PortableBackup.pathExtension
+        panel.message = "Сохранить копию для переноса на другой Mac"
+        guard panel.runModal() == .OK, let target = panel.url else { return }
+        portableRequest = PortableBackupRequest(mode: .exportFile(source, target), host: session.router.backupHost)
     }
 
     private func reload() {
@@ -336,7 +377,7 @@ struct BackupsView: View {
             }.value
             guard isRelevant() else { return }
             let current = try await session.readConfigText(operation: operation)
-            let found = Restore.compare(backup: backup, current: current)
+            let found = try Restore.validatedComparison(backup: backup, current: current)
             guard isRelevant() else { return }
             if found.isEmpty {
                 alert = AlertPayload(
@@ -397,7 +438,19 @@ struct BackupsView: View {
 struct RestorePreview: View {
     let difference: Restore.Difference
     let snapshot: String
-    var onBuild: () -> Void
+    var onBuild: (Restore.Difference) -> Void
+    @State private var restoreContents = true
+    @State private var restoreChains = true
+    @State private var restoreStatics = true
+    @State private var selectedGroups: Set<String>? = nil
+
+    private var allGroups: [String] {
+        Set(difference.snapshotGroups.keys).union(difference.currentGroups.keys).sorted()
+    }
+    private var selectedDifference: Restore.Difference {
+        Restore.selecting(.init(groupIDs: selectedGroups, restoreContents: restoreContents,
+                                restoreChains: restoreChains, restoreStaticRoutes: restoreStatics), from: difference)
+    }
     var onCancel: () -> Void
 
     var body: some View {
@@ -410,37 +463,68 @@ struct RestorePreview: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Что восстановить").font(.headline)
+                        Toggle("Содержимое и имена списков", isOn: $restoreContents)
+                        Toggle("Цепочки маршрутов списков", isOn: $restoreChains)
+                        Toggle("Статические маршруты", isOn: $restoreStatics)
+                        if restoreContents || restoreChains {
+                            DisclosureGroup("Выбрать списки (\((selectedGroups ?? Set(allGroups)).count) из \(allGroups.count))") {
+                                HStack {
+                                    Button("Все") { selectedGroups = nil }
+                                    Button("Ни одного") { selectedGroups = [] }
+                                    Spacer()
+                                }
+                                ForEach(allGroups, id: \.self) { ident in
+                                    Toggle(isOn: Binding(
+                                        get: { (selectedGroups ?? Set(allGroups)).contains(ident) },
+                                        set: { chosen in
+                                            var next = selectedGroups ?? Set(allGroups)
+                                            if chosen { next.insert(ident) } else { next.remove(ident) }
+                                            selectedGroups = next
+                                        })) {
+                                            Text(groupTitle(ident)).lineLimit(2).help(groupTitle(ident))
+                                        }
+                                }
+                            }
+                        }
+                    }.toggleStyle(.checkbox).padding(12).inset()
+
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
-                        MetricTile(value: String(difference.missingDomainCount),
+                        MetricTile(value: String(selectedDifference.missingDomainCount),
                                    label: "Вернуть доменов", icon: "arrow.uturn.backward",
                                    tint: Palette.success)
-                        MetricTile(value: String(difference.extraDomainCount),
+                        MetricTile(value: String(selectedDifference.extraDomainCount),
                                    label: "Убрать доменов", icon: "minus.circle",
                                    tint: Palette.danger)
-                        MetricTile(value: String(difference.missingGroups.count),
+                        MetricTile(value: String(selectedDifference.missingGroups.count),
                                    label: "Создать списков", icon: "folder.badge.plus",
                                    tint: Palette.accent)
-                        MetricTile(value: String(difference.extraGroups.count),
+                        MetricTile(value: String(selectedDifference.extraGroups.count),
                                    label: "Удалить списков", icon: "folder.badge.minus",
                                    tint: Palette.warning)
                     }
 
-                    section("Списки появятся заново", difference.missingGroups.map {
+                    section("Имена списков вернутся", selectedDifference.changedDescriptions.sorted(by: { $0.key < $1.key }).map {
+                        "\($0.key): \(selectedDifference.currentGroups[$0.key]?.descriptionText ?? "") → \($0.value.isEmpty ? "без имени" : $0.value)"
+                    }, tint: Palette.accent)
+
+                    section("Списки появятся заново", selectedDifference.missingGroups.map {
                         "\($0.ident) · \($0.descriptionText) · \(Format.domains($0.includes.count))"
                     }, tint: Palette.accent)
 
-                    section("Списки будут удалены", difference.extraGroups.map {
+                    section("Списки будут удалены", selectedDifference.extraGroups.map {
                         "\($0.ident) · \($0.descriptionText) · \(Format.domains($0.includes.count))"
                     }, tint: Palette.warning)
 
-                    section("Маршруты списков вернутся", difference.missingRouteLines,
+                    section("Маршруты списков вернутся", selectedDifference.missingRouteLines,
                             tint: Palette.success)
-                    section("Маршруты списков снимутся", difference.extraRouteLines,
+                    section("Маршруты списков снимутся", selectedDifference.extraRouteLines,
                             tint: Palette.danger)
                     section("Статические маршруты вернутся",
-                            difference.missingRoutes.map(\.command), tint: Palette.success)
+                            selectedDifference.missingRoutes.map { $0.command + ($0.disabled ? " · выключен" : "") }, tint: Palette.success)
                     section("Статические маршруты снимутся",
-                            difference.extraRoutes.map(\.command), tint: Palette.danger)
+                            selectedDifference.extraRoutes.map { $0.command + ($0.disabled ? " · выключен" : "") }, tint: Palette.danger)
 
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "info.circle")
@@ -448,7 +532,7 @@ struct RestorePreview: View {
                             .font(.system(size: 11))
                         Text("Возвращается только то, чем управляет приложение: списки FQDN, "
                              + "их маршруты и статические маршруты. Wi-Fi, NAT, межсетевой экран "
-                             + "и прочее из снимка не трогаются.")
+                             + "и прочее из снимка не трогаются. Удаление списка также снимает его маршруты.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -485,6 +569,11 @@ struct RestorePreview: View {
         .background(Palette.surface)
     }
 
+    private func groupTitle(_ ident: String) -> String {
+        let name = difference.snapshotGroups[ident]?.descriptionText ?? difference.currentGroups[ident]?.descriptionText ?? ""
+        return name.isEmpty ? ident : "\(name) · \(ident)"
+    }
+
     private var cancelButton: some View {
         Button("Отмена", action: onCancel)
             .buttonStyle(SubtleButtonStyle())
@@ -492,13 +581,14 @@ struct RestorePreview: View {
     }
 
     private var buildButton: some View {
-        Button("Собрать план") { onBuild() }
+        Button("Собрать план") { onBuild(selectedDifference) }
+            .disabled(selectedDifference.isEmpty)
             .buttonStyle(PrimaryButtonStyle())
             .keyboardShortcut(.defaultAction)
     }
 
     private var summaryText: some View {
-        Text(difference.summary.joined(separator: " · "))
+        Text(selectedDifference.summary.joined(separator: " · "))
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
             .lineLimit(2)

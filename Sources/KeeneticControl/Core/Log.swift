@@ -60,7 +60,7 @@ final class LogStore: ObservableObject {
     }
 
     func append(_ level: LogLevel, _ text: String) {
-        let entry = LogEntry(date: Date(), level: level, text: CLI.redactSecrets(text))
+        let entry = LogEntry(date: Date(), level: level, text: DiagnosticPrivacy.redact(text))
         entries.append(entry)
         if entries.count > limit { entries.removeFirst(entries.count - limit) }
         write(entry)
@@ -96,7 +96,7 @@ final class LogStore: ObservableObject {
     /// запуске новой версии заменяем их значения секретов прямо в старом логе.
     private func redactExistingFile() {
         guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
-        let redacted = CLI.redactSecrets(text)
+        let redacted = DiagnosticPrivacy.redact(text)
         guard redacted != text else { return }
         try? redacted.write(to: fileURL, atomically: true, encoding: .utf8)
     }

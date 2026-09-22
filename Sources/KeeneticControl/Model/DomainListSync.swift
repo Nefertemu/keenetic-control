@@ -3,7 +3,7 @@ import Foundation
 /// Полная синхронизация уже установленных источников. Существующие части
 /// сохраняют имена и маршруты; неизменившиеся записи остаются на своих местах.
 enum DomainListSyncPlanner {
-    static let maximumEntries = 300
+    static let maximumEntries = FqdnLimits.maximumEntries
 
     static func plan(groups: [String: FqdnGroup], data: SourceData,
                      chunkSize: Int = maximumEntries,
@@ -63,7 +63,7 @@ enum DomainListSyncPlanner {
             commonChain = chain
         }
         let chain = commonChain ?? []
-        let limit = min(max(1, chunkSize), maximumEntries)
+        let limit = FqdnLimits.effective(chunkSize: chunkSize)
         result.groupEntryLimit = limit
         result.verifyBeforeSave = true
         result.domainListBaselines = [DomainListBaseline(spec: spec, groups:
@@ -152,6 +152,7 @@ enum DomainListSyncPlanner {
         if !emptied.isEmpty {
             result.notes.append("Освободившиеся части сохранены с маршрутами для будущих обновлений: \(emptied.count).")
         }
+        result.sourceVersions = [OperationSourceVersion(spec: data.spec, data: data)]
         return result
     }
 

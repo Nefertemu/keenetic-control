@@ -11,21 +11,31 @@ struct StaticRoute: Identifiable, Hashable {
     var family: Family = .ipv4
     /// «default», «10.0.0.0/8», «1.2.3.4» — в человекочитаемом виде.
     var destination: String = ""
-    /// Интерфейс или адрес шлюза.
+    /// Интерфейс, адрес шлюза или шлюз и интерфейс через пробел.
     var via: String = ""
     /// Приоритет маршрута. Его нельзя терять при импорте/откате: от метрики
     /// зависит, какой из одинаковых маршрутов выберет роутер.
     var metric: Int?
     var auto: Bool = true
     var reject: Bool = false
+    var disabled: Bool = false
     var comment: String = ""
     /// Строка из running-config — по ней и удаляем.
     var rawLine: String = ""
 
-    var id: String { rawLine.isEmpty ? command : rawLine }
+    var id: String {
+        (rawLine.isEmpty ? command : rawLine) + (disabled ? "\n\(family.keyword) disable" : "")
+    }
+
+    /// A disabled route is represented by two adjacent CLI commands. Keep the
+    /// setting in comparisons without making command a multiline CLI string.
+    var configurationKey: String { additionCommands.joined(separator: "\n") }
+    var additionCommands: [String] {
+        disabled ? [command, "\(family.keyword) disable"] : [command]
+    }
 
     var searchText: String {
-        [destination, via, metric.map(String.init) ?? "", comment, family.title]
+        [destination, via, metric.map(String.init) ?? "", comment, family.title, disabled ? "отключён disabled" : ""]
             .joined(separator: " ").lowercased()
     }
 
@@ -62,14 +72,15 @@ struct StaticRoute: Identifiable, Hashable {
 
     static func validate(family: Family, destination: String, via: String,
                          metric: Int? = nil, comment: String = "") throws {
+        guard !containsControl(via) else {
+            throw TransportError("Интерфейс или шлюз содержит служебные символы.")
+        }
         let destination = destination.trimmingCharacters(in: .whitespaces)
         let via = via.trimmingCharacters(in: .whitespaces)
 
         guard !destination.isEmpty else { throw TransportError("Укажи сеть или узел назначения.") }
         guard !via.isEmpty else { throw TransportError("Укажи интерфейс или шлюз.") }
-        guard isSingleCLIToken(via) else {
-            throw TransportError("Интерфейс или шлюз должен быть одним словом без служебных символов.")
-        }
+        try validateVia(via, family: family)
         guard !containsControl(comment) else {
             throw TransportError("Комментарий не может содержать перевод строки или служебные символы.")
         }
@@ -97,11 +108,37 @@ struct StaticRoute: Identifiable, Hashable {
         }
     }
 
-    private static func isSingleCLIToken(_ value: String) -> Bool {
-        guard value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
-              !containsControl(value)
-        else { return false }
-        return !value.contains(where: { "!;\"'\\".contains($0) })
+    /// Keenetic accepts an interface, a gateway, or a gateway followed by its
+    /// interface. The latter is common for default routes received from an ISP.
+    /// Accept that documented pair without opening the field to CLI options.
+    private static func validateVia(_ value: String, family: Family) throws {
+        guard !containsControl(value), !value.contains(where: { "!;\"'\\".contains($0) }) else {
+            throw TransportError("Интерфейс или шлюз содержит служебные символы.")
+        }
+        let parts = value.split(separator: " ").map(String.init)
+        func gateway(_ token: String) -> Bool {
+            guard !token.contains("%") else { return false }
+            return family == .ipv4 ? IPTools.isIPv4(token) : IPTools.isIPv6(token)
+        }
+        func interface(_ token: String) -> Bool {
+            guard !["auto", "reject", "metric", "default", "host", "no"].contains(token.lowercased()),
+                  !IPTools.isIP(token) else { return false }
+            return token.range(of: #"^[A-Za-z][A-Za-z0-9_./-]*$"#, options: .regularExpression) != nil
+        }
+        let valid: Bool
+        switch parts.count {
+        case 1: valid = gateway(parts[0]) || interface(parts[0])
+        case 2:
+            // IPv6's documented CLI order is interface + gateway; preserve
+            // the gateway + interface form emitted by other configurations.
+            valid = (gateway(parts[0]) && interface(parts[1]))
+                || (family == .ipv6 && interface(parts[0]) && gateway(parts[1]))
+        default: valid = false
+        }
+        guard valid else {
+            throw TransportError("Укажи интерфейс, IP-шлюз нужного семейства или шлюз и интерфейс через пробел.",
+                                 hint: "Например: ISP, 192.168.1.1 или 192.168.1.1 ISP. Флаги auto, reject и метрика задаются отдельно.")
+        }
     }
 
     private static func containsControl(_ value: String) -> Bool {
@@ -112,20 +149,60 @@ struct StaticRoute: Identifiable, Hashable {
 enum StaticRouteParser {
     /// Разбирает `ip route` / `ipv6 route` из running-config.
     static func parse(config text: String) -> [StaticRoute] {
+        parseWithDiagnostics(config: text).routes
+    }
+
+    /// `ip route disable` affects the route immediately before it. It is not a
+    /// standalone route or a global routing switch. Keep unknown/orphan forms
+    /// visible to backup validation and offline route explanations.
+    /// Keenetic 5.0 discussion: https://forum.keenetic.ru/topic/23888/
+    static func parseWithDiagnostics(config text: String) -> (routes: [StaticRoute], problems: [String]) {
         var routes: [StaticRoute] = []
+        var problems: [String] = []
+        var pendingIndex: Int?
         // Идентификатор маршрута — его строка. Повтор в конфигурации дал бы
         // два элемента с одним id: ForEach на таком ломается, а выделение
         // цепляло бы оба сразу.
-        var seen = Set<String>()
-
         for raw in CLI.normalizeNewlines(text).split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw)
-            guard !line.isEmpty, !(line.first?.isWhitespace ?? false) else { continue }
+            guard !line.isEmpty, !(line.first?.isWhitespace ?? false) else {
+                pendingIndex = nil
+                continue
+            }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard let route = parse(line: trimmed), seen.insert(route.id).inserted else { continue }
-            routes.append(route)
+            if let family = disableFamily(trimmed) {
+                if let index = pendingIndex, routes[index].family == family, !routes[index].disabled {
+                    routes[index].disabled = true
+                } else { problems.append(trimmed) }
+                pendingIndex = nil
+            } else if let route = parse(line: trimmed) {
+                routes.append(route)
+                pendingIndex = routes.count - 1
+            } else {
+                pendingIndex = nil
+                if trimmed.lowercased().hasPrefix("ip route ") || trimmed.lowercased().hasPrefix("ipv6 route ") {
+                    problems.append(trimmed)
+                }
+            }
         }
-        return routes
+        var seen = Set<String>()
+        return (routes.filter { seen.insert($0.configurationKey).inserted }, problems)
+    }
+
+    private static func disableFamily(_ line: String) -> StaticRoute.Family? {
+        switch line.lowercased() {
+        case "ip route disable": return .ipv4
+        case "ipv6 route disable": return .ipv6
+        default: return nil
+        }
+    }
+
+    static func hasInvalidDisable(in skipped: [String]) -> Bool {
+        skipped.contains { line in
+            let tokens = line.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+            return Array(tokens.prefix(3)) == ["ip", "route", "disable"]
+                || Array(tokens.prefix(3)) == ["ipv6", "route", "disable"]
+        }
     }
 
     static func parse(line: String) -> StaticRoute? {
@@ -200,20 +277,29 @@ enum StaticRouteParser {
     static func parseImport(_ text: String) -> (routes: [StaticRoute], skipped: [String]) {
         var routes: [StaticRoute] = []
         var skipped: [String] = []
-        var seen = Set<String>()
+        var pendingIndex: Int?
 
         for raw in CLI.normalizeNewlines(text).split(separator: "\n", omittingEmptySubsequences: false) {
             var line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty { continue }
+            if line.isEmpty { pendingIndex = nil; continue }
             if line.lowercased().hasPrefix("@echo") || line.lowercased().hasPrefix("rem ")
-                || line.hasPrefix("::") || line.hasPrefix("#") { continue }
-            if line.lowercased().hasPrefix("chcp") || line.lowercased() == "pause" { continue }
+                || line.hasPrefix("::") || line.hasPrefix("#") { pendingIndex = nil; continue }
+            if line.lowercased().hasPrefix("chcp") || line.lowercased() == "pause" { pendingIndex = nil; continue }
             if line.lowercased() == "setlocal disabledelayedexpansion"
-                || line.lowercased() == "endlocal" { continue }
+                || line.lowercased() == "endlocal" { pendingIndex = nil; continue }
+
+            if let family = disableFamily(line) {
+                if let index = pendingIndex, routes[index].family == family, !routes[index].disabled {
+                    routes[index].disabled = true
+                } else { skipped.append(line) }
+                pendingIndex = nil
+                continue
+            }
 
             var route: StaticRoute?
 
-            if line.lowercased().hasPrefix("ip route ") || line.lowercased().hasPrefix("ipv6 route ") {
+            let isCLI = line.lowercased().hasPrefix("ip route ") || line.lowercased().hasPrefix("ipv6 route ")
+            if isCLI {
                 route = parse(line: line)
             } else {
                 if line.lowercased().hasPrefix("route ") { line = String(line.dropFirst("route ".count)) }
@@ -221,17 +307,17 @@ enum StaticRouteParser {
             }
 
             guard var found = route else {
+                pendingIndex = nil
                 skipped.append(line)
                 continue
             }
             found.rawLine = ""
-            let key = found.command
-            if seen.contains(key) { continue }
-            seen.insert(key)
             routes.append(found)
+            pendingIndex = isCLI ? routes.count - 1 : nil
         }
 
-        return (routes, skipped)
+        var seen = Set<String>()
+        return (routes.filter { seen.insert($0.configurationKey).inserted }, skipped)
     }
 
     /// `add 1.2.3.0 mask 255.255.255.0 192.168.1.1 metric 1`
@@ -323,7 +409,7 @@ enum StaticRouteParser {
     /// Раньше такие строки просто исчезали из выгрузки — без единого слова.
     static func batUnsupported(_ routes: [StaticRoute]) -> [StaticRoute] {
         routes.filter {
-            $0.family != .ipv4 || $0.reject || $0.destination.lowercased() == "default"
+            $0.disabled || $0.family != .ipv4 || $0.reject || $0.destination.lowercased() == "default"
                 || !IPTools.isIPv4($0.via)
         }
     }
@@ -338,7 +424,7 @@ enum StaticRouteParser {
             // Непереносимое остаётся в файле комментарием: из выгрузки
             // ничего не пропадает молча.
             guard !unsupported.contains(route.id) else {
-                lines.append("rem не переносится в Windows: "
+                lines.append("rem " + (route.disabled ? "отключён, не переносится в Windows: " : "не переносится в Windows: ")
                              + batComment(route.rawLine.isEmpty ? route.command : route.rawLine))
                 continue
             }
@@ -379,6 +465,9 @@ enum StaticRouteParser {
 
     /// Экспорт в формате команд Keenetic — чтобы залить на другой роутер.
     static func exportCLI(_ routes: [StaticRoute]) -> String {
-        routes.map { $0.rawLine.isEmpty ? $0.command : $0.rawLine }.joined(separator: "\n") + "\n"
+        routes.flatMap { route in
+            [route.rawLine.isEmpty ? route.command : route.rawLine]
+                + (route.disabled ? ["\(route.family.keyword) disable"] : [])
+        }.joined(separator: "\n") + "\n"
     }
 }

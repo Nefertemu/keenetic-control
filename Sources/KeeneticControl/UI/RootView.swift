@@ -9,6 +9,8 @@ enum AppSection: String, CaseIterable, Identifiable {
     case backups
     case journal
     case routers
+    // Append to preserve the existing numbered keyboard shortcuts.
+    case routeExplanation
 
     var id: String { rawValue }
 
@@ -22,6 +24,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .backups:       return "Резервные копии"
         case .journal:       return "Журнал"
         case .routers:       return "Роутеры и настройки"
+        case .routeExplanation: return "Поиск маршрута"
         }
     }
 
@@ -35,6 +38,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .backups:       return "clock.arrow.circlepath"
         case .journal:       return "text.alignleft"
         case .routers:       return "gearshape"
+        case .routeExplanation: return "magnifyingglass"
         }
     }
 
@@ -43,7 +47,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         // Раздел один — отдельная группа из одного пункта с тем же именем
         // выглядела как ошибка вёрстки.
         case .overview, .tunnels:                return "Роутер"
-        case .domains, .staticRoutes, .compare:
+        case .domains, .staticRoutes, .compare, .routeExplanation:
                                                  return "Маршрутизация"
         case .backups, .journal, .routers:       return "Служебное"
         }
@@ -178,7 +182,8 @@ struct RootView: View {
 
         for item in AppSection.allCases {
             result.append(PaletteItem(id: "section-\(item.rawValue)", kind: .section(item),
-                                      title: item.title, subtitle: item.group,
+                                      title: item.title,
+                                      subtitle: item == .routeExplanation ? "Домен, IP, URL · почему через этот туннель" : item.group,
                                       icon: item.icon, group: "Разделы"))
         }
         for router in store.routers where router.id != session.router.id {
@@ -221,6 +226,9 @@ struct RootView: View {
             Navigator.shared.interfaceIdent = ident
             tunnelsTab = .status
             section = .tunnels
+        case .routeQuery(let query):
+            Navigator.shared.routeQuery = query
+            section = .routeExplanation
         }
     }
 
@@ -576,6 +584,7 @@ struct RootView: View {
                 case .backups:       BackupsView(alert: $alert)
                 case .journal:       JournalView()
                 case .routers:       RoutersView(alert: $alert)
+                case .routeExplanation: RouteExplanationView()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

@@ -4,6 +4,7 @@ import Foundation
 struct DomainListApplicationError: LocalizedError {
     let cause: Error
     let backupURL: URL
+    var historyID: UUID?
     var errorDescription: String? { RouterConnectionManager.describeError(cause) }
 }
 
@@ -77,6 +78,7 @@ final class RouterPlanExecutor {
             log(.info, "Предпросмотр «\(plan.title)»: \(Format.commands(plan.commands.count)), на роутер ничего не ушло.")
             return ApplyOutcome(applied: false)
         }
+        try validateCommandContexts(plan.commands)
         let acquired = try beginWriting(owner)
         defer {
             finishWriting(owner, acquired: acquired)
@@ -95,7 +97,8 @@ final class RouterPlanExecutor {
         try preWriteCheck?()
 
         let preconditions = PlanVerifier.preconditionProblems(
-            plan: plan, groups: RouterConfigParser.parseFqdnGroups(configText))
+            plan: plan, groups: RouterConfigParser.parseFqdnGroups(configText),
+            staticRoutes: StaticRouteParser.parse(config: configText), configText: configText)
         guard preconditions.isEmpty else {
             throw TransportError("Списки изменились после сверки. Обновление остановлено до записи.",
                                  hint: preconditions.joined(separator: "\n"))
@@ -108,6 +111,10 @@ final class RouterPlanExecutor {
                 hint: "Проверь доступ приложения к связке ключей и свободное место на диске.")
         }
         log(.info, "Защищённая резервная копия: \(backupURL.lastPathComponent)")
+
+        let history = connections.dependencies.operationHistory()
+        let historyID = history.begin(profile: profile, plan: plan,
+                                      configText: configText, backupURL: backupURL)
 
         let started = Date()
         let batchSize = max(1, connections.dependencies.settings().batchSize)
@@ -155,12 +162,43 @@ final class RouterPlanExecutor {
             } else {
                 for problem in problems { log(.warn, "Проверка: \(problem)") }
             }
-            return ApplyOutcome(applied: true, problems: problems, backupURL: backupURL, elapsed: elapsed)
+            history.finish(historyID, status: problems.isEmpty
+                           ? (saveConfig ? .saved : .temporary) : .needsAttention, problems: problems)
+            return ApplyOutcome(applied: true, problems: problems, backupURL: backupURL,
+                                elapsed: elapsed, historyID: historyID)
         } catch {
+            history.finish(historyID, status: .failed,
+                           problems: ["Часть команд могла примениться. Проверь конфигурацию и копию перед повтором.",
+                                      connections.describe(error)])
             log(.error, "Выполнение остановлено: \(connections.describe(error))")
             log(.warn, "Часть команд могла примениться — проверь резервную копию.")
-            if plan.verifyBeforeSave { throw DomainListApplicationError(cause: error, backupURL: backupURL) }
+            if plan.verifyBeforeSave {
+                throw DomainListApplicationError(cause: error, backupURL: backupURL, historyID: historyID)
+            }
             throw error
+        }
+    }
+
+    /// `ip route disable` относится к предыдущему маршруту. Пара идёт одним
+    /// запросом, без постороннего чтения между командами и без повтора после
+    /// неоднозначной ошибки. Отдельное disable никогда не отправляется.
+    private func isStaticRoutePair(_ commands: [String], at index: Int) -> Bool {
+        guard index + 1 < commands.count,
+              let route = StaticRouteParser.parse(line: commands[index]) else { return false }
+        return commands[index + 1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == route.family.keyword + " disable"
+    }
+
+    private func validateCommandContexts(_ commands: [String]) throws {
+        var index = 0
+        while index < commands.count {
+            if isStaticRoutePair(commands, at: index) { index += 2; continue }
+            let line = commands[index].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard line != "ip route disable", line != "ipv6 route disable" else {
+                throw TransportError("Отключение маршрута не связано с его объявлением.",
+                                     hint: "Составь план заново: отдельная команда disable не будет отправлена.")
+            }
+            index += 1
         }
     }
 
@@ -179,7 +217,10 @@ final class RouterPlanExecutor {
         while index < commands.count {
             try connections.requireCurrent(operation)
             var chunk: [String] = []
-            if isBulk(commands[index]) {
+            let contextualPair = isStaticRoutePair(commands, at: index)
+            if contextualPair {
+                chunk = Array(commands[index...index + 1])
+            } else if isBulk(commands[index]) {
                 while index + chunk.count < commands.count,
                       isBulk(commands[index + chunk.count]),
                       chunk.count < batchSize {
@@ -198,7 +239,7 @@ final class RouterPlanExecutor {
             try connections.requireCurrent(operation)
 
             if CLI.failed(output) {
-                if batch.count > 1 {
+                if batch.count > 1 && !contextualPair {
                     log(.warn, "Ошибка внутри пачки — повторяю команды по одной…")
                     for command in batch {
                         try connections.requireCurrent(operation)
@@ -232,7 +273,8 @@ final class RouterPlanExecutor {
         }
         try connections.requireCurrent(operation)
         let groups = RouterConfigParser.parseFqdnGroups(configText)
-        let problems = PlanVerifier.problems(plan: plan, groups: groups, limit: limit)
+        let problems = PlanVerifier.problems(plan: plan, groups: groups, limit: limit,
+                                             staticRoutes: StaticRouteParser.parse(config: configText), configText: configText)
 
         // Обновляем состояние из уже прочитанной конфигурации — лишний раз не ходим.
         connections.storeConfigurationSnapshot(configText, owner: owner)
@@ -263,7 +305,9 @@ final class RouterPlanExecutor {
     func runCommands(_ commands: [String], title: String, saveConfig: Bool,
                      operation: RouterOperation) async throws -> String {
         guard !commands.isEmpty else { return "" }
+        try validateCommandContexts(commands)
         try connections.requireCurrent(operation)
+        let profile = try connections.profile(for: operation)
         let owner = operation.routerID
         let acquired = try beginWriting(owner)
         defer { finishWriting(owner, acquired: acquired) }
@@ -274,35 +318,53 @@ final class RouterPlanExecutor {
         defer { if connections.isCurrent(operation) { connections.store(progress: nil, owner: owner) } }
 
         var outputs: [String] = []
-        for (index, command) in commands.enumerated() {
-            try connections.requireCurrent(operation)
-            log(.cmd, CLI.redactSecrets(command))
-            let output = try await connections.watch(transport, budget: 150, owner: owner) {
-                try transport.run(command, timeout: 120)
+        var commandPlan = Plan(title: title)
+        commandPlan.commands = commands
+        let history = connections.dependencies.operationHistory()
+        let historyID = history.begin(profile: profile, plan: commandPlan,
+                                      configText: connections.readState(for: owner)?.configText ?? "", backupURL: nil)
+        do {
+            var index = 0
+            while index < commands.count {
+                try connections.requireCurrent(operation)
+                let count = isStaticRoutePair(commands, at: index) ? 2 : 1
+                let batch = Array(commands[index..<index + count])
+                for command in batch { log(.cmd, CLI.redactSecrets(command)) }
+                let output = try await connections.watch(transport, budget: 150, owner: owner) {
+                    batch.count == 1
+                        ? try transport.run(batch[0], timeout: 120)
+                        : try transport.runBatch(batch, timeout: 120)
+                }
+                try connections.requireCurrent(operation)
+                if CLI.failed(output) {
+                    throw TransportError("Роутер отверг команду: \(CLI.redactSecrets(batch.joined(separator: "\n")))",
+                                         hint: CLI.redactSecrets(output))
+                }
+                if !output.isEmpty { outputs.append(CLI.redactSecrets(output)) }
+                index += count
+                connections.bumpProgress(index, owner: owner)
             }
-            try connections.requireCurrent(operation)
-            if CLI.failed(output) {
-                throw TransportError("Роутер отверг команду: \(CLI.redactSecrets(command))",
-                                     hint: CLI.redactSecrets(output))
-            }
-            if !output.isEmpty { outputs.append(CLI.redactSecrets(output)) }
-            connections.bumpProgress(index + 1, owner: owner)
-        }
 
-        if saveConfig {
-            try connections.requireCurrent(operation)
-            let output = try await connections.watch(transport, budget: 200, owner: owner) {
-                try transport.run("system configuration save", timeout: 180)
+            if saveConfig {
+                try connections.requireCurrent(operation)
+                let output = try await connections.watch(transport, budget: 200, owner: owner) {
+                    try transport.run("system configuration save", timeout: 180)
+                }
+                try connections.requireCurrent(operation)
+                if CLI.failed(output) {
+                    throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
+                }
+                connections.bumpProgress(commands.count + 1, owner: owner)
+                log(.ok, "Конфигурация сохранена.")
             }
-            try connections.requireCurrent(operation)
-            if CLI.failed(output) {
-                throw TransportError("Роутер не сохранил конфигурацию.", hint: output)
-            }
-            connections.bumpProgress(commands.count + 1, owner: owner)
-            log(.ok, "Конфигурация сохранена.")
-        }
 
-        return outputs.joined(separator: "\n")
+            let saved = saveConfig || commands.last?.trimmingCharacters(in: .whitespacesAndNewlines) == "system configuration save"
+            history.finish(historyID, status: saved ? .saved : .temporary)
+            return outputs.joined(separator: "\n")
+        } catch {
+            history.finish(historyID, status: .failed, problems: [connections.describe(error)])
+            throw error
+        }
     }
 
 }

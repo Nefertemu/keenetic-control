@@ -245,11 +245,17 @@ struct RoutersView: View {
                        subtitle: "Значения по умолчанию совпадают с консольным скриптом")
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 16)], spacing: 14) {
-                numberField("Доменов в одной части списка", value: $store.settings.chunkSize,
-                            range: 10...1000,
-                            hint: "Прошивка не любит очень длинные object-group.")
-                numberField("Потолок для проверки", value: $store.settings.maxDomainsPerList,
-                            range: 10...2000,
+                numberField("Доменов в одной части списка", value: Binding(get: { store.settings.effectiveChunkSize }, set: {
+                                store.settings.chunkSize = FqdnLimits.effective(chunkSize: $0,
+                                    verificationLimit: store.settings.maxDomainsPerList)
+                            }),
+                            range: 1...FqdnLimits.maximumEntries,
+                            hint: "Не больше потолка проверки и 300 записей — ограничения роутера.")
+                numberField("Потолок для проверки", value: Binding(get: { FqdnLimits.clamp(store.settings.maxDomainsPerList) }, set: {
+                                store.settings.maxDomainsPerList = FqdnLimits.clamp($0)
+                                store.settings.chunkSize = store.settings.effectiveChunkSize
+                            }),
+                            range: 1...FqdnLimits.maximumEntries,
                             hint: "После применения списки сверяются с этим числом.")
                 numberField("Команд в одной пачке", value: $store.settings.batchSize,
                             range: 1...64,

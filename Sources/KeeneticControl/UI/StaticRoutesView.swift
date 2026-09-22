@@ -52,16 +52,20 @@ struct StaticRoutesView: View {
             RouteEditor(interfaces: session.state?.candidates ?? []) { route in
                 showAdd = false
                 var built = Plan(title: "Добавление маршрута")
-                built.commands = [route.command]
+                built.commands = route.additionCommands
+                built.verifyBeforeSave = true
+                built.expectedStaticRouteAdditions = [route.configurationKey]
                 plan = built.forRouter(session.router)
             } onCancel: { showAdd = false }
         }
         .sheet(isPresented: $showImport) {
             ImportPreview(routes: importPreview, skipped: importSkipped) { accepted in
                 showImport = false
-                guard !accepted.isEmpty else { return }
+                guard !accepted.isEmpty, !StaticRouteParser.hasInvalidDisable(in: importSkipped) else { return }
                 var built = Plan(title: "Импорт \(Format.routes(accepted.count))")
-                built.commands = accepted.map(\.command)
+                built.commands = accepted.flatMap(\.additionCommands)
+                built.verifyBeforeSave = true
+                built.expectedStaticRouteAdditions = Set(accepted.map(\.configurationKey))
                 built.notes = ["Маршруты добавляются как есть. Существующие такие же строки роутер просто перезапишет."]
                 plan = built.forRouter(session.router)
             } onCancel: { showImport = false }
@@ -258,7 +262,7 @@ struct StaticRoutesView: View {
                     .lineLimit(1)
             }
             .frame(width: 210, alignment: .leading)
-            .help(route.rawLine.isEmpty ? route.command : route.rawLine)
+            .help(StaticRouteParser.exportCLI([route]))
 
             VStack(alignment: .leading, spacing: 1) {
                 let note = session.state?.note(for: route.via)
@@ -276,10 +280,13 @@ struct StaticRoutesView: View {
             .frame(width: 170, alignment: .leading)
             .help(session.state?.label(for: route.via) ?? route.via)
 
-            HStack(spacing: 4) {
-                if route.auto { StatusPill(text: "auto", tint: Palette.success) }
-                if route.reject { StatusPill(text: "reject", tint: Palette.danger) }
-                Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 3) {
+                if route.disabled { StatusPill(text: "Отключён", tint: .secondary) }
+                HStack(spacing: 4) {
+                    if route.auto { StatusPill(text: "auto", tint: Palette.success) }
+                    if route.reject { StatusPill(text: "reject", tint: Palette.danger) }
+                    Spacer(minLength: 0)
+                }
             }
             .frame(width: 120, alignment: .leading)
 
@@ -298,7 +305,7 @@ struct StaticRoutesView: View {
         .contextMenu {
             Button("Скопировать команду") {
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(route.rawLine.isEmpty ? route.command : route.rawLine,
+                NSPasteboard.general.setString(StaticRouteParser.exportCLI([route]),
                                                forType: .string)
             }
             Button("Удалить", role: .destructive) {
@@ -560,6 +567,7 @@ struct ImportPreview: View {
     @State private var excluded: Set<String> = []
 
     private var accepted: [StaticRoute] { routes.filter { !excluded.contains($0.id) } }
+    private var hasInvalidDisable: Bool { StaticRouteParser.hasInvalidDisable(in: skipped) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -575,13 +583,22 @@ struct ImportPreview: View {
 
             ScrollView {
                 LazyVStack(spacing: 0) {
+                    if hasInvalidDisable {
+                        Label("Не удалось определить, какой маршрут отключён. Исправь строки disable в файле: импорт заблокирован, чтобы не включить маршрут по ошибке.",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Palette.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.bottom, 14)
+                    }
                     ForEach(routes) { route in
                         let isOn = !excluded.contains(route.id)
                         HStack(spacing: 10) {
                             Image(systemName: isOn ? "checkmark.square.fill" : "square")
                                 .font(.system(size: 13))
                                 .foregroundStyle(isOn ? Palette.accent : Color.secondary.opacity(0.45))
-                            Text(route.command)
+                            Text(route.configurationKey)
                                 .font(.system(size: 11, design: .monospaced))
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -668,9 +685,12 @@ struct ImportPreview: View {
     }
 
     private var importPlanButton: some View {
-        Button("Составить план") { onAccept(accepted) }
+        Button("Составить план") {
+            guard !hasInvalidDisable else { return }
+            onAccept(accepted)
+        }
             .buttonStyle(PrimaryButtonStyle())
-            .disabled(accepted.isEmpty)
+            .disabled(accepted.isEmpty || hasInvalidDisable)
             .keyboardShortcut(.defaultAction)
     }
 }

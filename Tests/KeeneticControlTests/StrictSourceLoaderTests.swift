@@ -3,6 +3,12 @@ import XCTest
 @testable import KeeneticControl
 
 final class StrictSourceLoaderTests: XCTestCase {
+    private func assertLoadFails(_ action: () async throws -> SourceData,
+                                 file: StaticString = #filePath, line: UInt = #line) async {
+        do { _ = try await action(); XCTFail("Expected source rejection", file: file, line: line) }
+        catch { /* Expected. */ }
+    }
+
     private struct Fixture {
         let directory: URL
         let spec: SourceSpec
@@ -36,18 +42,18 @@ final class StrictSourceLoaderTests: XCTestCase {
             }
         }
 
-        func load(strict: Bool = true, forceRefresh: Bool = true) throws -> SourceData {
-            try SourceLoader.load(spec, ttlMinutes: 60, forceRefresh: forceRefresh, requireFreshComplete: strict)
+        func load(strict: Bool = true, forceRefresh: Bool = true) async throws -> SourceData {
+            try await SourceLoader.load(spec, ttlMinutes: 60, forceRefresh: forceRefresh, requireFreshComplete: strict)
         }
     }
 
-    func testStrictDownloadAcceptsCommentsCRLFAndDuplicates() throws {
+    func testStrictDownloadAcceptsCommentsCRLFAndDuplicates() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         try fixture.write(domains: "# Domain list\r\n\r\nkeep.example.org\r\nkeep.example.org\r\n! Comment\r\n",
                           v4: "# IPv4\r\n192.0.2.0/24\r\n192.0.2.0/24\r\n; Another comment\r\n",
                           v6: "// IPv6\r\n2001:db8::/32\r\n\r\n")
-        let loaded = try fixture.load()
+        let loaded = try await fixture.load()
         XCTAssertFalse(loaded.fromCache)
         XCTAssertNotNil(loaded.fetchedAt)
         XCTAssertTrue(loaded.skipped.isEmpty)
@@ -55,73 +61,73 @@ final class StrictSourceLoaderTests: XCTestCase {
         XCTAssertEqual(loaded.duplicates, 1)
     }
 
-    func testStrictDownloadRejectsPartiallyParsedDomains() throws {
+    func testStrictDownloadRejectsPartiallyParsedDomains() async throws {
         let fixture = try Fixture(subnets: false)
         defer { fixture.cleanup() }
         try fixture.write(domains: "keep.example.org\n<malformed format>\n")
-        XCTAssertThrowsError(try fixture.load())
+        await assertLoadFails { try await fixture.load() }
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.spec.cacheFile.path),
                        "A partially parsed strict download must not replace the cache")
-        let preview = try fixture.load(strict: false)
+        let preview = try await fixture.load(strict: false)
         XCTAssertEqual(preview.entries, ["keep.example.org"])
         XCTAssertEqual(preview.skipped, ["<malformed format>"])
     }
 
-    func testStrictDownloadRejectsPartiallyParsedSubnetComponent() throws {
+    func testStrictDownloadRejectsPartiallyParsedSubnetComponent() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         try fixture.write(v4: "192.0.2.0/24\n198.51.100.0/INVALID\n")
-        XCTAssertThrowsError(try fixture.load())
+        await assertLoadFails { try await fixture.load() }
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.spec.subnetCacheFile.path),
                        "An incomplete subnet set must not be stamped as complete")
-        let preview = try fixture.load(strict: false)
+        let preview = try await fixture.load(strict: false)
         XCTAssertEqual(preview.subnetsV4, ["192.0.2.0/24"])
         XCTAssertEqual(preview.subnetsV6, ["2001:db8::/32"])
     }
 
-    func testStrictDownloadRejectsMissingComponentDespiteCompleteCache() throws {
+    func testStrictDownloadRejectsMissingComponentDespiteCompleteCache() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         try fixture.write()
-        _ = try fixture.load()
+        _ = try await fixture.load()
         try FileManager.default.removeItem(at: fixture.v6)
-        XCTAssertThrowsError(try fixture.load())
-        let preview = try fixture.load(strict: false)
+        await assertLoadFails { try await fixture.load() }
+        let preview = try await fixture.load(strict: false)
         XCTAssertTrue(preview.fromCache)
         XCTAssertEqual(preview.subnetsV6, ["2001:db8::/32"])
     }
 
-    func testStrictDownloadNeverFallsBackToDomainCache() throws {
+    func testStrictDownloadNeverFallsBackToDomainCache() async throws {
         let fixture = try Fixture(subnets: false)
         defer { fixture.cleanup() }
         try fixture.write()
-        _ = try fixture.load()
+        _ = try await fixture.load()
         try FileManager.default.removeItem(at: fixture.domains)
-        XCTAssertThrowsError(try fixture.load())
-        let preview = try fixture.load(strict: false)
+        await assertLoadFails { try await fixture.load() }
+        let preview = try await fixture.load(strict: false)
         XCTAssertTrue(preview.fromCache)
         XCTAssertEqual(preview.entries, ["keep.example.org"])
     }
 
-    func testStrictFlagAlwaysBypassesFreshCache() throws {
+    func testStrictFlagAlwaysBypassesFreshCache() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         try fixture.write()
-        _ = try fixture.load()
+        _ = try await fixture.load()
         try fixture.write(domains: "changed.example.org\n", v4: "198.51.100.0/24\n")
-        let loaded = try fixture.load(forceRefresh: false)
+        let loaded = try await fixture.load(forceRefresh: false)
         XCTAssertFalse(loaded.fromCache)
         XCTAssertEqual(Set(loaded.entries), ["changed.example.org", "198.51.100.0/24", "2001:db8::/32"])
     }
 
-    func testStrictDownloadRejectsEmptySubnetComponent() throws {
+    func testStrictDownloadRejectsEmptySubnetComponent() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         try fixture.write(v6: "# nothing here\n\n")
-        XCTAssertThrowsError(try fixture.load())
+        await assertLoadFails { try await fixture.load() }
     }
 
-    func testDelegatedTopLevelDomainsNormalizeIdempotentlyWithoutAcceptingErrorWords() throws {
+    func testDelegatedTopLevelDomainsNormalizeIdempotentlyWithoutAcceptingErrorWords() async throws {
         let cases = [(".ua", "ua"), ("ua", "ua"), ("UA.", "ua"), ("*.ua", "ua"),
                      (".com", "com"), (".рф", "xn--p1ai"), (".ua # zone", "ua"),
                      ("0.0.0.0 ua # zone", "ua")]
@@ -135,23 +141,23 @@ final class StrictSourceLoaderTests: XCTestCase {
         }
     }
 
-    func testStrictSourceRejectsFailureMessagesBeginningWithRegisteredTopLevelDomain() throws {
+    func testStrictSourceRejectsFailureMessagesBeginningWithRegisteredTopLevelDomain() async throws {
         let fixture = try Fixture(subnets: false)
         defer { fixture.cleanup() }
         for errorMessage in ["network failure", "page not found"] {
             try fixture.write(domains: "keep.example.org\n\(errorMessage)\n")
-            XCTAssertThrowsError(try fixture.load(), errorMessage)
+            await assertLoadFails { try await fixture.load() }
             XCTAssertEqual(Domains.parseList(errorMessage).skipped, [errorMessage])
         }
     }
 
-    func testStrictSourceContainingTopLevelZoneCanBePlannedAndRepeated() throws {
+    func testStrictSourceContainingTopLevelZoneCanBePlannedAndRepeated() async throws {
         let fixture = try Fixture(subnets: false)
         defer { fixture.cleanup() }
         // inside-raw.lst начинает список с .ua — это весь доменный суффикс,
         // а не ошибка и не строка, которую можно молча выбросить перед удалением.
         try fixture.write(domains: ".ua\nkeep.example.org\n")
-        let loaded = try fixture.load()
+        let loaded = try await fixture.load()
         XCTAssertEqual(loaded.entries, ["ua", "keep.example.org"])
         XCTAssertTrue(loaded.skipped.isEmpty)
         var group = FqdnGroup(ident: "domain-list0", descriptionText: fixture.spec.descriptionPrefix,
@@ -169,13 +175,13 @@ final class StrictSourceLoaderTests: XCTestCase {
     }
 
     /// Явный smoke-test публичных источников; обычный прогон полностью локален.
-    func testLiveCatalogSourcesAreFreshAndComplete() throws {
+    func testLiveCatalogSourcesAreFreshAndComplete() async throws {
         guard ProcessInfo.processInfo.environment["KC_LIVE_DOMAIN_SOURCES"] == "1" else {
             throw XCTSkip("Live source downloads require KC_LIVE_DOMAIN_SOURCES=1")
         }
         for spec in SourceCatalog.all {
             do {
-                let loaded = try SourceLoader.load(spec, ttlMinutes: 0, forceRefresh: true,
+                let loaded = try await SourceLoader.load(spec, ttlMinutes: 0, forceRefresh: true,
                                                    requireFreshComplete: true)
                 XCTAssertEqual(loaded.spec, spec)
                 XCTAssertFalse(loaded.fromCache, spec.key)

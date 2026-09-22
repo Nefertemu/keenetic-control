@@ -25,6 +25,7 @@ final class RouterSession: ObservableObject {
     var lastChange: RouterChange? { connections.lastChange }
     var progress: ProgressInfo? { connections.progress }
     var activity: String? { connections.activity }
+    var operationHistory: OperationHistoryStore { connections.dependencies.operationHistory() }
     typealias BulkConnectOutcome = RouterConnectionManager.BulkConnectOutcome
 
     func beginOperation() -> RouterOperation { connections.beginOperation() }

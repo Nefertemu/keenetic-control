@@ -1449,7 +1449,7 @@ final class RegressionTests: XCTestCase {
                               current: snapshotConfig).isEmpty)
     }
 
-    func testCustomSources() throws {
+    func testCustomSources() async throws {
         check("адреса из многострочного поля",
               CustomSource.addresses(from: " https://a/x \n\n https://b/y ,https://c/z ").joined(separator: "|"),
               "https://a/x|https://b/y|https://c/z")
@@ -1477,7 +1477,7 @@ final class RegressionTests: XCTestCase {
               sourceError(CustomSource(title: "Мой", descriptionPrefix: "my",
                                        urls: ["ftp://a/x"])) != nil)
         check("старый источник не запускает чужую схему",
-              (try? SourceLoader.fetch("ftp://a/x")) == nil)
+              (try? await SourceLoader.fetch("ftp://a/x")) == nil)
         check("префикс с переводом строки отбивается",
               sourceError(CustomSource(title: "Мой", descriptionPrefix: "my\nlist",
                                        urls: ["https://a/x"])) != nil)
@@ -1508,7 +1508,7 @@ final class RegressionTests: XCTestCase {
               SourceSpec.rawGitHub("/tmp/github.com/x.txt"), "/tmp/github.com/x.txt")
     }
 
-    func testSubnetSources() throws {
+    func testSubnetSources() async throws {
         // IPv4 и IPv6 — независимые обязательные части одного источника. Если одна
         // часть не приехала, загрузчик не должен отдавать Planner неполную склейку:
         // removeStale тогда удалил бы отсутствующие записи с роутера.
@@ -1530,7 +1530,7 @@ final class RegressionTests: XCTestCase {
         try? "1.1.1.0/24\n".write(to: subnetV4, atomically: true, encoding: .utf8)
         try? "this-is-not-a-subnet\n".write(to: subnetV6, atomically: true, encoding: .utf8)
         do {
-            _ = try SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
+            _ = try await SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
             check("частичная загрузка подсетей отклоняется", false)
         } catch let error as TransportError {
             check("частичная загрузка подсетей отклоняется", true)
@@ -1540,10 +1540,10 @@ final class RegressionTests: XCTestCase {
             check("частичная загрузка подсетей отклоняется", true)
         }
         try? "2001:db8::/32\n".write(to: subnetV6, atomically: true, encoding: .utf8)
-        let completeSubnets = try? SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
+        let completeSubnets = try? await SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
         check("полный набор подсетей загружается", completeSubnets?.subnetCount == 2)
         try? "broken-again\n".write(to: subnetV6, atomically: true, encoding: .utf8)
-        let cachedSubnets = try? SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
+        let cachedSubnets = try? await SourceLoader.load(partialSpec, ttlMinutes: 0, forceRefresh: true)
         check("при следующей частичной загрузке берётся полный кэш",
               cachedSubnets?.fromCache == true && cachedSubnets?.subnetCount == 2)
         try? FileManager.default.removeItem(at: subnetRoot)
@@ -1656,12 +1656,12 @@ final class RegressionTests: XCTestCase {
               RCITransport.endpoint(in: "x-ndw4 endpoint=\"../auth\"") == nil)
     }
 
-    func testLiveSourceDownloads() throws {
+    func testLiveSourceDownloads() async throws {
         guard ProcessInfo.processInfo.environment["SELFTEST_NETWORK"] == "1" else {
             throw XCTSkip("External source downloads require SELFTEST_NETWORK=1")
         }
         for spec in SourceCatalog.all {
-            let data = try SourceLoader.load(spec, ttlMinutes: 0, forceRefresh: true)
+            let data = try await SourceLoader.load(spec, ttlMinutes: 0, forceRefresh: true)
             XCTAssertGreaterThanOrEqual(data.entries.count, spec.minDomains, spec.title)
         }
     }

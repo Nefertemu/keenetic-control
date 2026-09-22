@@ -173,7 +173,7 @@ final class DomainListUpdateControllerTests: XCTestCase {
         defer { session.disconnectAll() }
         let updater = DomainListUpdateController(sourceLoader: { _, spec in self.data(spec, ["new.example.org"]) })
         await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: false)
-        XCTAssertEqual(updater.report?.results.first?.status, .updated)
+        XCTAssertEqual(updater.report?.results.first?.status, .appliedTemporarily)
         let firstWrites = writes(transport)
         XCTAssertEqual(fixture.backups.count, 1)
         await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: false)
@@ -307,7 +307,7 @@ final class DomainListUpdateControllerTests: XCTestCase {
             return self.data(spec, desired)
         })
         await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: false)
-        XCTAssertEqual(updater.report?.results.first?.status, .updated)
+        XCTAssertEqual(updater.report?.results.first?.status, .appliedTemporarily)
         XCTAssertTrue(fixture.backups.first?.contains("Wireguard9 auto reject") == true)
         let managed = Planner.managedGroups(try XCTUnwrap(session.state).groups, spec: spec)
         XCTAssertEqual(managed.count, 2)
@@ -477,5 +477,132 @@ final class DomainListUpdateControllerTests: XCTestCase {
         XCTAssertTrue(fixture.backups.isEmpty)
         XCTAssertNotNil(updater.report?.error)
         XCTAssertEqual(backend.snapshot["domain-list1"]?.entries, ["second.example.org"])
+    }
+}
+
+extension DomainListUpdateControllerTests {
+    func testUnusualRemovalNeedsSourceSpecificConfirmationThenApplies() async throws {
+        let spec = source(), desired = (0..<10).map { "d\($0).example.org" }
+        let backend = DomainUpdateRouter(["domain-list0": .init(description: "alpha",
+            entries: Set((0..<60).map { "d\($0).example.org" }))])
+        let transport = backend.transport(), fixture = SessionFixture(transport), session = fixture.session()
+        defer { session.disconnectAll() }
+        let updater = DomainListUpdateController(sourceLoader: { _, spec in self.data(spec, desired) })
+        await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: true)
+        XCTAssertEqual(updater.report?.results.first?.status, .needsConfirmation)
+        XCTAssertTrue(writes(transport).isEmpty)
+        XCTAssertTrue(fixture.backups.isEmpty)
+        let confirmation = try XCTUnwrap(updater.pendingConfirmations.first)
+        XCTAssertEqual(confirmation.removed, 50)
+        await updater.confirmRemoval(confirmation.id, session: session)
+        XCTAssertEqual(updater.report?.results.first?.status, .updated)
+        XCTAssertEqual(backend.snapshot["domain-list0"]?.entries, Set(desired))
+        XCTAssertEqual(fixture.backups.count, 1)
+    }
+
+    func testChangedDownloadDoesNotReuseRemovalConsent() async throws {
+        let spec = source()
+        let backend = DomainUpdateRouter(["domain-list0": .init(description: "alpha",
+            entries: Set((0..<60).map { "d\($0).example.org" }))])
+        let transport = backend.transport(), fixture = SessionFixture(transport), session = fixture.session()
+        defer { session.disconnectAll() }
+        var desired = (0..<10).map { "d\($0).example.org" }
+        let updater = DomainListUpdateController(sourceLoader: { _, spec in self.data(spec, desired) })
+        await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: true)
+        let confirmation = try XCTUnwrap(updater.pendingConfirmations.first)
+        desired = Array(desired.dropLast())
+        await updater.confirmRemoval(confirmation.id, session: session)
+        XCTAssertEqual(updater.report?.results.first?.status, .needsConfirmation)
+        XCTAssertEqual(updater.pendingConfirmations.first?.removed, 51)
+        XCTAssertNotEqual(updater.pendingConfirmations.first?.id, confirmation.id)
+        XCTAssertTrue(writes(transport).isEmpty)
+    }
+
+    func testChangedRouterListDoesNotReuseRemovalConsent() async throws {
+        let spec = source()
+        let backend = DomainUpdateRouter(["domain-list0": .init(description: "alpha",
+            entries: Set((0..<60).map { "d\($0).example.org" }))])
+        let transport = backend.transport(), fixture = SessionFixture(transport), session = fixture.session()
+        defer { session.disconnectAll() }
+        let updater = DomainListUpdateController(sourceLoader: { _, spec in
+            self.data(spec, (0..<10).map { "d\($0).example.org" })
+        })
+        await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: true)
+        let confirmation = try XCTUnwrap(updater.pendingConfirmations.first)
+        backend.change("domain-list0") { $0.entries.insert("manually-added.example.org") }
+        await updater.confirmRemoval(confirmation.id, session: session)
+        XCTAssertEqual(updater.report?.results.first?.status, .needsConfirmation)
+        XCTAssertTrue(writes(transport).isEmpty)
+    }
+
+    func testUserCancelCancelsDownloadAndLeavesNoBackupOrWrite() async throws {
+        let spec = source()
+        let backend = DomainUpdateRouter(["domain-list0": .init(description: "alpha", entries: ["old.example.org"])])
+        let transport = backend.transport(), fixture = SessionFixture(transport), session = fixture.session()
+        defer { session.disconnectAll() }
+        let started = expectation(description: "Source downloading")
+        let updater = DomainListUpdateController(sourceLoader: { _, spec in
+            started.fulfill()
+            try await Task.sleep(nanoseconds: 30_000_000_000)
+            return self.data(spec, ["new.example.org"])
+        })
+        let task = Task { await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: true) }
+        await fulfillment(of: [started], timeout: 2)
+        XCTAssertTrue(updater.canCancel)
+        updater.cancel()
+        await task.value
+        XCTAssertEqual(updater.report?.cancelled, true)
+        XCTAssertFalse(updater.canCancel)
+        XCTAssertTrue(writes(transport).isEmpty)
+        XCTAssertTrue(fixture.backups.isEmpty)
+    }
+
+    func testCancelIsUnavailableAfterLastPrewriteCheckAndDoesNotInterruptChanges() async throws {
+        let spec = source()
+        let backend = DomainUpdateRouter(["domain-list0": .init(description: "alpha", entries: ["old.example.org"])])
+        let transport = backend.transport(), fixture = SessionFixture(transport), session = fixture.session()
+        defer { session.disconnectAll() }
+        let gate = TransportGate()
+        transport.onRun = { command in
+            if command.hasPrefix("no object-group fqdn") { try gate.wait() }
+            return try backend.run(command)
+        }
+        let updater = DomainListUpdateController(sourceLoader: { _, spec in self.data(spec, ["new.example.org"]) })
+        let task = Task { await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: true) }
+        await fulfillment(of: [gate.started], timeout: 2)
+        XCTAssertFalse(updater.canCancel)
+        updater.cancel()
+        gate.release()
+        await task.value
+        XCTAssertEqual(updater.report?.results.first?.status, .updated)
+        XCTAssertEqual(backend.snapshot["domain-list0"]?.entries, ["new.example.org"])
+        XCTAssertTrue(writes(transport).contains("system configuration save"))
+    }
+}
+
+extension DomainListUpdateControllerTests {
+    func testUserCancelInterruptsInitialRouterRead() async {
+        let spec = source(), gate = TransportGate(), transport = FakeTransport()
+        transport.onRead = {
+            try gate.wait()
+            return "hostname fixture\nobject-group fqdn domain-list0\n description alpha\n include old.example.org\n!\n"
+        }
+        transport.onAbort = { gate.release() }
+        let fixture = SessionFixture(transport), session = fixture.session()
+        defer { gate.release(); session.disconnectAll() }
+        var downloads = 0
+        let updater = DomainListUpdateController(sourceLoader: { _, spec in
+            downloads += 1
+            return self.data(spec, ["new.example.org"])
+        })
+        let task = Task { await updater.update(session: session, catalog: [spec], chunkSize: 300, saveConfig: true) }
+        await fulfillment(of: [gate.started], timeout: 2)
+        updater.cancel()
+        await task.value
+        XCTAssertGreaterThan(transport.abortCount, 0, "Cancel must interrupt the read, not just wait for its timeout")
+        XCTAssertEqual(updater.report?.cancelled, true)
+        XCTAssertEqual(downloads, 0)
+        XCTAssertTrue(fixture.backups.isEmpty)
+        XCTAssertTrue(writes(transport).isEmpty)
     }
 }

@@ -244,6 +244,7 @@ struct ApplyOutcome: Identifiable {
     var problems: [String] = []
     var backupURL: URL?
     var elapsed: TimeInterval = 0
+    var historyID: UUID?
 }
 
 /// Снимок конкретного подключения, с которым началась длинная операция.

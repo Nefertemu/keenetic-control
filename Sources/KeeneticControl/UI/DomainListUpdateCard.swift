@@ -11,13 +11,20 @@ struct DomainListUpdateCard: View {
     var report: DomainListUpdateReport?
     var isDisabled: Bool
     var otherRouterName: String?
+    var canCancel: Bool
+    var confirmations: [DomainRemovalConfirmation]
+    var onCancel: () -> Void
+    var onConfirmRemoval: (UUID) -> Void
     var onUpdate: () -> Void
+    @State private var selectedConfirmation: DomainRemovalConfirmation?
     @State private var detailsExpanded: Bool
 
     init(isRunning: Bool = false, phase: String = "", completed: Int = 0,
          total: Int = 0, report: DomainListUpdateReport? = nil,
          isDisabled: Bool = false, otherRouterName: String? = nil,
-         detailsExpanded: Bool = false, onUpdate: @escaping () -> Void = {}) {
+         detailsExpanded: Bool = false, canCancel: Bool = false,
+         confirmations: [DomainRemovalConfirmation] = [], onCancel: @escaping () -> Void = {},
+         onConfirmRemoval: @escaping (UUID) -> Void = { _ in }, onUpdate: @escaping () -> Void = {}) {
         self.isRunning = isRunning
         self.phase = phase
         self.completed = completed
@@ -25,8 +32,16 @@ struct DomainListUpdateCard: View {
         self.report = report
         self.isDisabled = isDisabled
         self.otherRouterName = otherRouterName
+        self.canCancel = canCancel
+        self.confirmations = confirmations
+        self.onCancel = onCancel
+        self.onConfirmRemoval = onConfirmRemoval
         self.onUpdate = onUpdate
-        _detailsExpanded = State(initialValue: detailsExpanded)
+        _detailsExpanded = State(initialValue: detailsExpanded || report.map { report in
+            report.error != nil || report.cancelled || report.results.contains {
+                [.skipped, .needsAttention, .needsConfirmation].contains($0.status)
+            }
+        } == true)
     }
 
     var body: some View {
@@ -66,6 +81,13 @@ struct DomainListUpdateCard: View {
         // строк и поднимает минимальную высоту всего окна.
         .frame(minWidth: 320, alignment: .leading)
         .card(padding: 14)
+        .alert(item: $selectedConfirmation) { confirmation in
+            Alert(title: Text("Сильно сократился источник «\(confirmation.spec.title)»"),
+                  message: Text("Удалить \(confirmation.removed) из \(confirmation.previousEntries.count) записей? В свежем источнике осталось \(confirmation.desiredEntries.count). Перед применением источник и списки будут проверены ещё раз; изменившиеся данные потребуют нового подтверждения."),
+                  primaryButton: .destructive(Text("Удалить \(confirmation.removed) записей")) {
+                      onConfirmRemoval(confirmation.id)
+                  }, secondaryButton: .cancel(Text("Оставить списки")))
+        }
         .onChange(of: report?.finishedAt) { _, _ in
             detailsExpanded = report.map(hasIssues) ?? false
         }
@@ -113,6 +135,16 @@ struct DomainListUpdateCard: View {
                         .fixedSize()
                 }
             }
+            HStack {
+                Text(canCancel ? "Можно отменить до записи на роутер." : "Запись началась. Дожидаемся проверки результата.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                if canCancel {
+                    Button("Отменить", action: onCancel)
+                        .font(.system(size: 11))
+                        .accessibilityIdentifier("domain-lists.cancel")
+                }
+            }
             if total > 0, completed < total {
                 ProgressView(value: Double(min(max(completed, 0), total)), total: Double(total))
                     .tint(Palette.accent)
@@ -137,7 +169,13 @@ struct DomainListUpdateCard: View {
                     .fixedSize()
             }
 
-            let changed = report.results.filter { $0.status == .updated }
+            if report.results.contains(where: { $0.status == .appliedTemporarily }) {
+                Label("Применено временно — изменения не сохранятся после перезагрузки роутера.", systemImage: "clock.badge.exclamationmark")
+                    .font(.system(size: 11)).foregroundStyle(Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("domain-lists.temporary")
+            }
+            let changed = report.results.filter { $0.status == .updated || $0.status == .appliedTemporarily }
             if !changed.isEmpty {
                 let added = changed.reduce(0) { $0 + $1.added }
                 let removed = changed.reduce(0) { $0 + $1.removed }
@@ -232,11 +270,19 @@ struct DomainListUpdateCard: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
-                } else if source.status == .updated {
+                } else if source.status == .updated || source.status == .appliedTemporarily {
                     Text("+\(source.added) добавлено · −\(source.removed) удалено"
                          + (source.createdParts > 0 ? " · новых частей: \(source.createdParts)" : ""))
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
+                }
+                if let confirmation = confirmations.first(where: { $0.spec.key == source.spec.key }) {
+                    Button("Проверить удаление \(confirmation.removed) записей…") {
+                        selectedConfirmation = confirmation
+                    }
+                    .buttonStyle(.link).font(.system(size: 11))
+                    .disabled(isDisabled || isRunning)
+                    .accessibilityIdentifier("domain-lists.confirm.\(source.spec.key)")
                 }
             }
         }
@@ -244,7 +290,7 @@ struct DomainListUpdateCard: View {
 
     private func hasIssues(_ report: DomainListUpdateReport) -> Bool {
         report.error != nil || report.cancelled || report.results.contains {
-            $0.status == .skipped || $0.status == .needsAttention
+            $0.status == .skipped || $0.status == .needsAttention || $0.status == .needsConfirmation
         }
     }
 
@@ -254,6 +300,7 @@ struct DomainListUpdateCard: View {
             return report.results.contains { $0.status == .updated }
                 ? "Обновлено частично" : "Обновление требует внимания"
         }
+        if report.results.contains(where: { $0.status == .appliedTemporarily }) { return "Применено временно" }
         if report.results.isEmpty { return "Установленных источников не найдено" }
         return report.results.contains { $0.status == .updated } ? "Списки обновлены" : "Списки актуальны"
     }
@@ -261,6 +308,8 @@ struct DomainListUpdateCard: View {
     private func statusTitle(_ source: DomainSourceUpdateResult) -> String {
         switch source.status {
         case .updated: return "Обновлён"
+        case .appliedTemporarily: return "Применено временно"
+        case .needsConfirmation: return "Нужно подтверждение"
         case .unchanged: return "Без изменений"
         case .skipped: return "Пропущен"
         case .needsAttention: return "Требует внимания"
@@ -274,9 +323,15 @@ struct DomainListUpdateSection: View {
     @ObservedObject var updater: DomainListUpdateController
     @ObservedObject private var store = Store.shared
 
-    init(session: RouterSession) {
+    private var catalogOverride: [SourceSpec]?
+    private var settingsOverride: AppSettings?
+
+    init(session: RouterSession, updater: DomainListUpdateController? = nil,
+         catalog: [SourceSpec]? = nil, settings: AppSettings? = nil) {
         self.session = session
-        self.updater = session.domainListUpdater
+        self.updater = updater ?? session.domainListUpdater
+        self.catalogOverride = catalog
+        self.settingsOverride = settings
     }
 
     var body: some View {
@@ -288,10 +343,14 @@ struct DomainListUpdateSection: View {
             total: belongsToRouter ? updater.total : 0,
             report: belongsToRouter ? updater.report : nil,
             isDisabled: updater.isRunning || session.isBusy(session.router.id),
-            otherRouterName: updater.isRunning && !belongsToRouter ? updater.routerName : nil
+            otherRouterName: updater.isRunning && !belongsToRouter ? updater.routerName : nil,
+            canCancel: belongsToRouter && updater.canCancel,
+            confirmations: belongsToRouter ? updater.pendingConfirmations : [],
+            onCancel: { updater.cancel() },
+            onConfirmRemoval: { id in Task { await updater.confirmRemoval(id, session: session) } }
         ) {
-            let catalog = store.allSources
-            let settings = store.settings
+            let catalog = catalogOverride ?? store.allSources
+            let settings = settingsOverride ?? store.settings
             let context = RouterPresentationContext(session.router)
             Task {
                 guard RouterPresentationContext(session.router) == context else { return }

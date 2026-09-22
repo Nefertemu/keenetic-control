@@ -52,6 +52,21 @@ enum Backups {
 
     static func read(_ url: URL) throws -> String { try SecureBackup.read(url) }
 
+    /// Пароль нужен только для открытия переносимого контейнера. Локальная
+    /// копия сразу повторно шифруется ключом текущего Mac и проверяется чтением.
+    static func importPortable(_ source: URL, password: String, host: String) throws -> URL {
+        let text = try PortableBackup.read(source, password: password)
+        let target = AppPaths.backups.appendingPathComponent(runningConfigFilename(host: host))
+        do {
+            try SecureBackup.write(text, to: target)
+            guard try SecureBackup.read(target) == text else { throw SecureBackupError.invalidContainer }
+            return target
+        } catch {
+            try? FileManager.default.removeItem(at: target)
+            throw error
+        }
+    }
+
     /// Старые версии оставляли running-config открытым текстом. Миграция
     /// сначала пишет и перечитывает зашифрованный контейнер, и только после
     /// успешной сверки удаляет исходный `.txt`; при любой ошибке старый файл

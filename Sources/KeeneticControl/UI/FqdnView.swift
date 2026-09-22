@@ -70,7 +70,8 @@ struct FqdnView: View {
                                          hint: "Выбери другое имя или управляй существующим списком на вкладке «Маршруты».")
                 }
                 let built = try ManualFqdnPlanner.plan(
-                    ident: cleanIdent, description: description, entriesText: entries)
+                    ident: cleanIdent, description: description, entriesText: entries,
+                    limit: store.settings.maxDomainsPerList)
                 planApplyTitle = "Создать список"
                 plan = built.forRouter(session.router)
                 // Закрываем редактор только после успешной проверки.
@@ -99,7 +100,7 @@ struct FqdnView: View {
             CardHeader(icon: "list.bullet.rectangle", title: "Добавление списков доменов",
                        subtitle: "Первый импорт и ручная загрузка выбранных источников")
 
-            Text("Ручной импорт делит списки на части до \(store.settings.chunkSize) записей и не меняет маршруты. "
+            Text("Ручной импорт делит списки на части до \(store.settings.effectiveChunkSize) записей и не меняет маршруты. "
                  + "Новым частям назначь туннели на вкладке «Маршруты». Для регулярного обновления используй кнопку «Обновить списки» выше.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
@@ -411,17 +412,17 @@ struct FqdnView: View {
 
             for spec in sources {
                 guard isRelevant() else { return }
-                let data = try await session.loadSource(spec, forceRefresh: forceRefresh)
+                let data = try await session.loadSource(spec, forceRefresh: forceRefresh,
+                                                        requireFreshComplete: removeStale)
                 guard isRelevant() else { return }
                 fetched[spec.key] = data
                 log(.info, "\(spec.title): \(data.entries.count) записей, \(data.freshness).")
 
-                plans.append(Planner.planImport(
-                    groups: state.groups,
-                    data: data,
-                    chunkSize: settings.chunkSize,
-                    removeStale: removeStale,
-                    reservedIDs: &reserved))
+                var sourcePlan = Planner.planImport(
+                    groups: state.groups, data: data, chunkSize: settings.effectiveChunkSize,
+                    removeStale: removeStale, reservedIDs: &reserved)
+                sourcePlan.sourceVersions = [OperationSourceVersion(spec: spec, data: data)]
+                plans.append(sourcePlan)
             }
 
             guard isRelevant() else { return }

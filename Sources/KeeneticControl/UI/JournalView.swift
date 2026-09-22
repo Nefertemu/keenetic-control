@@ -2,6 +2,30 @@ import AppKit
 import SwiftUI
 
 struct JournalView: View {
+    @EnvironmentObject private var session: RouterSession
+    @State private var showsOperations = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Picker("Журнал", selection: $showsOperations) {
+                Text("Операции").tag(true)
+                Text("Сообщения").tag(false)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 360)
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+            if showsOperations {
+                OperationHistoryView(session: session)
+            } else {
+                LogEntriesView()
+            }
+        }
+    }
+}
+
+private struct LogEntriesView: View {
     @ObservedObject private var store = LogStore.shared
     @State private var filter: LogLevel?
     @State private var query = ""

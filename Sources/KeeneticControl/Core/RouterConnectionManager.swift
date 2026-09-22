@@ -145,6 +145,13 @@ final class RouterConnectionManager: ObservableObject {
 
     let dependencies: RouterSessionDependencies
 
+    func profile(for operation: RouterOperation) throws -> RouterProfile {
+        try requireCurrent(operation)
+        if operation.routerID == router.id { return router }
+        guard let profile = slots[operation.routerID]?.profile else { throw CancellationError() }
+        return profile
+    }
+
     init(router: RouterProfile, dependencies: RouterSessionDependencies) {
         self.dependencies = dependencies
         self.router = router
@@ -1175,10 +1182,8 @@ final class RouterConnectionManager: ObservableObject {
         let owner = operation.routerID
         store(activity: "Загружаю «\(spec.title)»…", owner: owner)
         defer { if isCurrent(operation) { clearActivity(owner: owner) } }
-        return try await background(owner: owner) {
-            try SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh,
-                                  requireFreshComplete: requireFreshComplete)
-        }
+        return try await SourceLoader.load(spec, ttlMinutes: ttl, forceRefresh: forceRefresh,
+                                           requireFreshComplete: requireFreshComplete)
     }
 
     /// Используем уже прочитанный running-config, сохраняя живые счётчики.

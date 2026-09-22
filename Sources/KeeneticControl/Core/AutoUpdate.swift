@@ -29,10 +29,12 @@ final class AutoUpdater: ObservableObject {
     private weak var session: RouterSession?
     private var notificationsAsked = false
 
-    private let sourceLoader: (RouterSession, SourceSpec) async throws -> SourceData
+    private enum CheckAbort: Error { case contextChanged }
 
-    init(sourceLoader: @escaping (RouterSession, SourceSpec) async throws -> SourceData = {
-        try await $0.loadSource($1, forceRefresh: true)
+    private let sourceLoader: @MainActor (RouterSession, SourceSpec) async throws -> SourceData
+
+    init(sourceLoader: @escaping @MainActor (RouterSession, SourceSpec) async throws -> SourceData = {
+        try await $0.loadSource($1, forceRefresh: true, requireFreshComplete: true)
     }) {
         self.sourceLoader = sourceLoader
     }
@@ -116,38 +118,51 @@ final class AutoUpdater: ObservableObject {
                 && store.allSources == catalog
                 && store.settings.autoUpdateSources == chosen
                 && store.settings.chunkSize == settings.chunkSize
+                && store.settings.maxDomainsPerList == settings.maxDomainsPerList
                 && store.settings.removeStaleByDefault == settings.removeStaleByDefault
         }
 
-        for spec in sources {
-            // Пока источник скачивался, человек мог выбрать другой роутер.
-            // Не продолжаем строить и тем более показывать устаревший план.
-            guard contextIsCurrent() else {
-                lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
-                return
-            }
-            do {
-                let data = try await sourceLoader(session, spec)
-                guard contextIsCurrent() else {
-                    lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
-                    return
+        var loaded: [String: SourceData] = [:]
+        do {
+            try await SourceDownloadBatch.load(sources, loader: { spec in
+                try await self.sourceLoader(session, spec)
+            }, onComplete: { outcome in
+                try Task.checkCancellation()
+                guard contextIsCurrent() else { throw CheckAbort.contextChanged }
+                switch outcome.result {
+                case .success(let data): loaded[outcome.spec.key] = data
+                case .failure(let error): failures.append("\(outcome.spec.title): \(session.describe(error))")
                 }
-                plans.append(Planner.planImport(
-                    groups: state.groups,
-                    data: data,
-                    chunkSize: settings.chunkSize,
-                    removeStale: settings.removeStaleByDefault,
-                    reservedIDs: &reserved))
-            } catch is CancellationError {
-                lastMessage = "Сверка отменена."
-                return
-            } catch {
-                failures.append("\(spec.title): \(session.describe(error))")
+            })
+        } catch is CancellationError {
+            lastMessage = "Сверка отменена."
+            return
+        } catch CheckAbort.contextChanged {
+            lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
+            return
+        } catch {
+            lastMessage = "Сверка не завершена: " + session.describe(error)
+            return
+        }
+        for spec in sources {
+            guard let data = loaded[spec.key] else { continue }
+            let existing = Set(Planner.managedGroups(state.groups, spec: spec).flatMap(\.includes))
+            let desired = Set(data.entries)
+            if settings.removeStaleByDefault,
+               (data.fromCache || !data.skipped.isEmpty || DomainRemovalConfirmation.isUnusual(previous: existing, desired: desired)) {
+                failures.append("\(spec.title): удаление требует отдельной проверки кнопкой «Обновить списки».")
+                continue
             }
+            var plan = Planner.planImport(groups: state.groups, data: data,
+                chunkSize: settings.effectiveChunkSize, removeStale: settings.removeStaleByDefault,
+                reservedIDs: &reserved)
+            plan.sourceVersions = [OperationSourceVersion(spec: spec, data: data)]
+            plans.append(plan)
         }
 
         guard contextIsCurrent() else {
-            lastMessage = "Сверка отменена: изменились роутер, списки или параметры проверки."
+            lastMessage = Task.isCancelled ? "Сверка отменена."
+                : "Сверка отменена: изменились роутер, списки или параметры проверки."
             return
         }
         lastCheck = Date()

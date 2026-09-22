@@ -8,12 +8,25 @@ import Foundation
 /// снести настройки, которые к делу не относятся.
 enum Restore {
 
+    struct Selection {
+        /// nil — все списки, пустое множество — ни одного.
+        var groupIDs: Set<String>? = nil
+        var restoreContents = true
+        var restoreChains = true
+        var restoreStaticRoutes = true
+    }
+
     /// Чем текущая конфигурация отличается от снимка.
     struct Difference: Identifiable {
         /// Сверка показывается в sheet. Идентификатор должен переживать
         /// перерисовку, иначе SwiftUI воспринимает тот же результат как новый.
         let id = UUID()
         /// Домены, появившиеся после снимка, — их надо убрать.
+        var snapshotGroups: [String: FqdnGroup] = [:]
+        var currentGroups: [String: FqdnGroup] = [:]
+        var snapshotStaticRoutes: [StaticRoute] = []
+        var currentStaticRoutes: [StaticRoute] = []
+        var changedDescriptions: [String: String] = [:]
         var extraDomains: [String: Set<String>] = [:]
         /// Домены, пропавшие после снимка, — их надо вернуть.
         var missingDomains: [String: Set<String>] = [:]
@@ -45,7 +58,7 @@ enum Restore {
             extraDomains.isEmpty && missingDomains.isEmpty
                 && extraGroups.isEmpty && missingGroups.isEmpty
                 && extraRouteLines.isEmpty && missingRouteLines.isEmpty
-                && extraRoutes.isEmpty && missingRoutes.isEmpty
+                && extraRoutes.isEmpty && missingRoutes.isEmpty && changedDescriptions.isEmpty
         }
 
         /// Человеческая сводка — то же, что попадёт в заголовок плана.
@@ -59,14 +72,64 @@ enum Restore {
             if routes > 0 { parts.append("маршрутов списков: \(routes)") }
             let statics = missingRoutes.count + extraRoutes.count
             if statics > 0 { parts.append("статических маршрутов: \(statics)") }
+            if !changedDescriptions.isEmpty { parts.append("имён списков: \(changedDescriptions.count)") }
             return parts
         }
     }
 
     static func compare(backup: String, current: String) -> Difference {
-        let before = RouterConfigParser.parseFqdnGroups(CLI.normalizeNewlines(backup))
-        let after = RouterConfigParser.parseFqdnGroups(CLI.normalizeNewlines(current))
+        compare(groups: RouterConfigParser.parseFqdnGroups(CLI.normalizeNewlines(backup)),
+                currentGroups: RouterConfigParser.parseFqdnGroups(CLI.normalizeNewlines(current)),
+                staticRoutes: StaticRouteParser.parse(config: backup),
+                currentStaticRoutes: StaticRouteParser.parse(config: current))
+    }
+
+    /// Точка входа для пользовательских файлов; compare также служит наблюдателю
+    /// уже прочитанных конфигураций, поэтому сам не бросает ошибки.
+    static func validatedComparison(backup: String, current: String) throws -> Difference {
+        compare(backup: try ConfigurationText.validatedBackup(backup),
+                current: try ConfigurationText.validatedBackup(current))
+    }
+
+    static func selecting(_ selection: Selection, from difference: Difference) -> Difference {
+        let ids = selection.groupIDs ?? Set(difference.snapshotGroups.keys).union(difference.currentGroups.keys)
+        var target = difference.currentGroups
+        for ident in ids {
+            let saved = difference.snapshotGroups[ident]
+            if selection.restoreContents {
+                target[ident] = saved
+                if !selection.restoreChains, target[ident] != nil {
+                    target[ident]?.routeLines = difference.currentGroups[ident]?.routeLines ?? []
+                }
+            } else if selection.restoreChains, target[ident] != nil {
+                target[ident]?.routeLines = saved?.routeLines ?? []
+            }
+            // Ссылка по старому description перестанет разрешаться после
+            // выборочного возврата имени. Сохраняем те же интерфейсы/флаги,
+            // но такую ссылку переводим на стабильный идентификатор.
+            if let group = target[ident] {
+                target[ident]?.routeLines = group.routeLines.map { line in
+                    var tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+                    if tokens.count >= 5, tokens[3] != ident, tokens[3] != group.descriptionText {
+                        tokens[3] = ident
+                        return tokens.joined(separator: " ")
+                    }
+                    return line
+                }
+            }
+        }
+        return compare(groups: target, currentGroups: difference.currentGroups,
+                       staticRoutes: selection.restoreStaticRoutes ? difference.snapshotStaticRoutes : difference.currentStaticRoutes,
+                       currentStaticRoutes: difference.currentStaticRoutes)
+    }
+
+    private static func compare(groups before: [String: FqdnGroup], currentGroups after: [String: FqdnGroup],
+                                staticRoutes oldStatic: [StaticRoute], currentStaticRoutes newStatic: [StaticRoute]) -> Difference {
         var difference = Difference()
+        difference.snapshotGroups = before
+        difference.currentGroups = after
+        difference.snapshotStaticRoutes = oldStatic
+        difference.currentStaticRoutes = newStatic
 
         for ident in before.keys.sorted() {
             guard let old = before[ident] else { continue }
@@ -74,6 +137,9 @@ enum Restore {
                 difference.missingGroups.append(old)
                 difference.exactRouteChains[ident] = old.routeAssignments
                 continue
+            }
+            if old.descriptionText != new.descriptionText {
+                difference.changedDescriptions[ident] = old.descriptionText
             }
             let gone = old.includes.subtracting(new.includes)
             let added = new.includes.subtracting(old.includes)
@@ -100,21 +166,41 @@ enum Restore {
             }
         }
 
-        let oldStatic = StaticRouteParser.parse(config: CLI.normalizeNewlines(backup))
-        let newStatic = StaticRouteParser.parse(config: CLI.normalizeNewlines(current))
-        let oldKeys = Set(oldStatic.map(\.id))
-        let newKeys = Set(newStatic.map(\.id))
-        difference.missingRoutes = oldStatic.filter { !newKeys.contains($0.id) }
-        difference.extraRoutes = newStatic.filter { !oldKeys.contains($0.id) }
+        let oldKeys = Set(oldStatic.map(\.configurationKey))
+        let newKeys = Set(newStatic.map(\.configurationKey))
+        difference.missingRoutes = oldStatic.filter { !newKeys.contains($0.configurationKey) }
+        difference.extraRoutes = newStatic.filter { !oldKeys.contains($0.configurationKey) }
 
         return difference
     }
 
     /// План возврата. Порядок важен: сначала убираем лишнее, потом
     /// восстанавливаем недостающее, маршруты — после самих списков.
-    static func plan(_ difference: Difference, chunkSize: Int, title: String) -> Plan {
+    static func plan(_ difference: Difference, chunkSize: Int, title: String,
+                     verificationLimit: Int = FqdnLimits.maximumEntries) -> Plan {
         var plan = Plan(title: title)
-        plan.exactRouteChains = difference.exactRouteChains
+        plan.verifyBeforeSave = true
+        let desiredRoutes = Set(difference.snapshotGroups.values.flatMap(\.routeLines).map(ConfigurationText.canonicalRouteLine))
+        plan.expectedAbsentRouteLines = Set((difference.extraRouteLines + difference.extraGroups.flatMap(\.routeLines))
+            .map(ConfigurationText.canonicalRouteLine)).subtracting(desiredRoutes)
+        plan.groupEntryLimit = FqdnLimits.clamp(verificationLimit)
+        let touched = Set(difference.extraDomains.keys).union(difference.missingDomains.keys)
+            .union(difference.extraGroups.map(\.ident)).union(difference.missingGroups.map(\.ident))
+            .union(difference.exactRouteChains.keys).union(difference.changedDescriptions.keys)
+        plan.configurationBaselines = [ManagedConfigurationBaseline(
+            groupIDs: touched, groups: difference.currentGroups.filter { touched.contains($0.key) },
+            staticRoutes: difference.extraRoutes.isEmpty && difference.missingRoutes.isEmpty
+                ? nil : Set(difference.currentStaticRoutes.map(\.configurationKey)))]
+        for ident in touched {
+            if let saved = difference.snapshotGroups[ident] {
+                plan.expectedGroupContents[ident] = saved.includes
+                plan.expectedDescriptions[ident] = saved.descriptionText
+                plan.exactRouteChains[ident] = saved.routeAssignments
+            } else { plan.expectedAbsentGroups.insert(ident) }
+        }
+        if !difference.extraRoutes.isEmpty || !difference.missingRoutes.isEmpty {
+            plan.expectedStaticRoutes = Set(difference.snapshotStaticRoutes.map(\.configurationKey))
+        }
 
         // 1. Маршруты, которых в снимке не было, — снять до правки списков.
         for line in difference.extraRouteLines {
@@ -157,6 +243,12 @@ enum Restore {
             }
         }
 
+        for (ident, description) in difference.changedDescriptions.sorted(by: { $0.key < $1.key }) {
+            plan.commands.append(description.isEmpty
+                ? "no object-group fqdn \(ident) description"
+                : "object-group fqdn \(ident) description \(CLI.quote(description))")
+        }
+
         // 6. Маршруты списков возвращаем последними — списки уже на месте.
         for line in difference.missingRouteLines {
             plan.commands.append(line)
@@ -167,18 +259,25 @@ enum Restore {
 
         // 7. Статические маршруты.
         for route in difference.extraRoutes { plan.commands.append(route.deleteCommand) }
-        for route in difference.missingRoutes { plan.commands.append(route.command) }
+        for route in difference.missingRoutes { plan.commands.append(contentsOf: route.additionCommands) }
 
-        var notes = ["Возвращается только то, чем управляет приложение: списки FQDN, "
+        let notes = ["Возвращается только то, чем управляет приложение: списки FQDN, "
                      + "их маршруты и статические маршруты. Остальная конфигурация роутера "
                      + "остаётся как есть."]
-        let oversized = difference.missingGroups.filter { $0.includes.count > chunkSize }
-        if !oversized.isEmpty {
-            notes.append("В снимке есть списки крупнее \(chunkSize) записей "
-                         + "(\(oversized.map { "\($0.ident)=\($0.includes.count)" }.joined(separator: ", ")))"
-                         + " — восстанавливаются как были.")
-        }
         plan.notes = notes
         return plan
     }
+    /// Нельзя молча менять идентификаторы исторического списка ради деления:
+    /// другие части конфигурации могут ссылаться на него.
+    static func validatedPlan(_ difference: Difference, chunkSize: Int, title: String,
+                              verificationLimit: Int = FqdnLimits.maximumEntries) throws -> Plan {
+        let result = plan(difference, chunkSize: chunkSize, title: title, verificationLimit: verificationLimit)
+        let limit = result.groupEntryLimit ?? FqdnLimits.maximumEntries
+        if let large = result.expectedGroupContents.first(where: { $0.value.count > limit }) {
+            throw TransportError("В копии список \(large.key) содержит \(large.value.count) записей при лимите \(limit).",
+                                 hint: "Выбери другие списки. Такой список нужно предварительно разделить.")
+        }
+        return result
+    }
+
 }

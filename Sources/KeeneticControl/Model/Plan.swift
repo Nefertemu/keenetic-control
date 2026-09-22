@@ -13,6 +13,12 @@ struct PlannedDnsRoute: Hashable {
 
 /// Снимок всех частей одного источника, на котором основано обновление.
 /// Сравнивается с новым running-config непосредственно перед записью.
+struct ManagedConfigurationBaseline {
+    var groupIDs: Set<String>
+    var groups: [String: FqdnGroup]
+    var staticRoutes: Set<String>? = nil
+}
+
 struct DomainListBaseline {
     var spec: SourceSpec
     var groups: [String: FqdnGroup]
@@ -50,10 +56,17 @@ struct Plan: Identifiable {
     /// Обновление источника проверяет весь итоговый набор, а не только
     /// отправленные include/no include: лишние записи тоже означают ошибку.
     var expectedGroupContents: [String: Set<String>] = [:]
+    var expectedAbsentGroups: Set<String> = []
+    var expectedAbsentRouteLines: Set<String> = []
+    var expectedDescriptions: [String: String] = [:]
+    var expectedStaticRouteAdditions: Set<String> = []
+    var expectedStaticRoutes: Set<String>?
+    var configurationBaselines: [ManagedConfigurationBaseline] = []
     var groupEntryLimit: Int?
     var domainListBaselines: [DomainListBaseline] = []
     /// Одно нажатие сохраняет обновление только после успешной проверки.
     var verifyBeforeSave = false
+    var sourceVersions: [OperationSourceVersion] = []
     var notes: [String] = []
 
     var addCount: Int { adds.values.reduce(0) { $0 + $1.count } }
@@ -98,9 +111,26 @@ struct Plan: Identifiable {
 /// Проверка управляемой части конфигурации вынесена из сетевой сессии, чтобы
 /// одинаково строго проверять как реальный роутер, так и тестовые снимки.
 enum PlanVerifier {
-    static func preconditionProblems(plan: Plan, groups: [String: FqdnGroup]) -> [String] {
-        guard !plan.domainListBaselines.isEmpty else { return [] }
+    static func preconditionProblems(plan: Plan, groups: [String: FqdnGroup],
+                                     staticRoutes: [StaticRoute] = [], configText: String? = nil) -> [String] {
         var problems: [String] = []
+        if plan.configurationBaselines.contains(where: { $0.staticRoutes != nil }), let configText,
+           !StaticRouteParser.parseWithDiagnostics(config: configText).problems.isEmpty {
+            problems.append("После предпросмотра появились неподдерживаемые или повреждённые статические маршруты. Повтори сверку.")
+        }
+        if let limit = plan.groupEntryLimit {
+            for (ident, contents) in plan.expectedGroupContents where contents.count > FqdnLimits.clamp(limit) {
+                problems.append("\(ident): восстановление превысит лимит \(FqdnLimits.clamp(limit)) записей.")
+            }
+        }
+        for baseline in plan.configurationBaselines {
+            for ident in baseline.groupIDs where groups[ident] != baseline.groups[ident] {
+                problems.append("\(ident): список или его маршруты изменились после предпросмотра. Повтори сверку.")
+            }
+            if let expected = baseline.staticRoutes, expected != Set(staticRoutes.map(\.configurationKey)) {
+                problems.append("Статические маршруты изменились после предпросмотра. Повтори сверку.")
+            }
+        }
         for baseline in plan.domainListBaselines {
             let current = Dictionary(uniqueKeysWithValues:
                 Planner.managedGroups(groups, spec: baseline.spec).map { ($0.ident, $0) })
@@ -108,14 +138,46 @@ enum PlanVerifier {
                 problems.append("\(baseline.spec.title): списки или их маршруты изменились во время проверки. Повтори обновление.")
             }
         }
-        for group in plan.createdGroups where groups[group.ident] != nil {
+        for group in plan.createdGroups where groups[group.ident] != nil && !plan.domainListBaselines.isEmpty {
             problems.append("\(group.ident): имя новой части уже занято. Повтори обновление.")
         }
         return problems
     }
 
-    static func problems(plan: Plan, groups: [String: FqdnGroup], limit: Int) -> [String] {
+    static func problems(plan: Plan, groups: [String: FqdnGroup], limit: Int,
+                         staticRoutes: [StaticRoute] = [], configText: String? = nil) -> [String] {
         var problems: [String] = []
+        if let configText {
+            let actualRoutes = ConfigurationText.dnsRouteLines(configText)
+            for line in plan.expectedAbsentRouteLines where actualRoutes.contains(ConfigurationText.canonicalRouteLine(line)) {
+                problems.append("Маршрут списка не снят: \(line)")
+            }
+        }
+        for ident in plan.expectedAbsentGroups.sorted() where groups[ident] != nil {
+            problems.append("\(ident): список не удалён")
+        }
+        for (ident, description) in plan.expectedDescriptions where groups[ident]?.descriptionText != description {
+            problems.append("\(ident): имя списка не восстановлено")
+        }
+        if !plan.expectedStaticRouteAdditions.isEmpty {
+            let actual = Set(staticRoutes.map(\.configurationKey))
+            let missing = plan.expectedStaticRouteAdditions.subtracting(actual)
+            if !missing.isEmpty {
+                problems.append("Не подтверждены добавленные статические маршруты или их состояние: \(missing.count)")
+            }
+            if let configText, !StaticRouteParser.parseWithDiagnostics(config: configText).problems.isEmpty {
+                problems.append("Ответ содержит нераспознанные статические маршруты или некорректное отключение маршрута.")
+            }
+        }
+        if let expected = plan.expectedStaticRoutes {
+            if let configText, !StaticRouteParser.parseWithDiagnostics(config: configText).problems.isEmpty {
+                problems.append("Статические маршруты не удалось полностью проверить: есть неподдерживаемые или повреждённые строки.")
+            }
+            let actual = Set(staticRoutes.map(\.configurationKey))
+            if expected != actual {
+                problems.append("Статические маршруты не совпали: отсутствует \(expected.subtracting(actual).count), лишних \(actual.subtracting(expected).count)")
+            }
+        }
 
         for (ident, expected) in plan.expectedGroupContents.sorted(by: { $0.key < $1.key }) {
             guard let current = groups[ident] else {
@@ -195,7 +257,7 @@ enum PlanVerifier {
                 continue
             }
             let actual = group.routeAssignments
-            if !plan.domainListBaselines.isEmpty,
+            if (!plan.domainListBaselines.isEmpty || !plan.configurationBaselines.isEmpty),
                (try? DomainListSyncPlanner.validatedRouteChain(group, sourceTitle: ident)) == nil {
                 problems.append("\(ident): цепочка содержит неподдерживаемые или повторяющиеся маршруты")
             }
@@ -214,7 +276,7 @@ enum PlanVerifier {
                 problems.append("\(target.group): маршрут на \(target.interface) остался")
             }
         }
-        let effectiveLimit = min(max(1, limit), plan.groupEntryLimit ?? max(1, limit))
+        let effectiveLimit = min(FqdnLimits.clamp(limit), plan.groupEntryLimit ?? FqdnLimits.clamp(limit))
         for ident in Set(plan.adds.keys).union(plan.removes.keys).union(plan.expectedGroupContents.keys).sorted() {
             if let group = groups[ident], group.includes.count > effectiveLimit {
                 problems.append("\(ident): превышен лимит \(group.includes.count)/\(effectiveLimit)")
@@ -313,6 +375,7 @@ enum Planner {
         removeStale: Bool,
         reservedIDs: inout Set<String>
     ) -> Plan {
+        let chunkSize = FqdnLimits.effective(chunkSize: chunkSize)
         let spec = data.spec
         var plan = Plan(title: "\(spec.title): загрузка списков")
 
@@ -563,6 +626,7 @@ enum Planner {
                          current: [String: FqdnGroup],
                          chunkSize: Int,
                          reservedIDs: inout Set<String>) -> Plan {
+        let chunkSize = FqdnLimits.effective(chunkSize: chunkSize)
         var plan = Plan(title: "Перенос недостающих доменов")
         reservedIDs.formUnion(current.keys)
 
@@ -678,14 +742,36 @@ enum Planner {
                 merged.groupEntryLimit = min(merged.groupEntryLimit ?? limit, limit)
             }
             merged.domainListBaselines.append(contentsOf: plan.domainListBaselines)
+            merged.configurationBaselines.append(contentsOf: plan.configurationBaselines)
+            merged.expectedAbsentGroups.formUnion(plan.expectedAbsentGroups)
+            merged.expectedAbsentRouteLines.formUnion(plan.expectedAbsentRouteLines)
+            merged.expectedDescriptions.merge(plan.expectedDescriptions) { _, new in new }
+            merged.expectedStaticRouteAdditions.formUnion(plan.expectedStaticRouteAdditions)
+            if let expected = plan.expectedStaticRoutes { merged.expectedStaticRoutes = expected }
             merged.verifyBeforeSave = merged.verifyBeforeSave || plan.verifyBeforeSave
+            for version in plan.sourceVersions where !merged.sourceVersions.contains(where: { $0.key == version.key }) {
+                merged.sourceVersions.append(version)
+            }
             merged.notes.append(contentsOf: plan.notes)
         }
 
         var seen = Set<String>()
-        for command in removals + additions where !seen.contains(command) {
-            seen.insert(command)
-            merged.commands.append(command)
+        let orderedCommands = removals + additions
+        var index = 0
+        while index < orderedCommands.count {
+            let command = orderedCommands[index]
+            var unit = [command]
+            if index + 1 < orderedCommands.count,
+               let route = StaticRouteParser.parse(line: command),
+               orderedCommands[index + 1] == route.family.keyword + " disable" {
+                // disable относится к предыдущему маршруту: дедупликация
+                // его строки отдельно незаметно включила бы второй маршрут.
+                unit.append(orderedCommands[index + 1])
+            }
+            if seen.insert(unit.joined(separator: "\n")).inserted {
+                merged.commands.append(contentsOf: unit)
+            }
+            index += unit.count
         }
         return merged
     }
@@ -697,7 +783,7 @@ enum Planner {
 /// вкладке «Маршруты списков» вместе со всеми загруженными источниками.
 enum ManualFqdnPlanner {
     static func plan(ident rawIdent: String, description rawDescription: String,
-                     entriesText: String) throws -> Plan {
+                     entriesText: String, limit: Int = FqdnLimits.maximumEntries) throws -> Plan {
         let ident = rawIdent.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ident.range(of: "^[A-Za-z][A-Za-z0-9_-]{0,31}$", options: .regularExpression) != nil else {
             throw TransportError("Имя списка должно начинаться с латинской буквы и содержать "
@@ -722,7 +808,18 @@ enum ManualFqdnPlanner {
                                  hint: "Исправь их или убери из списка — ничего не будет пропущено молча.")
         }
 
+        let limit = FqdnLimits.clamp(limit)
+        guard parsed.domains.count <= limit else {
+            throw TransportError("В ручном списке допустимо не больше \(limit) записей.",
+                                 hint: "Для автоматического деления большого списка добавь его как источник.")
+        }
         var plan = Plan(title: "Создание списка «\(ident)»")
+        plan.groupEntryLimit = limit
+        plan.verifyBeforeSave = true
+        plan.configurationBaselines = [ManagedConfigurationBaseline(groupIDs: [ident], groups: [:])]
+        plan.expectedGroupContents[ident] = Set(parsed.domains)
+        plan.expectedDescriptions[ident] = description
+        plan.exactRouteChains[ident] = []
         var group = FqdnGroup(ident: ident, descriptionText: description)
         group.includes = Set(parsed.domains)
         plan.createdGroups = [group]

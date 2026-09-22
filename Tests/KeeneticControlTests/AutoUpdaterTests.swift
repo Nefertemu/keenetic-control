@@ -57,7 +57,7 @@ final class AutoUpdaterTests: XCTestCase {
         updater.attach(session: session)
         await updater.check(manual: true)
         XCTAssertNil(updater.finding)
-        XCTAssertTrue(updater.lastMessage?.contains("отменена") == true)
+        XCTAssertEqual(updater.lastMessage, "Сверка отменена: изменились роутер, списки или параметры проверки.")
     }
 
     func testUpdatedGroupsInvalidatePendingPlan() async {
@@ -72,7 +72,7 @@ final class AutoUpdaterTests: XCTestCase {
         updater.attach(session: session)
         await updater.check(manual: true)
         XCTAssertNil(updater.finding)
-        XCTAssertTrue(updater.lastMessage?.contains("отменена") == true)
+        XCTAssertEqual(updater.lastMessage, "Сверка отменена: изменились роутер, списки или параметры проверки.")
     }
 
     func testCancellationDoesNotShowFailureOrCreatePlan() async {
@@ -113,7 +113,7 @@ final class AutoUpdaterTests: XCTestCase {
         updater.attach(session: session)
         await updater.check(manual: true)
         XCTAssertNil(updater.finding)
-        XCTAssertTrue(updater.lastMessage?.contains("отменена") == true)
+        XCTAssertEqual(updater.lastMessage, "Сверка отменена: изменились роутер, списки или параметры проверки.")
     }
 
     func testTaskCancellationDiscardsSuccessfulLateDownload() async {
@@ -133,6 +133,7 @@ final class AutoUpdaterTests: XCTestCase {
         await task.value
         XCTAssertNil(updater.finding)
         XCTAssertNil(updater.lastCheck)
+        XCTAssertEqual(updater.lastMessage, "Сверка отменена.")
         XCTAssertFalse(updater.checking)
     }
 

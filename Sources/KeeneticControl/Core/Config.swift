@@ -231,6 +231,10 @@ struct AppSettings: Codable {
     var checkAppUpdates: Bool = true
     var lastUpdateCheck: Date?
 
+    var effectiveChunkSize: Int {
+        FqdnLimits.effective(chunkSize: chunkSize, verificationLimit: maxDomainsPerList)
+    }
+
     static let `default` = AppSettings()
 
     init() {}
@@ -246,8 +250,9 @@ struct AppSettings: Codable {
             ((try? box.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? `default`
         }
 
-        chunkSize = value(.chunkSize, fallback.chunkSize)
-        maxDomainsPerList = value(.maxDomainsPerList, fallback.maxDomainsPerList)
+        maxDomainsPerList = FqdnLimits.clamp(value(.maxDomainsPerList, fallback.maxDomainsPerList))
+        chunkSize = FqdnLimits.effective(chunkSize: value(.chunkSize, fallback.chunkSize),
+                                         verificationLimit: maxDomainsPerList)
         batchSize = value(.batchSize, fallback.batchSize)
         cacheTTLMinutes = value(.cacheTTLMinutes, fallback.cacheTTLMinutes)
         defaultAuto = value(.defaultAuto, fallback.defaultAuto)

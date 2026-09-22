@@ -213,7 +213,7 @@ final class DomainListUpdateUITests: XCTestCase {
     }
 
     private func recognize(_ png: Data) throws -> [String] {
-        let request = VNRecognizeTextRequest()
+        let request = try NativeUIInteractions.recognitionRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["ru-RU", "en-US"]
         try VNImageRequestHandler(data: png, options: [:]).perform([request])

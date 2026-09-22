@@ -18,6 +18,8 @@ final class Navigator: ObservableObject {
     @Published var paletteRequested = false
     /// Вкладка раздела «Туннели», на которую нужно перейти.
     @Published var tunnelsTab: TunnelsTab?
+    /// A direct domain/IP lookup requested from the palette.
+    @Published var routeQuery: String?
 
     private init() {}
 
@@ -40,6 +42,7 @@ struct PaletteItem: Identifiable, Hashable {
         case router(UUID)
         case list(String)
         case interfaceItem(String)
+        case routeQuery(String)
     }
 
     let id: String
@@ -61,10 +64,17 @@ struct CommandPalette: View {
     private var matches: [PaletteItem] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { return Array(items.prefix(30)) }
-        return items.filter {
+        var result = items.filter {
             $0.title.localizedCaseInsensitiveContains(needle)
                 || $0.subtitle.localizedCaseInsensitiveContains(needle)
         }
+        if let query = try? RouteExplanationQuery.parse(needle) {
+            result.insert(PaletteItem(id: "route-query", kind: .routeQuery(needle),
+                                      title: "Найти маршрут: \(query.value)",
+                                      subtitle: "По прочитанной конфигурации",
+                                      icon: "magnifyingglass", group: "Поиск маршрута"), at: 0)
+        }
+        return result
     }
 
     /// Группы в том же порядке, в каком идут элементы, — без сортировки по
@@ -81,7 +91,7 @@ struct CommandPalette: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-                TextField("Раздел, роутер, список или интерфейс", text: $query)
+                TextField("Раздел, роутер, список, домен или IP", text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .focused($focused)

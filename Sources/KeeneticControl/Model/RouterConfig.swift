@@ -291,7 +291,10 @@ enum RouterConfigParser {
             var name: String?
             var routeLine = trimmed
 
-            if let ident = capture(flat, in: trimmed, group: 1) {
+            // A policy can contain its own dns-proxy rule. Attaching that
+            // nested rule here would turn a per-client route into a global one
+            // when a later plan copies or updates the group's route chain.
+            if topLevel, let ident = capture(flat, in: trimmed, group: 1) {
                 name = ident
             } else if insideDNSProxy, !topLevel, let ident = capture(nested, in: trimmed, group: 1) {
                 name = ident

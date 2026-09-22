@@ -1,6 +1,6 @@
 import Foundation
 
-struct SourceSpec: Identifiable, Hashable {
+struct SourceSpec: Identifiable, Hashable, Sendable {
     let key: String
     let title: String
     let subtitle: String
@@ -144,7 +144,7 @@ enum SourceCatalog {
     static func spec(for key: String) -> SourceSpec? { all.first { $0.key == key } }
 }
 
-struct SourceData {
+struct SourceData: Sendable {
     let spec: SourceSpec
     /// Домены и подсети одним списком — Keenetic кладёт их в одну object-group.
     let entries: [String]
@@ -165,6 +165,11 @@ struct SourceData {
 }
 
 enum SourceLoader {
+    typealias HTTPTransport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    static let liveHTTPTransport: HTTPTransport = { request in
+        try await URLSession.shared.data(for: request)
+    }
+
     /// Результат загрузки подсетей хранит происхождение отдельно от доменного
     /// списка. Если хотя бы одна часть взята из кэша, возраст всего SourceData
     /// должен отражать самую старую его часть, а не выглядеть только что скачанным.
@@ -191,12 +196,14 @@ enum SourceLoader {
     /// Скачивает список с зеркалами. Обычный просмотр допускает локальную
     /// копию, а обновление с удалением требует свежего и полного ответа.
     static func load(_ spec: SourceSpec, ttlMinutes: Int, forceRefresh: Bool,
-                     requireFreshComplete: Bool = false) throws -> SourceData {
+                     requireFreshComplete: Bool = false,
+                     httpTransport: @escaping HTTPTransport = liveHTTPTransport) async throws -> SourceData {
+        try Task.checkCancellation()
         // Подсети — не зеркала, а независимые обязательные компоненты (обычно
         // IPv4 и IPv6). Загружаем их до доменов: частичный набор не должен
         // дойти до Planner и удалить записи через removeStale.
-        let subnets = try loadSubnets(spec, ttlMinutes: ttlMinutes, forceRefresh: forceRefresh,
-                                     requireFreshComplete: requireFreshComplete)
+        let subnets = try await loadSubnets(spec, ttlMinutes: ttlMinutes, forceRefresh: forceRefresh,
+                                     requireFreshComplete: requireFreshComplete, httpTransport: httpTransport)
 
         func finish(_ parsed: Domains.ParseResult, fromCache: Bool, at moment: Date?) -> SourceData {
             var seen = Set(parsed.domains)
@@ -238,7 +245,8 @@ enum SourceLoader {
         var errors: [String] = []
         for url in spec.domainURLs {
             do {
-                let text = try fetch(url)
+                try Task.checkCancellation()
+                let text = try await fetch(url, httpTransport: httpTransport)
                 let parsed = Domains.parseList(text)
                 if requireFreshComplete, !parsed.skipped.isEmpty {
                     errors.append("\(url): не удалось распознать \(parsed.skipped.count) строк")
@@ -252,6 +260,7 @@ enum SourceLoader {
                 try? text.write(to: cacheFile, atomically: true, encoding: .utf8)
                 return finish(parsed, fromCache: false, at: Date())
             } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
                 errors.append("\(url): \(error.localizedDescription)")
             }
         }
@@ -272,7 +281,8 @@ enum SourceLoader {
     }
 
     private static func loadSubnets(_ spec: SourceSpec, ttlMinutes: Int,
-                                    forceRefresh: Bool, requireFreshComplete: Bool) throws -> SubnetData {
+                                    forceRefresh: Bool, requireFreshComplete: Bool,
+                                    httpTransport: @escaping HTTPTransport) async throws -> SubnetData {
         guard !spec.subnetURLs.isEmpty else { return .empty }
 
         let cached = readCompleteSubnetCache(spec)
@@ -290,7 +300,8 @@ enum SourceLoader {
         // часть набора. Успех одного не маскирует отказ следующего.
         for url in spec.rawSubnetURLs {
             do {
-                let text = try fetch(url)
+                try Task.checkCancellation()
+                let text = try await fetch(url, httpTransport: httpTransport)
                 let parsed = Domains.parseSubnetsWithDiagnostics(text)
                 if requireFreshComplete, !parsed.skipped.isEmpty {
                     errors.append("\(url): не удалось распознать \(parsed.skipped.count) строк подсетей")
@@ -303,6 +314,7 @@ enum SourceLoader {
                 for subnet in parsed.v4 where seen.insert(subnet).inserted { v4.append(subnet) }
                 for subnet in parsed.v6 where seen.insert(subnet).inserted { v6.append(subnet) }
             } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
                 errors.append("\(url): \(error.localizedDescription)")
             }
         }
@@ -381,8 +393,10 @@ enum SourceLoader {
         }
     }
 
-    /// Синхронная загрузка: вызывается только с фоновой очереди.
-    static func fetch(_ urlString: String) throws -> String {
+    /// URLSession связывает отмену родительской Task с сетевым запросом.
+    static func fetch(_ urlString: String,
+                      httpTransport: @escaping HTTPTransport = liveHTTPTransport) async throws -> String {
+        try Task.checkCancellation()
         // Свой источник может быть файлом на диске — читаем его напрямую,
         // а не через сеть.
         if urlString.hasPrefix("/") || urlString.hasPrefix("file:") {
@@ -414,44 +428,53 @@ enum SourceLoader {
         request.setValue("KeeneticControl/1.1.0", forHTTPHeaderField: "User-Agent")
         request.setValue("text/plain", forHTTPHeaderField: "Accept")
 
-        let semaphore = DispatchSemaphore(value: 0)
-        let lock = NSLock()
-        var result: Result<String, Error>?
+        let (data, response) = try await httpTransport(request)
+        try Task.checkCancellation()
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw TransportError("HTTP \(http.statusCode)")
+        }
+        guard var text = String(data: data, encoding: .utf8) else {
+            throw TransportError("Источник не является корректным текстом UTF-8.")
+        }
+        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        return text
+    }
+}
 
-        let task = URLSession.shared.dataTask(with: request) { data, response, error in
-            let value: Result<String, Error>
-            if let error {
-                value = .failure(error)
-            } else if let http = response as? HTTPURLResponse,
-                      !(200..<300).contains(http.statusCode) {
-                value = .failure(TransportError("HTTP \(http.statusCode)"))
-            } else if let data {
-                var text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-                if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
-                value = .success(text)
-            } else {
-                value = .failure(TransportError("Пустой ответ"))
+/// Не больше трёх источников одновременно; зеркала внутри источника остаются
+/// последовательными. Ошибка источника не отменяет остальные, отмена — отменяет.
+@MainActor
+enum SourceDownloadBatch {
+    struct Outcome {
+        let spec: SourceSpec
+        let result: Result<SourceData, Error>
+    }
+
+    static func load(_ sources: [SourceSpec], concurrency: Int = 3,
+                     loader: @escaping @MainActor (SourceSpec) async throws -> SourceData,
+                     onComplete: @escaping @MainActor (Outcome) throws -> Void) async throws {
+        try await withThrowingTaskGroup(of: Outcome.self) { group in
+            var nextIndex = 0
+            func enqueue(_ spec: SourceSpec) {
+                group.addTask {
+                    try Task.checkCancellation()
+                    do { return Outcome(spec: spec, result: .success(try await loader(spec))) }
+                    catch {
+                        if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                        return Outcome(spec: spec, result: .failure(error))
+                    }
+                }
             }
-
-            lock.lock()
-            result = value
-            lock.unlock()
-            semaphore.signal()
-        }
-        task.resume()
-
-        guard semaphore.wait(timeout: .now() + 45) == .success else {
-            task.cancel()
-            throw TransportError("Источник не ответил за 45 с: \(urlString)")
-        }
-
-        lock.lock()
-        let finished = result
-        lock.unlock()
-        switch finished {
-        case .success(let text): return text
-        case .failure(let error): throw error
-        case nil: throw TransportError("Загрузка не завершилась")
+            for _ in 0..<min(max(1, concurrency), sources.count) {
+                enqueue(sources[nextIndex]); nextIndex += 1
+            }
+            while let outcome = try await group.next() {
+                try Task.checkCancellation()
+                try onComplete(outcome)
+                if nextIndex < sources.count {
+                    enqueue(sources[nextIndex]); nextIndex += 1
+                }
+            }
         }
     }
 }

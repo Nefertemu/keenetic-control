@@ -4,19 +4,43 @@ enum Domains {
     private static let labelPattern = try! NSRegularExpression(
         pattern: "^(?!-)[a-z0-9_-]{1,63}(?<!-)$")
 
-    /// Приводит строку любого популярного формата списков к чистому домену,
-    /// IP-адресу или подсети. Возвращает nil, если строку понять нельзя.
+    private static let commentMarkers = ["#", "!", ";", "//"]
+
+    /// Комментарий начинается отдельным словом: // внутри https:// не режется.
+    private static func contentTokens(_ raw: String) -> [String] {
+        let tokens = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        return Array(tokens.prefix { token in
+            !commentMarkers.contains(where: token.hasPrefix)
+        })
+    }
+
+    /// Нормализация одного значения не должна молча терять соседние записи.
     static func normalize(_ raw: String) -> String? {
-        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return nil }
-        for marker in ["#", "!", ";", "//"] where value.hasPrefix(marker) { return nil }
+        guard let entries = lineEntries(raw), entries.count == 1 else { return nil }
+        return entries[0]
+    }
 
-        let tokens = value.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-        guard let first = tokens.first else { return nil }
-        // Формат hosts-файла: «0.0.0.0 example.com».
-        let nameIndex = tokens.count >= 2 && IPTools.isIP(first) ? 1 : 0
-        value = tokens[nameIndex]
+    private static func lineEntries(_ raw: String) -> [String]? {
+        let tokens = contentTokens(raw)
+        guard let first = tokens.first else { return [] }
+        if tokens.count > 1, IPTools.isIP(first) {
+            guard !first.contains("%") else { return nil }
+            // В hosts каждый алиас важен. Невалидный хвост отклоняет всю
+            // строку, иначе строгая загрузка приняла бы обрезанный источник.
+            var aliases: [String] = []
+            for token in tokens.dropFirst() {
+                guard let name = normalizeToken(token), !IPTools.isIP(name),
+                      !name.contains("/"), !token.contains("://") else { return nil }
+                aliases.append(name)
+            }
+            return aliases
+        }
+        guard tokens.count == 1, let entry = normalizeToken(first) else { return nil }
+        return [entry]
+    }
 
+    private static func normalizeToken(_ token: String) -> String? {
+        var value = token
         if value.hasPrefix("||") { value = String(value.dropFirst(2)) }
         while value.hasSuffix("^") { value = String(value.dropLast()) }
 
@@ -30,7 +54,7 @@ enum Domains {
         if value.hasPrefix("*.") { value = String(value.dropFirst(2)) }
         while value.hasPrefix(".") { value = String(value.dropFirst()) }
 
-        guard !value.isEmpty, !value.contains("?") else { return nil }
+        guard !value.isEmpty, !value.contains("?"), !value.contains("%") else { return nil }
 
         // Подсети и голые адреса Keenetic кладёт в object-group наравне с доменами.
         if value.contains("/") {
@@ -50,13 +74,7 @@ enum Domains {
         // нормализоваться так же при планировании, а случайное ERROR — нет.
         if labels.count < 2 {
             guard IanaTopLevelDomains.all.contains(value) else { return nil }
-            // network и page — настоящие TLD, но «network failure» и
-            // «page not found» не списки. После зоны допускается лишь
-            // комментарий; hosts-адрес уже отделён выше.
-            if let tail = tokens.dropFirst(nameIndex + 1).first,
-               !["#", "!", ";", "//"].contains(where: { tail.hasPrefix($0) }) {
-                return nil
-            }
+
         }
         for label in labels {
             let range = NSRange(label.startIndex..., in: label)
@@ -84,16 +102,17 @@ enum Domains {
             if trimmed.hasPrefix("#") || trimmed.hasPrefix("!")
                 || trimmed.hasPrefix(";") || trimmed.hasPrefix("//") { continue }
 
-            guard let domain = normalize(String(raw)) else {
+            guard let entries = lineEntries(String(raw)) else {
                 result.skipped.append(trimmed)
                 continue
             }
-            if seen.contains(domain) {
-                result.duplicates += 1
-                continue
+            for domain in entries {
+                if !seen.insert(domain).inserted {
+                    result.duplicates += 1
+                    continue
+                }
+                result.domains.append(domain)
             }
-            seen.insert(domain)
-            result.domains.append(domain)
         }
 
         return result
@@ -125,7 +144,12 @@ enum Domains {
             if value.isEmpty { continue }
             for marker in ["#", "!", ";", "//"] where value.hasPrefix(marker) { value = "" }
             if value.isEmpty { continue }
-            value = String(value.split(whereSeparator: { $0 == " " || $0 == "\t" }).first ?? "")
+            let tokens = contentTokens(value)
+            guard tokens.count == 1, let token = tokens.first, !token.contains("%") else {
+                skipped.append(value)
+                continue
+            }
+            value = token
 
             var normalized: String?
             if value.contains("/") {

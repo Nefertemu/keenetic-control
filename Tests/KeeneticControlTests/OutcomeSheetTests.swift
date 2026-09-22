@@ -106,7 +106,7 @@ final class OutcomeSheetTests: XCTestCase {
 
     private func labels(in png: Data) throws -> [(text: String, frame: CGRect)] {
         let bitmap = try XCTUnwrap(NSBitmapImageRep(data: png))
-        let request = VNRecognizeTextRequest()
+        let request = try NativeUIInteractions.recognitionRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["ru-RU", "en-US"]
         request.customWords = ["FIRSTROW001", "LASTROW100", "Закрыть"]
