@@ -35,14 +35,15 @@ final class RestoreUITests: XCTestCase {
         for dark in [false, true] {
             let text = try await render(PortableBackupSheet(request: request, onComplete: { _ in }, onCancel: {})
                 .environment(\.colorScheme, dark ? .dark : .light),
-                size: NSSize(width: 470, height: 250), dark: dark, name: "portable-password")
-            for label in ["Экспорт с паролем", "Повтори пароль", "Зашифровать", "Отмена"] {
+                size: NSSize(width: 470, height: 360), dark: dark, name: "portable-password", fitsContentHeight: true)
+            for label in ["Экспорт с паролем", "12 символов", "Повтори пароль", "Зашифровать", "Отмена"] {
                 XCTAssertTrue(text.contains { $0.contains(label) }, "Missing \(label): \(text)")
             }
         }
     }
 
-    private func render<V: View>(_ view: V, size: NSSize, dark: Bool, name: String) async throws -> [String] {
+    private func render<V: View>(_ view: V, size: NSSize, dark: Bool, name: String,
+                                 fitsContentHeight: Bool = false) async throws -> [String] {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let hosting = NSHostingView(rootView: view)
         hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
@@ -53,7 +54,16 @@ final class RestoreUITests: XCTestCase {
         hosting.setFrameSize(size)
         for _ in 0..<3 { hosting.layoutSubtreeIfNeeded(); try await Task.sleep(nanoseconds: 50_000_000) }
         XCTAssertEqual(hosting.bounds.width, size.width, accuracy: 1)
-        XCTAssertEqual(hosting.bounds.height, size.height, accuracy: 1)
+        if fitsContentHeight {
+            // SecureField uses native metrics: the same complete sheet is
+            // 246 pt on macOS 15 and 250 pt on macOS 27. It must accommodate
+            // its natural content and remain inside the available window.
+            XCTAssertEqual(hosting.bounds.height, hosting.fittingSize.height, accuracy: 1)
+            XCTAssertGreaterThan(hosting.bounds.height, 0)
+            XCTAssertLessThanOrEqual(hosting.bounds.height, size.height + 1)
+        } else {
+            XCTAssertEqual(hosting.bounds.height, size.height, accuracy: 1)
+        }
         let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
         hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
         let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))

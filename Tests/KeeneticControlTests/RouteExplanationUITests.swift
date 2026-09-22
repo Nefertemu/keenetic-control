@@ -143,9 +143,7 @@ final class RouteExplanationUITests: XCTestCase {
 
     private func capture(_ hosting: NSView, name: String) throws -> [String] {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
-        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
-        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let png = try NativeUIInteractions.renderedPNG(in: hosting)
         try png.write(to: outputDirectory.appendingPathComponent(name + ".png"))
         let request = try NativeUIInteractions.recognitionRequest()
         request.recognitionLevel = .accurate

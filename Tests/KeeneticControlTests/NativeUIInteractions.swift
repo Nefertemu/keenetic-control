@@ -20,11 +20,24 @@ enum NativeUIInteractions {
         return request
     }
 
-    static func observations(in view: NSView) throws -> [VNRecognizedTextObservation] {
+    /// Render at a fixed pixel density without changing the window's layout
+    /// in points. Hosted macOS CI uses a 1× display, where 10pt route flags and
+    /// disabled labels can lose letters in OCR despite being fully visible.
+    static func renderedPNG(in view: NSView) throws -> Data {
         view.layoutSubtreeIfNeeded()
-        let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        let size = view.bounds.size
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(ceil(size.width * 2)), pixelsHigh: Int(ceil(size.height * 2)),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        bitmap.size = size
         view.cacheDisplay(in: view.bounds, to: bitmap)
-        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+    }
+
+    static func observations(in view: NSView) throws -> [VNRecognizedTextObservation] {
+        let png = try renderedPNG(in: view)
         let request = try recognitionRequest()
         try VNImageRequestHandler(data: png, options: [:]).perform([request])
         return request.results ?? []

@@ -185,7 +185,9 @@ final class DomainListUpdateUITests: XCTestCase {
                     }.first)
                     let document = try XCTUnwrap(resultScroll.documentView)
                     for _ in 0..<3 {
-                        document.scroll(NSPoint(x: 0, y: document.bounds.maxY))
+                        document.scroll(NSPoint(x: document.bounds.minX,
+                            y: max(document.bounds.minY, document.bounds.maxY - resultScroll.contentView.bounds.height)))
+                        resultScroll.reflectScrolledClipView(resultScroll.contentView)
                         hosting.layoutSubtreeIfNeeded()
                         try await Task.sleep(nanoseconds: 50_000_000)
                     }
@@ -205,9 +207,7 @@ final class DomainListUpdateUITests: XCTestCase {
     }
 
     private func capture(_ view: NSView) throws -> Data {
-        let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-        view.cacheDisplay(in: view.bounds, to: bitmap)
-        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let png = try NativeUIInteractions.renderedPNG(in: view)
         XCTAssertGreaterThan(png.count, 20_000)
         return png
     }

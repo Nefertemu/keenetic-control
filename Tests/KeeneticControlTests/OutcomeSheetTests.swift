@@ -71,13 +71,19 @@ final class OutcomeSheetTests: XCTestCase {
         XCTAssertTrue(hosting.bounds.insetBy(dx: -1, dy: -1).contains(viewport),
                       "The problems viewport must stay inside the sheet")
 
-        // LazyVStack can revise its estimated document size as rows appear.
-        // Repeating the scroll after layout reaches the actual last row.
+        // Place the *bottom* of the viewport at the document's end. Scrolling
+        // its top to maxY overshoots by a whole viewport on macOS 15 and makes
+        // LazyVStack display no rows. Repeat after estimates become exact.
         for _ in 0..<4 {
-            document.scroll(NSPoint(x: 0, y: document.bounds.maxY))
+            let bottomOrigin = max(document.bounds.minY,
+                                   document.bounds.maxY - scroll.contentView.bounds.height)
+            document.scroll(NSPoint(x: document.bounds.minX, y: bottomOrigin))
+            scroll.reflectScrolledClipView(scroll.contentView)
             await settle(hosting)
         }
         XCTAssertGreaterThan(scroll.contentView.bounds.minY, 0)
+        XCTAssertLessThanOrEqual(scroll.contentView.bounds.maxY, document.bounds.maxY + 1,
+                                "The test must not scroll past the document into a blank viewport")
         let bottom = try capture(hosting, name: "outcome-\(theme)-640-bottom")
         let bottomLabels = try labels(in: bottom)
         XCTAssertTrue(bottomLabels.contains { normalized($0.text).contains("LASTROW100") },
@@ -96,9 +102,7 @@ final class OutcomeSheetTests: XCTestCase {
     }
 
     private func capture(_ view: NSView, name: String) throws -> Data {
-        let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-        view.cacheDisplay(in: view.bounds, to: bitmap)
-        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let png = try NativeUIInteractions.renderedPNG(in: view)
         XCTAssertGreaterThan(png.count, 20_000, "The sheet render is blank")
         try png.write(to: outputDirectory.appendingPathComponent(name + ".png"))
         return png
