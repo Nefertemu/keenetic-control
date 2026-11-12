@@ -171,22 +171,22 @@ struct RouterChange {
         if difference.extraDomainCount > 0 {
             result.append(Format.agree(difference.extraDomainCount, "добавлен", "добавлено")
                           + " \(Format.domains(difference.extraDomainCount))"
-                          + namesSuffix(Array(difference.extraDomains.keys)))
+                          + placeSuffix(Array(difference.extraDomains.keys)))
         }
         if difference.missingDomainCount > 0 {
             result.append(Format.agree(difference.missingDomainCount, "убран", "убрано")
                           + " \(Format.domains(difference.missingDomainCount))"
-                          + namesSuffix(Array(difference.missingDomains.keys)))
+                          + placeSuffix(Array(difference.missingDomains.keys), preposition: "из"))
         }
         if !difference.extraGroups.isEmpty {
             result.append(Format.agree(difference.extraGroups.count, "появился", "появилось")
                           + " \(Format.lists(difference.extraGroups.count))"
-                          + namesSuffix(difference.extraGroups.map(\.ident)))
+                          + listNames(difference.extraGroups.map(\.ident)))
         }
         if !difference.missingGroups.isEmpty {
             result.append(Format.agree(difference.missingGroups.count, "удалён", "удалено")
                           + " \(Format.lists(difference.missingGroups.count))"
-                          + namesSuffix(difference.missingGroups.map(\.ident)))
+                          + listNames(difference.missingGroups.map(\.ident)))
         }
         if difference.extraRouteCount > 0 {
             result.append("назначено маршрутов списков: \(difference.extraRouteCount)")
@@ -195,7 +195,7 @@ struct RouterChange {
             result.append("снято маршрутов списков: \(difference.missingRouteCount)")
         }
         if !difference.reorderedRouteGroups.isEmpty {
-            result.append("изменён порядок маршрутов" + namesSuffix(difference.reorderedRouteGroups))
+            result.append("изменён порядок маршрутов" + placeSuffix(difference.reorderedRouteGroups, preposition: "у"))
         }
         if !difference.extraRoutes.isEmpty {
             result.append(Format.agree(difference.extraRoutes.count, "добавлен", "добавлено")
@@ -208,16 +208,38 @@ struct RouterChange {
         return result
     }
 
-    /// «в itdog ru inside 2» или «в 3 списках» — чтобы не вываливать
-    /// десяток идентификаторов в одну строку.
-    private func namesSuffix(_ idents: [String]) -> String {
-        let sorted = idents.sorted {
-            RouterConfigParser.identOrder($0) < RouterConfigParser.identOrder($1)
+    /// Имя, которое списку дал человек; идентификатор — когда имени нет.
+    private func name(_ ident: String) -> String {
+        let text = (difference.currentGroups[ident] ?? difference.snapshotGroups[ident])?
+            .descriptionText ?? ""
+        return text.isEmpty ? ident : "«\(text)»"
+    }
+
+    private func ordered(_ idents: [String]) -> [String] {
+        idents.sorted { RouterConfigParser.identOrder($0) < RouterConfigParser.identOrder($1) }
+    }
+
+    /// «в «youtube»», «из «meta» и «test»», «в 3 списках» — где именно
+    /// поменялись записи. Десяток имён в одну строку не вываливаем.
+    private func placeSuffix(_ idents: [String], preposition: String = "в") -> String {
+        let sorted = ordered(idents)
+        switch sorted.count {
+        case 0: return ""
+        case 1: return " \(preposition) \(name(sorted[0]))"
+        case 2: return " \(preposition) \(name(sorted[0])) и \(name(sorted[1]))"
+        default:
+            return preposition == "в"
+                ? " в \(Format.inLists(sorted.count))"
+                : " \(preposition) \(Format.plural(sorted.count, "списка", "списков", "списков"))"
         }
-        guard !sorted.isEmpty else { return "" }
-        if sorted.count == 1 { return " в \(sorted[0])" }
-        if sorted.count == 2 { return " в \(sorted[0]) и \(sorted[1])" }
-        return " в \(Format.lists(sorted.count))"
+    }
+
+    /// Сами появившиеся или удалённые списки: «появился 1 список: «meta»».
+    /// Раньше имя пристёгивалось предлогом — «появился 1 список в domain-list2».
+    private func listNames(_ idents: [String]) -> String {
+        let sorted = ordered(idents)
+        guard !sorted.isEmpty, sorted.count <= 3 else { return "" }
+        return ": " + sorted.map(name).joined(separator: ", ")
     }
 }
 

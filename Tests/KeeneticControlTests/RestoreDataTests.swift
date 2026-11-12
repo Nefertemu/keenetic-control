@@ -61,11 +61,11 @@ final class RestoreDataTests: XCTestCase {
         let reordered = RouterChange(at: Date(), difference: Restore.compare(
             backup: config(["Wireguard0", "Wireguard1"]), current: config(["Wireguard1", "Wireguard0"])))
         XCTAssertTrue(reordered.touchesManagedSettings)
-        XCTAssertEqual(reordered.lines, ["изменён порядок маршрутов в domain-list0"])
+        XCTAssertEqual(reordered.lines, ["изменён порядок маршрутов у domain-list0"])
 
         let combined = RouterChange(at: Date(), difference: Restore.compare(
             backup: config(["Wireguard0", "Wireguard1"]), current: config(["Wireguard1", "Wireguard0", "Wireguard2"])))
         XCTAssertEqual(combined.lines, ["назначено маршрутов списков: 1",
-                                       "изменён порядок маршрутов в domain-list0"])
+                                       "изменён порядок маршрутов у domain-list0"])
     }
 }

@@ -257,6 +257,7 @@ struct PingCheckView: View {
                 Image(systemName: "trash")
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Удалить профиль \(profile.name)")
             .foregroundStyle(profile.isBuiltIn ? Color.secondary : Palette.danger)
             .disabled(profile.isBuiltIn)
         }

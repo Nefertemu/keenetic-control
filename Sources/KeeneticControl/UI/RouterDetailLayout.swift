@@ -56,6 +56,7 @@ struct RouterUpdateBanners: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+            .accessibilityLabel("Скрыть")
             .help("Скрыть до следующей версии")
         }
         .padding(.horizontal, 14)
@@ -103,6 +104,7 @@ struct RouterUpdateBanners: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+            .accessibilityLabel("Скрыть")
             .help("Скрыть до следующей проверки")
         }
         .padding(.horizontal, 14)

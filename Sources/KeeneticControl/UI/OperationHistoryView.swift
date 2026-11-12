@@ -98,7 +98,7 @@ struct OperationHistoryView: View {
             Text(record.status.title).font(.system(size: 11, weight: .medium))
                 .foregroundStyle(record.status.hasIssue ? Palette.warning : .secondary)
             if !record.changes.isEmpty {
-                Text("+\(record.addedCount) записей · −\(record.removedCount) записей · списков: \(record.changes.count)")
+                Text(record.changeSummary)
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             } else {
                 Text("Команд: \(record.commandCount)").font(.system(size: 11)).foregroundStyle(.secondary)

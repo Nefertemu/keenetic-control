@@ -51,20 +51,25 @@ struct BackupsView: View {
     }
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 16) {
-                list
-                    .frame(width: 340)
-                detail
-            }
-            .frame(minWidth: 720)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+        // Раскладку выбираем по настоящей ширине окна. ViewThatFits мерил
+        // идеальную ширину содержимого, а у открытой копии это самая длинная
+        // строка конфигурации: стоило выбрать файл, и две колонки на широком
+        // окне схлопывались в одну, а список сжимался до четырёх строк.
+        GeometryReader { proxy in
+            if proxy.size.width >= 720 {
+                HStack(alignment: .top, spacing: 16) {
                     list
-                        .frame(minHeight: 300, maxHeight: 380)
+                        .frame(width: 340)
                     detail
-                        .frame(minHeight: 420)
+                }
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        list
+                            .frame(minHeight: 300, maxHeight: 380)
+                        detail
+                            .frame(minHeight: 420)
+                    }
                 }
             }
         }
@@ -127,6 +132,7 @@ struct BackupsView: View {
                 } label: {
                     Image(systemName: "folder")
                 }
+                .accessibilityLabel("Открыть папку с копиями")
                 .buttonStyle(.plain)
                 .help("Открыть папку")
             }

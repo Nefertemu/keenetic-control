@@ -231,6 +231,8 @@ struct RoutersView: View {
                 Image(systemName: "trash")
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Удалить роутер \(router.name)")
+            .help("Удалить роутер из списка")
             .foregroundStyle(Palette.danger)
             .disabled(store.routers.count <= 1)
         }
@@ -365,7 +367,12 @@ struct RoutersView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Состояние").font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text(updater.lastMessage ?? "ещё не проверялось")
+                    // Итог сверки живёт до закрытия приложения, а её время
+                    // сохраняется. Без этой развилки после перезапуска рядом
+                    // стояли «ещё не проверялось» и «последняя проверка 72 дн назад».
+                    Text(updater.lastMessage
+                         ?? (updater.lastCheck == nil ? "ещё не проверялось"
+                                                      : "после запуска не проверялось"))
                         .font(.system(size: 12))
                         .fixedSize(horizontal: false, vertical: true)
                     if let last = updater.lastCheck {

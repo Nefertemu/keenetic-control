@@ -785,12 +785,24 @@ final class RegressionTests: XCTestCase {
         check("изменение затронуло то, чем управляем", routerChange.touchesManagedSettings)
         let changeText = routerChange.lines.joined(separator: " | ")
         check("добавленные домены названы с именем списка",
-              changeText.contains("добавлено 2 домена в domain-list0"))
-        check("появившийся список назван", changeText.contains("появился 1 список в domain-list2"))
-        check("исчезнувший список назван", changeText.contains("удалён 1 список в domain-list1"))
+              changeText.contains("добавлено 2 домена в «kinopub»"))
+        check("появившийся список назван", changeText.contains("появился 1 список: «meta»"))
+        check("исчезнувший список назван", changeText.contains("удалён 1 список: «telegram»"))
         check("новый маршрут посчитан", changeText.contains("назначено маршрутов списков: 1"))
         check("удалённый статический маршрут посчитан", changeText.contains("удалён 1 маршрут"))
         check("про списки, которых не касались, молчим", !changeText.contains("убран"))
+        check("имя не пристёгнуто предлогом к самому списку", !changeText.contains("список в "))
+
+        // Нулевые счётчики в журнале не показываем.
+        var record = OperationHistoryRecord(profile: RouterProfile(), plan: Plan(title: "t"),
+                                            configText: "", backupURL: nil)
+        record.changes = [.init(ident: "a", title: "a", added: [], removed: [], beforeCount: 1,
+                                afterCount: 1, routesBefore: [], routesAfter: ["x"],
+                                isCreated: false, isDeleted: false)]
+        check("смена маршрута без нулей", record.changeSummary, "маршруты изменены у 1 списка")
+        record.changes[0].added = ["a.example", "b.example"]
+        record.changes[0].routesAfter = []
+        check("добавление согласовано", record.changeSummary, "+2 записи · списков: 1")
         check("глагол согласуется с единицей", Format.agree(1, "добавлен", "добавлено"), "добавлен")
         check("и с двойкой", Format.agree(2, "добавлен", "добавлено"), "добавлено")
         check("одиннадцать — не единица", Format.agree(11, "добавлен", "добавлено"), "добавлено")

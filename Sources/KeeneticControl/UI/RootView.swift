@@ -355,6 +355,9 @@ struct RootView: View {
                     Image(systemName: session.status.isOnline ? "eject.circle" : "bolt.circle")
                         .font(.system(size: 16))
                 }
+                // Без подписи VoiceOver читал имя значка: «Вспышка»,
+                // «Символ извлечения в круге».
+                .accessibilityLabel(session.status.isOnline ? "Отключиться" : "Подключиться")
                 .buttonStyle(.plain)
                 .foregroundStyle(session.status.isOnline ? Color.secondary : Palette.accent)
                 .help(session.status.isOnline ? "Отключиться" : "Подключиться")

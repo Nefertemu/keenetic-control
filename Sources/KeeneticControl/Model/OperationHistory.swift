@@ -109,6 +109,19 @@ struct OperationHistoryRecord: Codable, Identifiable, Equatable {
     var problems: [String]
     var backupURL: URL?
 
+    /// Строка под заголовком операции в журнале. Нулевые счётчики не
+    /// показываем: у смены маршрутов выходило «+0 записей · −0 записей».
+    var changeSummary: String {
+        var parts: [String] = []
+        if addedCount > 0 { parts.append("+\(Format.entries(addedCount))") }
+        if removedCount > 0 { parts.append("−\(Format.entries(removedCount))") }
+        let rerouted = changes.filter { $0.routesBefore != $0.routesAfter }.count
+        if rerouted > 0 { parts.append("маршруты изменены у \(Format.plural(rerouted, "списка", "списков", "списков"))") }
+        if parts.isEmpty { parts.append("затронуто списков: \(changes.count)") }
+        else if addedCount + removedCount > 0 { parts.append("списков: \(changes.count)") }
+        return parts.joined(separator: " · ")
+    }
+
     var addedCount: Int { changes.reduce(0) { $0 + $1.added.count } }
     var removedCount: Int { changes.reduce(0) { $0 + $1.removed.count } }
     var commandsTruncated: Bool { commands.count < commandCount }
