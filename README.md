@@ -91,9 +91,10 @@ open "dist/Keenetic Control.app"
 
 * имена интерфейсов везде показываются вместе с примечаниями из
   конфигурации роутера — «Wireguard0 · Dataforest»;
-* десять готовых источников по разделам: общие списки блокировок (hoaxisr,
-  ITDog inside), соцсети и мессенджеры (Telegram, Meta, Twitter/X, Discord),
-  видео и стриминг (KinoPub, Twitch), ИИ-сервисы (Claude), игры (Nintendo);
+* одиннадцать готовых источников по разделам: общие списки блокировок
+  (hoaxisr, ITDog inside), соцсети и мессенджеры (Telegram, Meta, Twitter/X,
+  Discord), видео и стриминг (KinoPub, YouTube, Twitch), ИИ-сервисы (Claude),
+  игры (Nintendo);
 * домены и подсети (IPv4 + IPv6) кладутся в одну `object-group fqdn`;
 * автоматическая нарезка по частям, нумерация и приведение имён к канону;
 * удаление доменов, пропавших из источника;

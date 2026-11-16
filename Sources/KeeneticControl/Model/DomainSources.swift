@@ -155,6 +155,20 @@ enum SourceCatalog {
             category: .social),
 
         SourceSpec(
+            key: "youtube",
+            title: "YouTube",
+            subtitle: "itdoginfo · Services/youtube",
+            descriptionPrefix: "youtube",
+            icon: "play.rectangle.fill",
+            urls: [
+                "\(itdog)/Services/youtube.lst",
+                "https://github.com/itdoginfo/allow-domains/raw/refs/heads/main/Services/youtube.lst",
+            ],
+            cacheName: "itdog-youtube.lst",
+            minDomains: 5,
+            category: .video),
+
+        SourceSpec(
             key: "twitch",
             title: "Twitch",
             subtitle: "Ground-Zerro/Geo-Aggregator",
