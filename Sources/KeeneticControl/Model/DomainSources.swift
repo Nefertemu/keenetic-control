@@ -1,5 +1,30 @@
 import Foundation
 
+/// Раздел каталога. Источников стало больше десятка, и сплошная сетка
+/// перестала читаться: общий список блокировок стоял рядом с Nintendo.
+enum SourceCategory: Int, CaseIterable, Sendable {
+    case blocklists, social, video, ai, games, custom
+
+    var title: String {
+        switch self {
+        case .blocklists: return "Общие списки блокировок"
+        case .social:     return "Соцсети и мессенджеры"
+        case .video:      return "Видео и стриминг"
+        case .ai:         return "ИИ-сервисы"
+        case .games:      return "Игры"
+        case .custom:     return "Свои источники"
+        }
+    }
+
+    /// Источники по разделам в порядке каталога; пустые разделы пропускаются.
+    static func grouped(_ specs: [SourceSpec]) -> [(category: SourceCategory, specs: [SourceSpec])] {
+        allCases.compactMap { category in
+            let items = specs.filter { $0.category == category }
+            return items.isEmpty ? nil : (category, items)
+        }
+    }
+}
+
 struct SourceSpec: Identifiable, Hashable, Sendable {
     let key: String
     let title: String
@@ -13,12 +38,16 @@ struct SourceSpec: Identifiable, Hashable, Sendable {
     /// Списки подсетей — складываются вместе с доменами.
     let subnetURLs: [String]
     let minDomains: Int
+    /// Только для показа: на загрузку, сверку и владение списками не влияет.
+    let category: SourceCategory
 
     var id: String { key }
 
     init(key: String, title: String, subtitle: String, descriptionPrefix: String,
          icon: String, urls: [String], cacheName: String,
-         subnetURLs: [String] = [], minDomains: Int = 50) {
+         subnetURLs: [String] = [], minDomains: Int = 50,
+         category: SourceCategory = .custom) {
+        self.category = category
         self.key = key
         self.title = title
         self.subtitle = subtitle
@@ -62,7 +91,8 @@ enum SourceCatalog {
                 "https://raw.githubusercontent.com/hoaxisr/rulesets/master/raw/unavailable-in-russia.txt",
                 "https://github.com/hoaxisr/rulesets/raw/refs/heads/master/raw/unavailable-in-russia.txt",
             ],
-            cacheName: "hoaxisr-unavailable-in-russia.txt"),
+            cacheName: "hoaxisr-unavailable-in-russia.txt",
+            category: .blocklists),
 
         SourceSpec(
             key: "itdog_inside",
@@ -74,7 +104,8 @@ enum SourceCatalog {
                 "\(itdog)/Russia/inside-raw.lst",
                 "https://github.com/itdoginfo/allow-domains/raw/refs/heads/main/Russia/inside-raw.lst",
             ],
-            cacheName: "itdog-russia-inside-raw.lst"),
+            cacheName: "itdog-russia-inside-raw.lst",
+            category: .blocklists),
 
         SourceSpec(
             key: "kinopub",
@@ -84,7 +115,8 @@ enum SourceCatalog {
             icon: "film",
             urls: ["https://raw.githubusercontent.com/Ground-Zerro/Geo-Aggregator/main/source1/kinopub.txt"],
             cacheName: "kinopub.txt",
-            minDomains: 5),
+            minDomains: 5,
+            category: .video),
 
         SourceSpec(
             key: "telegram",
@@ -95,7 +127,8 @@ enum SourceCatalog {
             urls: ["\(itdog)/Services/telegram.lst"],
             cacheName: "itdog-telegram.lst",
             subnetURLs: ["\(itdog)/Subnets/IPv4/telegram.lst", "\(itdog)/Subnets/IPv6/telegram.lst"],
-            minDomains: 5),
+            minDomains: 5,
+            category: .social),
 
         SourceSpec(
             key: "meta",
@@ -106,7 +139,8 @@ enum SourceCatalog {
             urls: ["\(itdog)/Services/meta.lst"],
             cacheName: "itdog-meta.lst",
             subnetURLs: ["\(itdog)/Subnets/IPv4/meta.lst", "\(itdog)/Subnets/IPv6/Meta.lst"],
-            minDomains: 5),
+            minDomains: 5,
+            category: .social),
 
         SourceSpec(
             key: "twitter",
@@ -117,7 +151,8 @@ enum SourceCatalog {
             urls: ["\(itdog)/Services/twitter.lst"],
             cacheName: "itdog-twitter.lst",
             subnetURLs: ["\(itdog)/Subnets/IPv4/twitter.lst", "\(itdog)/Subnets/IPv6/twitter.lst"],
-            minDomains: 5),
+            minDomains: 5,
+            category: .social),
 
         SourceSpec(
             key: "twitch",
@@ -127,7 +162,8 @@ enum SourceCatalog {
             icon: "gamecontroller",
             urls: ["https://raw.githubusercontent.com/Ground-Zerro/Geo-Aggregator/main/source2/twitch.txt"],
             cacheName: "twitch.txt",
-            minDomains: 5),
+            minDomains: 5,
+            category: .video),
 
         SourceSpec(
             key: "discord",
@@ -138,7 +174,36 @@ enum SourceCatalog {
             urls: ["\(itdog)/Services/discord.lst"],
             cacheName: "itdog-discord.lst",
             subnetURLs: ["\(itdog)/Subnets/IPv4/Discord.lst", "\(itdog)/Subnets/IPv6/Discord.lst"],
-            minDomains: 5),
+            minDomains: 5,
+            category: .social),
+
+        SourceSpec(
+            key: "claude",
+            title: "Claude",
+            subtitle: "hoaxisr/rulesets · Anthropic",
+            descriptionPrefix: "claude",
+            icon: "sparkles",
+            urls: [
+                "https://raw.githubusercontent.com/hoaxisr/rulesets/master/raw/claude.txt",
+                "https://github.com/hoaxisr/rulesets/raw/refs/heads/master/raw/claude.txt",
+            ],
+            cacheName: "hoaxisr-claude.txt",
+            minDomains: 3,
+            category: .ai),
+
+        SourceSpec(
+            key: "nintendo",
+            title: "Nintendo",
+            subtitle: "hoaxisr/rulesets · eShop и сетевые службы",
+            descriptionPrefix: "nintendo",
+            icon: "gamecontroller.fill",
+            urls: [
+                "https://raw.githubusercontent.com/hoaxisr/rulesets/master/raw/nintendo.txt",
+                "https://github.com/hoaxisr/rulesets/raw/refs/heads/master/raw/nintendo.txt",
+            ],
+            cacheName: "hoaxisr-nintendo.txt",
+            minDomains: 3,
+            category: .games),
     ]
 
     static func spec(for key: String) -> SourceSpec? { all.first { $0.key == key } }

@@ -397,9 +397,13 @@ struct RoutersView: View {
                      : "Отмечено: \(store.settings.autoUpdateSources.count)")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
 
+                ForEach(SourceCategory.grouped(store.allSources), id: \.category) { group in
+                Text(group.category.title)
+                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                    .padding(.top, 4)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)],
                           alignment: .leading, spacing: 6) {
-                    ForEach(store.allSources) { spec in
+                    ForEach(group.specs) { spec in
                         let picked = store.settings.autoUpdateSources.contains(spec.key)
                         Toggle(isOn: Binding(
                             get: { picked },
@@ -412,6 +416,7 @@ struct RoutersView: View {
                         }
                         .toggleStyle(.checkbox)
                     }
+                }
                 }
             }
         }

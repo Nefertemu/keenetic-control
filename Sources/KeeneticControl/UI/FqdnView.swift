@@ -141,9 +141,17 @@ struct FqdnView: View {
                 }
             }
 
-            LazyVGrid(columns: columns, spacing: 12) {
-                ForEach(store.allSources) { spec in
-                    sourceCard(spec)
+            ForEach(SourceCategory.grouped(store.allSources), id: \.category) { group in
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(group.category.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityAddTraits(.isHeader)
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        ForEach(group.specs) { spec in
+                            sourceCard(spec)
+                        }
+                    }
                 }
             }
         }

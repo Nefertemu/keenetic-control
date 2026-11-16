@@ -168,4 +168,20 @@ final class DomainImprovementsTests: XCTestCase {
         XCTAssertEqual(started, 3)
         XCTAssertEqual(cancelled, 3)
     }
+
+    func testCatalogIsGroupedByCategoryWithoutLosingSources() {
+        let all = SourceCatalog.all
+        let grouped = SourceCategory.grouped(all)
+        XCTAssertEqual(grouped.flatMap(\.specs).map(\.key).sorted(), all.map(\.key).sorted())
+        XCTAssertFalse(grouped.contains { $0.category == .custom }, "встроенный источник остался без раздела")
+        XCTAssertEqual(grouped.map(\.category), [.blocklists, .social, .video, .ai, .games])
+        XCTAssertEqual(grouped.first { $0.category == .ai }?.specs.map(\.key), ["claude"])
+        XCTAssertEqual(grouped.first { $0.category == .games }?.specs.map(\.key), ["nintendo"])
+        // Свой источник попадает в отдельный раздел и идёт последним.
+        let own = CustomSource(title: "мой", descriptionPrefix: "мой", urls: ["https://example.org/a.txt"]).spec
+        XCTAssertEqual(SourceCategory.grouped(all + [own]).last?.category, .custom)
+        // Новые источники не должны претендовать на чужие списки.
+        XCTAssertTrue(CustomSource.conflictingSourceTitles(all).isEmpty)
+        XCTAssertEqual(Set(all.map(\.cacheName)).count, all.count)
+    }
 }
